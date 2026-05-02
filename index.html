@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gold Trading Journal - XAUUSD</title>
+  <meta name="theme-color" content="#10141a">
+  <meta name="application-name" content="Gold Journal">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Gold Journal">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">AU</div>
+        <div>
+          <div class="brand-title">Gold Journal</div>
+          <div class="brand-sub">XAUUSD trade desk</div>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="Main navigation">
+        <button class="nav-btn active" data-tab="log" onclick="switchTab('log', this)">
+          <i data-lucide="table-2"></i>
+          <span>Trade Log</span>
+        </button>
+        <button class="nav-btn" data-tab="analysis" onclick="switchTab('analysis', this)">
+          <i data-lucide="bar-chart-3"></i>
+          <span>Analysis</span>
+        </button>
+        <button class="nav-btn" data-tab="pnl" onclick="switchTab('pnl', this)">
+          <i data-lucide="calendar-days"></i>
+          <span>PnL</span>
+        </button>
+        <button class="nav-btn" data-tab="weekly" onclick="switchTab('weekly', this)">
+          <i data-lucide="notebook-pen"></i>
+          <span>Weekly Review</span>
+        </button>
+        <button class="nav-btn" data-tab="manage" onclick="switchTab('manage', this)">
+          <i data-lucide="sliders-horizontal"></i>
+          <span>Options</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-card" id="sidebar-stats"></div>
+
+      <div class="sidebar-actions">
+        <button class="ghost-btn" onclick="exportExcel()"><i data-lucide="file-spreadsheet"></i><span>Excel</span></button>
+        <button class="ghost-btn" onclick="exportCSV()"><i data-lucide="file-down"></i><span>CSV</span></button>
+        <button class="ghost-btn" onclick="exportPDF()"><i data-lucide="printer"></i><span>PDF</span></button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section id="tab-log" class="tab-panel active">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Live journal</p>
+            <h1>Trade Log</h1>
+            <p id="log-sub" class="muted">Track every XAUUSD decision in one place.</p>
+          </div>
+          <div class="head-actions">
+            <button class="soft-btn" onclick="duplicateLastTrade()"><i data-lucide="copy-plus"></i><span>Duplicate Last</span></button>
+            <button class="primary-btn" onclick="addTrade()"><i data-lucide="plus"></i><span>New Trade</span></button>
+          </div>
+        </header>
+
+        <div class="dashboard-strip" id="summary-strip"></div>
+
+        <div class="toolbar">
+          <label class="field search-field">
+            <i data-lucide="search"></i>
+            <input id="search-input" type="search" placeholder="Search level, setup, note..." oninput="renderTrades()">
+          </label>
+          <label class="field">
+            <span>Result</span>
+            <select id="result-filter" onchange="renderTrades()">
+              <option value="">All</option>
+              <option value="WIN">Win</option>
+              <option value="LOSS">Loss</option>
+              <option value="BE">Break even</option>
+              <option value="OPEN">Open</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Session</span>
+            <select id="session-filter" onchange="renderTrades()"></select>
+          </label>
+          <label class="field">
+            <span>Setup</span>
+            <select id="setup-filter" onchange="renderTrades()"></select>
+          </label>
+          <button class="soft-btn compact" onclick="clearFilters()"><i data-lucide="x"></i><span>Clear</span></button>
+        </div>
+
+        <div class="report-tools">
+          <div class="report-title">
+            <i data-lucide="file-text"></i>
+            <span>PDF Report</span>
+          </div>
+          <label class="field">
+            <span>Range</span>
+            <select id="report-preset" onchange="applyReportPreset()">
+              <option value="all">All trades</option>
+              <option value="week">This week</option>
+              <option value="month">This month</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>From</span>
+            <input id="report-from" type="date" onchange="setCustomReportRange()">
+          </label>
+          <label class="field">
+            <span>To</span>
+            <input id="report-to" type="date" onchange="setCustomReportRange()">
+          </label>
+          <button class="primary-btn compact" onclick="exportPDF()"><i data-lucide="printer"></i><span>Download PDF</span></button>
+        </div>
+
+        <div class="table-shell">
+          <table id="trade-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Date</th>
+                <th>Session</th>
+                <th>Side</th>
+                <th>Level</th>
+                <th>TF</th>
+                <th>Setup</th>
+                <th>Mistake</th>
+                <th>Hold</th>
+                <th>Market</th>
+                <th>Bias</th>
+                <th>Confirm</th>
+                <th>SL/TP</th>
+                <th>Patience</th>
+                <th>Risk</th>
+                <th>Reward</th>
+                <th>RR</th>
+                <th>Result</th>
+                <th>P&amp;L</th>
+                <th>Cum</th>
+                <th class="note-col">Notes</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="trade-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="tab-analysis" class="tab-panel">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Performance review</p>
+            <h1>Analysis</h1>
+            <p class="muted">Auto breakdown by session, level, timeframe, setup, and mistakes.</p>
+          </div>
+          <button class="soft-btn" onclick="seedDemoTrades()"><i data-lucide="sparkles"></i><span>Load Demo Data</span></button>
+        </header>
+        <div id="analysis-content" class="analysis-content"></div>
+      </section>
+
+      <section id="tab-pnl" class="tab-panel">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Pips calendar</p>
+            <h1>PnL</h1>
+            <p class="muted">Monthly profit and loss heatmap in pips.</p>
+          </div>
+          <div class="head-actions">
+            <button class="soft-btn" onclick="changePnlMonth(-1)"><i data-lucide="chevron-left"></i><span>Prev</span></button>
+            <button class="soft-btn" onclick="goCurrentPnlMonth()"><i data-lucide="calendar-check"></i><span>This Month</span></button>
+            <button class="soft-btn" onclick="changePnlMonth(1)"><i data-lucide="chevron-right"></i><span>Next</span></button>
+          </div>
+        </header>
+        <div id="pnl-content" class="pnl-content"></div>
+      </section>
+
+      <section id="tab-weekly" class="tab-panel">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Reflection loop</p>
+            <h1>Weekly Review</h1>
+            <p class="muted">Save weekly lessons, repeated patterns, and next-week improvements.</p>
+          </div>
+        </header>
+        <div class="weekly-content">
+          <section class="weekly-form panel panel-pad">
+            <label class="modal-field">
+              <span>Week of</span>
+              <input id="review-week" type="date">
+            </label>
+            <label class="modal-field modal-wide">
+              <span>What did I learn this week?</span>
+              <textarea id="review-learned" placeholder="Main lesson..."></textarea>
+            </label>
+            <label class="modal-field modal-wide">
+              <span>What pattern repeated (good or bad)?</span>
+              <textarea id="review-pattern" placeholder="Repeated pattern..."></textarea>
+            </label>
+            <label class="modal-field modal-wide">
+              <span>What will I improve next week?</span>
+              <textarea id="review-improve" placeholder="Next improvement..."></textarea>
+            </label>
+            <div class="weekly-actions">
+              <button class="primary-btn" onclick="saveWeeklyReview()"><i data-lucide="save"></i><span>Save Review</span></button>
+            </div>
+          </section>
+          <section>
+            <div class="panel-title"><span>Past Reviews</span><span class="neutral" id="review-count">0 saved</span></div>
+            <div id="weekly-review-list" class="weekly-review-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="tab-manage" class="tab-panel">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Journal setup</p>
+            <h1>Options</h1>
+            <p class="muted">Add your own sessions, levels, setups, and mistake tags.</p>
+          </div>
+          <button class="danger-soft-btn" onclick="resetOptions()"><i data-lucide="rotate-ccw"></i><span>Reset Options</span></button>
+        </header>
+        <div class="notice">Custom options appear instantly in the trade table and all analysis reports.</div>
+        <div class="manage-grid" id="manage-grid"></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="trade-modal" hidden>
+    <div class="trade-modal" role="dialog" aria-modal="true" aria-labelledby="trade-modal-title">
+      <button class="modal-close" type="button" onclick="closeTradeModal()" aria-label="Close">
+        <i data-lucide="x"></i>
+      </button>
+      <h2 id="trade-modal-title">NEW_TRADE</h2>
+      <div class="modal-grid">
+        <label class="modal-field">
+          <span>Date</span>
+          <input id="modal-date" type="date">
+        </label>
+        <label class="modal-field">
+          <span>Session</span>
+          <select id="modal-session"></select>
+        </label>
+        <label class="modal-field">
+          <span>Direction</span>
+          <select id="modal-entry">
+            <option value="">Select</option>
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+          </select>
+        </label>
+        <label class="modal-field">
+          <span>Level</span>
+          <select id="modal-level"></select>
+        </label>
+        <label class="modal-field">
+          <span>Timeframe</span>
+          <select id="modal-tf"></select>
+        </label>
+        <label class="modal-field">
+          <span>Result</span>
+          <select id="modal-result">
+            <option value="">Select</option>
+            <option value="WIN">WIN</option>
+            <option value="LOSS">LOSS</option>
+            <option value="BE">BE</option>
+          </select>
+        </label>
+        <label class="modal-field">
+          <span>Setup Quality</span>
+          <select id="modal-setup"></select>
+        </label>
+        <label class="modal-field">
+          <span>Hold Quality</span>
+          <select id="modal-hold"></select>
+        </label>
+        <label class="modal-field">
+          <span>Market Condition</span>
+          <select id="modal-market-condition"></select>
+        </label>
+        <label class="modal-field">
+          <span>Trade Direction vs Bias</span>
+          <select id="modal-bias-alignment"></select>
+        </label>
+        <label class="modal-field">
+          <span>Confirmation Type</span>
+          <select id="modal-confirmation-type"></select>
+        </label>
+        <label class="modal-field">
+          <span>SL/TP Placement</span>
+          <select id="modal-sl-tp-placement"></select>
+        </label>
+        <label class="modal-field">
+          <span>Patience Score</span>
+          <input id="modal-patience-score" type="number" min="1" max="5" step="1" placeholder="1 to 5">
+        </label>
+        <label class="modal-field">
+          <span>Mistake</span>
+          <select id="modal-mistake"></select>
+        </label>
+        <label class="modal-field">
+          <span>Risk (pips)</span>
+          <input id="modal-risk" type="number" min="0" step="0.1">
+        </label>
+        <label class="modal-field">
+          <span>Reward (pips)</span>
+          <input id="modal-reward" type="number" min="0" step="0.1">
+        </label>
+        <label class="modal-field modal-wide">
+          <span>Notes / Reason</span>
+          <textarea id="modal-reason" placeholder="Trade rationale..."></textarea>
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button class="soft-btn" type="button" onclick="closeTradeModal()">Cancel</button>
+        <button class="primary-btn" type="button" onclick="saveTradeFromModal()">Save Trade</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <div id="print-report" class="print-report"></div>
+  <script src="app.js"></script>
+</body>
+</html>

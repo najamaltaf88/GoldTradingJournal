@@ -1,0 +1,19 @@
+{
+  "name": "Gold Trading Journal",
+  "short_name": "Gold Journal",
+  "description": "Installable XAUUSD trading journal with trade log, analysis, and PDF reports.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#080a0d",
+  "theme_color": "#10141a",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
