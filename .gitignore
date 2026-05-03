@@ -5,9 +5,16 @@ Desktop.ini
 # Logs
 *.log
 
+# Local Firebase config with project keys
+firebase-config.js
+.firebaserc
+
 # Editor
 .vscode/
 .idea/
 
 # Python cache
 __pycache__/
+
+# Firebase deploy cache
+.firebase/

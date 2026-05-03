@@ -15,17 +15,46 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=20260503-clear-trades-v10">
+  <script src="firebase-config.js"></script>
 </head>
 <body>
+  <div id="login-screen" hidden>
+    <div class="login-card">
+      <div class="brand-mark">AU</div>
+      <h1>Gold Trading Journal</h1>
+      <p>XAUUSD trade desk</p>
+      <button class="google-btn" onclick="signInWithGoogle()">
+        <span>G</span>
+        <b>Sign in with Google</b>
+      </button>
+      <small>Your data is saved to the cloud. Works on any device.</small>
+    </div>
+  </div>
+  <div class="mobile-topbar">
+    <button class="icon-btn" onclick="openMobileMenu()" aria-label="Open menu"><i data-lucide="menu"></i></button>
+    <span>Gold Journal</span>
+    <button class="icon-btn" onclick="addTrade()" aria-label="New trade"><i data-lucide="plus"></i></button>
+  </div>
+  <div class="sidebar-backdrop" onclick="closeMobileMenu()"></div>
   <div class="app">
-    <aside class="sidebar">
+    <aside class="sidebar" id="app-sidebar">
       <div class="brand">
         <div class="brand-mark">AU</div>
         <div>
           <div class="brand-title">Gold Journal</div>
           <div class="brand-sub">XAUUSD trade desk</div>
         </div>
+      </div>
+
+      <div class="user-row" id="user-row" hidden>
+        <img id="user-avatar" src="" width="28" height="28" alt="">
+        <span id="user-name"></span>
+        <button onclick="signOutUser()">Sign out</button>
+      </div>
+      <div class="sync-status" id="sync-status">
+        <span class="sync-dot syncing"></span>
+        <span class="sync-label">Connecting...</span>
       </div>
 
       <nav class="nav" aria-label="Main navigation">
@@ -99,7 +128,9 @@
             <span>Setup</span>
             <select id="setup-filter" onchange="renderTrades()"></select>
           </label>
+          <button id="column-toggle" class="soft-btn compact" onclick="toggleOptionalColumns()"><i data-lucide="columns-3"></i><span>Show Columns</span></button>
           <button class="soft-btn compact" onclick="clearFilters()"><i data-lucide="x"></i><span>Clear</span></button>
+          <button class="danger-soft-btn compact" onclick="clearAllTrades()"><i data-lucide="trash-2"></i><span>Clear All Trades</span></button>
         </div>
 
         <div class="report-tools">
@@ -140,10 +171,10 @@
                 <th>Setup</th>
                 <th>Mistake</th>
                 <th>Hold</th>
-                <th>Market</th>
-                <th>Bias</th>
-                <th>Confirm</th>
-                <th>SL/TP</th>
+                <th class="optional-col">Market</th>
+                <th class="optional-col">Bias</th>
+                <th class="optional-col">Confirm</th>
+                <th class="optional-col">SL/TP</th>
                 <th>Patience</th>
                 <th>Risk</th>
                 <th>Reward</th>
@@ -165,7 +196,7 @@
           <div>
             <p class="eyebrow">Performance review</p>
             <h1>Analysis</h1>
-            <p class="muted">Auto breakdown by session, level, timeframe, setup, and mistakes.</p>
+            <p class="muted">Automated edge scanner for win rate, loss quality, sessions, levels, and confirmations.</p>
           </div>
           <button class="soft-btn" onclick="seedDemoTrades()"><i data-lucide="sparkles"></i><span>Load Demo Data</span></button>
         </header>
@@ -232,7 +263,10 @@
             <h1>Options</h1>
             <p class="muted">Add your own sessions, levels, setups, and mistake tags.</p>
           </div>
-          <button class="danger-soft-btn" onclick="resetOptions()"><i data-lucide="rotate-ccw"></i><span>Reset Options</span></button>
+          <div class="head-actions">
+            <button class="danger-soft-btn" onclick="clearAllTrades()"><i data-lucide="trash-2"></i><span>Clear All Trades</span></button>
+            <button class="danger-soft-btn" onclick="resetOptions()"><i data-lucide="rotate-ccw"></i><span>Reset Options</span></button>
+          </div>
         </header>
         <div class="notice">Custom options appear instantly in the trade table and all analysis reports.</div>
         <div class="manage-grid" id="manage-grid"></div>
@@ -247,83 +281,110 @@
       </button>
       <h2 id="trade-modal-title">NEW_TRADE</h2>
       <div class="modal-grid">
-        <label class="modal-field">
-          <span>Date</span>
-          <input id="modal-date" type="date">
-        </label>
-        <label class="modal-field">
-          <span>Session</span>
-          <select id="modal-session"></select>
-        </label>
-        <label class="modal-field">
-          <span>Direction</span>
-          <select id="modal-entry">
-            <option value="">Select</option>
-            <option value="BUY">BUY</option>
-            <option value="SELL">SELL</option>
-          </select>
-        </label>
-        <label class="modal-field">
-          <span>Level</span>
-          <select id="modal-level"></select>
-        </label>
-        <label class="modal-field">
-          <span>Timeframe</span>
-          <select id="modal-tf"></select>
-        </label>
-        <label class="modal-field">
-          <span>Result</span>
-          <select id="modal-result">
-            <option value="">Select</option>
-            <option value="WIN">WIN</option>
-            <option value="LOSS">LOSS</option>
-            <option value="BE">BE</option>
-          </select>
-        </label>
-        <label class="modal-field">
-          <span>Setup Quality</span>
-          <select id="modal-setup"></select>
-        </label>
-        <label class="modal-field">
-          <span>Hold Quality</span>
-          <select id="modal-hold"></select>
-        </label>
-        <label class="modal-field">
-          <span>Market Condition</span>
-          <select id="modal-market-condition"></select>
-        </label>
-        <label class="modal-field">
-          <span>Trade Direction vs Bias</span>
-          <select id="modal-bias-alignment"></select>
-        </label>
-        <label class="modal-field">
-          <span>Confirmation Type</span>
-          <select id="modal-confirmation-type"></select>
-        </label>
-        <label class="modal-field">
-          <span>SL/TP Placement</span>
-          <select id="modal-sl-tp-placement"></select>
-        </label>
-        <label class="modal-field">
-          <span>Patience Score</span>
-          <input id="modal-patience-score" type="number" min="1" max="5" step="1" placeholder="1 to 5">
-        </label>
-        <label class="modal-field">
-          <span>Mistake</span>
-          <select id="modal-mistake"></select>
-        </label>
-        <label class="modal-field">
-          <span>Risk (pips)</span>
-          <input id="modal-risk" type="number" min="0" step="0.1">
-        </label>
-        <label class="modal-field">
-          <span>Reward (pips)</span>
-          <input id="modal-reward" type="number" min="0" step="0.1">
-        </label>
-        <label class="modal-field modal-wide">
-          <span>Notes / Reason</span>
-          <textarea id="modal-reason" placeholder="Trade rationale..."></textarea>
-        </label>
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Trade Details</span></div>
+          <div class="modal-section-grid">
+            <label class="modal-field">
+              <span>Date</span>
+              <input id="modal-date" type="date">
+            </label>
+            <label class="modal-field">
+              <span>Session</span>
+              <select id="modal-session"></select>
+            </label>
+            <label class="modal-field">
+              <span>Direction</span>
+              <select id="modal-entry">
+                <option value="">Select</option>
+                <option value="BUY">BUY</option>
+                <option value="SELL">SELL</option>
+              </select>
+            </label>
+            <label class="modal-field">
+              <span>Result</span>
+              <select id="modal-result">
+                <option value="">Select</option>
+                <option value="WIN">WIN</option>
+                <option value="LOSS">LOSS</option>
+                <option value="BE">BE</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Strategy</span></div>
+          <div class="modal-section-grid">
+            <label class="modal-field">
+              <span>Level</span>
+              <select id="modal-level"></select>
+            </label>
+            <label class="modal-field">
+              <span>Timeframe</span>
+              <select id="modal-tf"></select>
+            </label>
+            <label class="modal-field">
+              <span>Setup Quality</span>
+              <select id="modal-setup"></select>
+            </label>
+            <label class="modal-field">
+              <span>Confirmation Type</span>
+              <select id="modal-confirmation-type"></select>
+            </label>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Execution</span></div>
+          <div class="modal-section-grid">
+            <label class="modal-field">
+              <span>Market Condition</span>
+              <select id="modal-market-condition"></select>
+            </label>
+            <label class="modal-field">
+              <span>Trade Direction vs Bias</span>
+              <select id="modal-bias-alignment"></select>
+            </label>
+            <label class="modal-field">
+              <span>SL/TP Placement</span>
+              <select id="modal-sl-tp-placement"></select>
+            </label>
+            <label class="modal-field">
+              <span>Patience Score</span>
+              <input id="modal-patience-score" type="number" min="1" max="5" step="1" placeholder="1 to 5">
+            </label>
+            <label class="modal-field">
+              <span>Mistake</span>
+              <select id="modal-mistake"></select>
+            </label>
+            <label class="modal-field">
+              <span>Hold Quality</span>
+              <select id="modal-hold"></select>
+            </label>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Risk</span></div>
+          <div class="modal-section-grid">
+            <label class="modal-field">
+              <span>Risk (pips)</span>
+              <input id="modal-risk" type="number" min="0" step="0.1">
+            </label>
+            <label class="modal-field">
+              <span>Reward (pips)</span>
+              <input id="modal-reward" type="number" min="0" step="0.1">
+            </label>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Notes</span></div>
+          <label class="modal-field modal-wide">
+            <span>Notes / Reason</span>
+            <textarea id="modal-reason" placeholder="Trade rationale..."></textarea>
+          </label>
+        </section>
       </div>
       <div class="modal-actions">
         <button class="soft-btn" type="button" onclick="closeTradeModal()">Cancel</button>
@@ -332,8 +393,42 @@
     </div>
   </div>
 
+  <nav class="bottom-nav" aria-label="Mobile navigation">
+    <button class="bottom-nav-btn active" data-tab="log" onclick="switchTab('log', this)"><i data-lucide="table-2"></i><span>Log</span></button>
+    <button class="bottom-nav-btn" data-tab="analysis" onclick="switchTab('analysis', this)"><i data-lucide="bar-chart-3"></i><span>Analysis</span></button>
+    <button class="bottom-nav-btn" data-tab="pnl" onclick="switchTab('pnl', this)"><i data-lucide="calendar-days"></i><span>PnL</span></button>
+    <button class="bottom-nav-btn" data-tab="weekly" onclick="switchTab('weekly', this)"><i data-lucide="notebook-pen"></i><span>Weekly</span></button>
+    <button class="bottom-nav-btn" data-tab="manage" onclick="switchTab('manage', this)"><i data-lucide="sliders-horizontal"></i><span>Options</span></button>
+  </nav>
   <div class="toast" id="toast"></div>
   <div id="print-report" class="print-report"></div>
-  <script src="app.js"></script>
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+    import { getFirestore, doc, setDoc, getDoc, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+    import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+    window.GoogleAuthProvider = GoogleAuthProvider;
+    window.signInWithPopup = signInWithPopup;
+    window.firebaseSignOut = signOut;
+    window.onAuthStateChanged = onAuthStateChanged;
+    window.firestoreDoc = doc;
+    window.firestoreSetDoc = setDoc;
+    window.firestoreGetDoc = getDoc;
+    window.firestoreCollection = collection;
+    window.firestoreGetDocs = getDocs;
+    window.firestoreDeleteDoc = deleteDoc;
+    window.rtdbRef = ref;
+    window.rtdbOnValue = onValue;
+    window.initializeFirebaseServices = (config) => {
+      window.firebaseApp = initializeApp(config);
+      window.firebaseAuth = getAuth(window.firebaseApp);
+      window.firebaseDb = getFirestore(window.firebaseApp);
+      window.firebaseRtdb = getDatabase(window.firebaseApp);
+      window.dispatchEvent(new CustomEvent("firebase-ready"));
+    };
+    window.dispatchEvent(new CustomEvent("firebase-sdk-ready"));
+  </script>
+  <script src="app.js?v=20260503-clear-trades-v10"></script>
 </body>
 </html>

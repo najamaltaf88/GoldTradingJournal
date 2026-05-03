@@ -1,3 +1,17 @@
+const FIREBASE_CONFIG = window.FIREBASE_CONFIG || {
+  apiKey: "",
+  authDomain: "",
+  projectId: "",
+  storageBucket: "",
+  messagingSenderId: "",
+  appId: "",
+  databaseURL: ""
+};
+
+function hasFirebaseConfig() {
+  return Boolean(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId && FIREBASE_CONFIG.appId);
+}
+
 const KEY = "xau_journal_v6";
 const LEGACY_KEY = "xau_journal_v5";
 
@@ -30,6 +44,7 @@ const CAT_META = {
 const DATE_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
 let state = {
+  ownerUid: "",
   trades: [],
   options: clone(FIXED),
   settings: { defaultRisk: "" },
@@ -43,9 +58,22 @@ let pnlView = {
 };
 
 let modalEditingIndex = null;
+let analysisTimer = null;
+let currentUser = null;
+let firebaseReady = false;
+let firestoreLoadComplete = false;
+
+const uiState = {
+  optionalColumns: true,
+  comboMinTrades: 2
+};
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function generateId(prefix = "id") {
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
 function loadState() {
@@ -54,6 +82,17 @@ function loadState() {
   try {
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.trades)) return;
+    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.uid) {
+      state = {
+        ownerUid: currentUser.uid,
+        trades: [],
+        options: clone(FIXED),
+        settings: { defaultRisk: "" },
+        weeklyReviews: []
+      };
+      return;
+    }
+    state.ownerUid = currentUser?.uid || parsed.ownerUid || "";
     state.trades = parsed.trades.map(normalizeTrade);
     state.options = normalizeOptions(parsed.options || FIXED);
     state.settings = Object.assign({ defaultRisk: "" }, parsed.settings || {});
@@ -74,6 +113,7 @@ function normalizeOptions(options) {
 
 function normalizeTrade(trade) {
   return {
+    id: trade.id || generateId("trade"),
     date: trade.date || "",
     session: trade.session || "",
     entry: trade.entry || "",
@@ -104,7 +144,7 @@ function normalizePatienceScore(value) {
 
 function normalizeWeeklyReview(review) {
   return {
-    id: review.id || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id: review.id || generateId("review"),
     weekOf: review.weekOf || "",
     learned: review.learned || "",
     pattern: review.pattern || "",
@@ -113,11 +153,22 @@ function normalizeWeeklyReview(review) {
   };
 }
 
-function save() {
+async function save() {
   try {
+    if (currentUser) state.ownerUid = currentUser.uid;
     localStorage.setItem(KEY, JSON.stringify(state));
   } catch (error) {
     console.warn("Could not save journal state", error);
+    updateSyncStatus("offline");
+  }
+
+  if (currentUser && firestoreLoadComplete) {
+    try {
+      await saveToFirestore();
+    } catch (error) {
+      console.warn("Could not sync to Firestore", error);
+      updateSyncStatus("offline");
+    }
   }
 }
 
@@ -279,6 +330,7 @@ function toast(message) {
 function renderSummary() {
   const p = performance();
   const open = state.trades.length - p.closed.length;
+  const bestLevel = bestLevelByPnl();
   const strip = document.getElementById("summary-strip");
   if (strip) {
     strip.innerHTML = [
@@ -297,6 +349,7 @@ function renderSummary() {
       <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-val ${p.winRate >= 50 ? "pos" : "neg"}">${p.winRate.toFixed(0)}%</span></div>
       <div class="stat-row"><span class="stat-label">Total P&L</span><span class="stat-val ${moneyClass(p.totalPnl)}">${signed(p.totalPnl)}</span></div>
       <div class="stat-row"><span class="stat-label">Drawdown</span><span class="stat-val ${p.maxDrawdown < 0 ? "neg" : "neutral"}">${signed(p.maxDrawdown)}</span></div>
+      <div class="stat-row"><span class="stat-label">Best Level</span><span class="stat-val gold">${escapeHtml(bestLevel || "-")}</span></div>
     `;
   }
 
@@ -306,9 +359,22 @@ function renderSummary() {
   }
 }
 
+function bestLevelByPnl() {
+  const p = performance();
+  const map = new Map();
+  p.closed.forEach((trade) => {
+    const key = trade.level || "-";
+    map.set(key, round1((map.get(key) || 0) + (parseFloat(trade.pnl) || 0)));
+  });
+  const rows = Array.from(map.entries()).filter(([, pnl]) => pnl !== 0);
+  if (!rows.length) return "";
+  return rows.sort((a, b) => b[1] - a[1])[0][0];
+}
+
 function metric(label, value, note, cls = "") {
+  const cardClass = cls ? ` metric-${cls}` : "";
   return `
-    <div class="metric-card">
+    <div class="metric-card${cardClass}">
       <div class="metric-label">${escapeHtml(label)}</div>
       <div class="metric-value ${cls}">${escapeHtml(value)}</div>
       <div class="metric-note">${escapeHtml(note)}</div>
@@ -337,6 +403,19 @@ function clearFilters() {
   renderTrades();
 }
 
+function toggleOptionalColumns() {
+  uiState.optionalColumns = !uiState.optionalColumns;
+  updateColumnToggle();
+}
+
+function updateColumnToggle() {
+  document.body.classList.toggle("show-optional-columns", uiState.optionalColumns);
+  const button = document.getElementById("column-toggle");
+  if (!button) return;
+  button.innerHTML = `<i data-lucide="columns-3"></i><span>${uiState.optionalColumns ? "Hide Columns" : "Show Columns"}</span>`;
+  refreshIcons();
+}
+
 function filteredTrades() {
   const search = (document.getElementById("search-input")?.value || "").trim().toLowerCase();
   const result = document.getElementById("result-filter")?.value || "";
@@ -360,13 +439,30 @@ function filteredTrades() {
 function renderTrades() {
   recalcCum();
   renderSummary();
+  updateColumnToggle();
   const tbody = document.getElementById("trade-body");
   if (!tbody) return;
   tbody.innerHTML = "";
 
   const rows = filteredTrades();
   if (!state.trades.length) {
-    tbody.innerHTML = `<tr><td colspan="22"><div class="empty-state"><div><strong>No trades yet</strong><span>Click New Trade and the journal will auto-fill date and session.</span></div></div></td></tr>`;
+    tbody.innerHTML = `
+      <tr class="empty-row">
+        <td colspan="22">
+          <div class="empty-state onboarding-state">
+            <div class="onboarding-card">
+              <i data-lucide="clipboard-plus"></i>
+              <strong>Start your first trade</strong>
+              <span>Click New Trade, fill the form, and your analysis updates automatically. No spreadsheet needed.</span>
+              <div class="onboarding-actions">
+                <button class="primary-btn" onclick="addTrade()"><i data-lucide="plus"></i><span>New Trade</span></button>
+                <button class="soft-btn" onclick="seedDemoTrades()"><i data-lucide="sparkles"></i><span>Or load demo data to explore the app</span></button>
+              </div>
+            </div>
+          </div>
+        </td>
+      </tr>
+    `;
     refreshIcons();
     return;
   }
@@ -380,6 +476,11 @@ function renderTrades() {
   rows.forEach(({ trade, index }) => {
     const tr = document.createElement("tr");
     tr.className = trade.result === "WIN" ? "row-win" : trade.result === "LOSS" ? "row-loss" : trade.result === "BE" ? "row-be" : "";
+    tr.classList.add("clickable-row");
+    tr.addEventListener("click", (event) => {
+      if (event.target.closest("button, input, select, textarea, a")) return;
+      openTradeModal(index);
+    });
     tr.appendChild(textCell("#", index + 1, "row-num"));
     tr.appendChild(displayCell("Date", formatDateDisplay(trade.date) || "-", "date-display"));
     tr.appendChild(displayCell("Session", trade.session || "-", "wrap-text"));
@@ -389,10 +490,10 @@ function renderTrades() {
     tr.appendChild(htmlCell("Setup", valuePill(trade.setup, "setup")));
     tr.appendChild(displayCell("Mistake", trade.mistake || "-", "wrap-text"));
     tr.appendChild(displayCell("Hold", trade.hold || "-", "wrap-text"));
-    tr.appendChild(displayCell("Market", trade.marketCondition || "-", "wrap-text"));
-    tr.appendChild(displayCell("Bias", trade.biasAlignment || "-", "wrap-text"));
-    tr.appendChild(displayCell("Confirm", trade.confirmationType || "-", "wrap-text"));
-    tr.appendChild(displayCell("SL/TP", trade.slTpPlacement || "-", "wrap-text"));
+    tr.appendChild(displayCell("Market", trade.marketCondition || "-", "wrap-text optional-col"));
+    tr.appendChild(displayCell("Bias", trade.biasAlignment || "-", "wrap-text optional-col"));
+    tr.appendChild(displayCell("Confirm", trade.confirmationType || "-", "wrap-text optional-col"));
+    tr.appendChild(displayCell("SL/TP", trade.slTpPlacement || "-", "wrap-text optional-col"));
     tr.appendChild(htmlCell("Patience", patienceBadge(index, trade.patienceScore)));
     tr.appendChild(displayCell("Risk", trade.risk || "-", "mono"));
     tr.appendChild(displayCell("Reward", trade.reward || "-", "mono"));
@@ -566,11 +667,13 @@ function newTradeTemplate(source) {
   const base = source ? clone(source) : {};
   return normalizeTrade({
     ...base,
+    id: generateId("trade"),
     date: todayISO(),
     session: base.session || currentSession(),
     mistake: base.mistake || "No mistake",
     risk: base.risk || state.settings.defaultRisk || "",
     result: source ? "" : base.result || "",
+    patienceScore: source ? "" : base.patienceScore || "",
     reason: source ? "" : base.reason || ""
   });
 }
@@ -704,6 +807,7 @@ function saveTradeFromModal() {
   if (modalEditingIndex === null) {
     state.trades.push(trade);
   } else {
+    trade.id = state.trades[modalEditingIndex]?.id || trade.id || generateId("trade");
     state.trades[modalEditingIndex] = trade;
   }
   save();
@@ -730,20 +834,49 @@ function scrollToLastRow() {
   }, 40);
 }
 
+function showAnalysisSkeleton() {
+  const el = document.getElementById("analysis-content");
+  if (!el) return;
+  el.innerHTML = `
+    <div class="analysis-skeleton" aria-label="Loading analysis">
+      <div></div>
+      <div></div>
+      <div></div>
+    </div>
+  `;
+}
+
+function renderAnalysisWithDelay() {
+  clearTimeout(analysisTimer);
+  showAnalysisSkeleton();
+  analysisTimer = setTimeout(renderAnalysis, 200);
+}
+
 function renderAnalysis() {
   const el = document.getElementById("analysis-content");
   if (!el) return;
   const p = performance();
   const streaks = streakStats();
   el.innerHTML = `
-    <div class="dashboard-strip" style="padding:0 0 14px">
+    <div class="analysis-automation">
+      <div>
+        <span class="auto-chip">Auto Analysis Engine</span>
+        <h2>Performance Command Center</h2>
+        <p>Live edge scanner across levels, sessions, confirmations, risk, and result quality.</p>
+      </div>
+      <div class="auto-pulse">
+        <span>${p.winRate.toFixed(1)}%</span>
+        <small>WIN RATE</small>
+      </div>
+    </div>
+    <div class="dashboard-strip analysis-strip">
       ${metric("Total Trades", p.closed.length, `${state.trades.length - p.closed.length} open`)}
       ${metric("Wins", p.wins.length, "closed winners", "pos")}
       ${metric("Losses", p.losses.length, "closed losses", "neg")}
       ${metric("Avg Win", `${p.avgWin.toFixed(1)} pips`, "winning trades", "pos")}
       ${metric("Avg Loss", `${p.avgLoss.toFixed(1)} pips`, "losing trades", "neg")}
     </div>
-    <div class="dashboard-strip" style="padding:0 0 14px">
+    <div class="dashboard-strip analysis-strip">
       ${metric("Current Win Streak", streaks.currentWin, "latest closed trades", streaks.currentWin ? "pos" : "neutral")}
       ${metric("Current Loss Streak", streaks.currentLoss, "latest closed trades", streaks.currentLoss ? "neg" : "neutral")}
       ${metric("Best Win Streak", streaks.bestWin, "all time", "pos")}
@@ -752,11 +885,11 @@ function renderAnalysis() {
     </div>
     <div class="analysis-grid">
       <div class="panel panel-pad">
-        <div class="panel-title"><span>Equity Curve</span><span class="${moneyClass(p.totalPnl)}">${signed(p.totalPnl)} pips</span></div>
+        <div class="panel-title"><span>Equity Curve</span><span class="section-pill ${moneyClass(p.totalPnl)}">${signed(p.totalPnl)} pips</span></div>
         ${equitySvg()}
       </div>
       <div class="panel panel-pad">
-        <div class="panel-title"><span>Auto Insights</span><span class="neutral">${p.closed.length} closed</span></div>
+        <div class="panel-title"><span>Auto Insights</span><span class="section-pill neutral">${p.closed.length} closed</span></div>
         <div class="insight-list">${insightHtml()}</div>
       </div>
     </div>
@@ -771,6 +904,7 @@ function renderAnalysis() {
     ${analysisTable("SL/TP Placement Analysis", "slTpPlacements", "slTpPlacement")}
     ${patienceAnalysis()}
     ${crossTable()}
+    ${comboAnalysisTable()}
   `;
   refreshIcons();
 }
@@ -817,12 +951,65 @@ function insightHtml() {
   const bestSession = bestGroup("sessions", "session", "winrate");
   const costlyMistake = worstGroup("mistakes", "mistake");
   const streak = currentStreak();
+  const bestDay = bestWeekdayInsight();
+  const patience = patienceCostInsight();
+  const counterTrend = counterTrendInsight();
   return [
     insight("trophy", "Best level", bestLevel ? `${bestLevel.key}: ${signed(bestLevel.pnl)} pips across ${bestLevel.count} trades.` : "No clear level edge yet."),
     insight("clock-3", "Best session", bestSession ? `${bestSession.key}: ${bestSession.winRate.toFixed(0)}% win rate.` : "No clear session edge yet."),
     insight("alert-triangle", "Costly mistake", costlyMistake ? `${costlyMistake.key}: ${signed(costlyMistake.pnl)} pips. Reduce this first.` : "No mistake pattern detected."),
-    insight(streak.type === "WIN" ? "flame" : "activity", "Current streak", streak.count ? `${streak.count} ${streak.type.toLowerCase()} trade(s) in a row.` : "No closed streak yet.")
+    insight(streak.type === "WIN" ? "flame" : "activity", "Current streak", streak.count ? `${streak.count} ${streak.type.toLowerCase()} trade(s) in a row.` : "No closed streak yet."),
+    insight("calendar-check", "Best day of week", bestDay || "No weekday edge yet."),
+    insight("gauge", "Patience insight", patience || "More scored trades are needed for patience insight."),
+    insight("route-off", "Counter trend alert", counterTrend || "Counter trend risk looks stable so far.")
   ].join("");
+}
+
+function bestWeekdayInsight() {
+  const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+  const map = new Map(weekdays.map((day) => [day, { day, trades: 0, wins: 0 }]));
+  performance().closed.forEach((trade) => {
+    if (!trade.date) return;
+    const day = new Date(`${trade.date}T00:00:00`).toLocaleDateString(undefined, { weekday: "long" });
+    if (!map.has(day)) return;
+    const row = map.get(day);
+    row.trades += 1;
+    row.wins += trade.result === "WIN" ? 1 : 0;
+  });
+  const rows = Array.from(map.values()).filter((row) => row.trades > 0);
+  if (!rows.length) return "";
+  const best = rows.sort((a, b) => (b.wins / b.trades) - (a.wins / a.trades) || b.trades - a.trades)[0];
+  return `${best.day}: ${((best.wins / best.trades) * 100).toFixed(0)}% win rate`;
+}
+
+function avgPatienceNumber(result) {
+  const rows = performance().closed.filter((trade) => trade.result === result && trade.patienceScore);
+  if (!rows.length) return null;
+  return rows.reduce((sum, trade) => sum + (parseInt(trade.patienceScore, 10) || 0), 0) / rows.length;
+}
+
+function patienceCostInsight() {
+  const lossAvg = avgPatienceNumber("LOSS");
+  const winAvg = avgPatienceNumber("WIN");
+  if (lossAvg === null || winAvg === null || lossAvg >= winAvg) return "";
+  const lowPatienceLoss = performance().closed
+    .filter((trade) => trade.result === "LOSS" && trade.patienceScore && parseInt(trade.patienceScore, 10) < winAvg)
+    .reduce((sum, trade) => sum + Math.abs(parseFloat(trade.pnl) || parseFloat(calcPnl(trade.risk, trade.reward, trade.result)) || 0), 0);
+  return `Impatient entries cost you ${round1(lowPatienceLoss)} pips. Score ≥4 trades win ${patienceWinRate((score) => score >= 4)} vs ${patienceWinRate((score) => score <= 2)} for ≤2.`;
+}
+
+function biasWinRate(label) {
+  const rows = performance().closed.filter((trade) => trade.biasAlignment === label);
+  if (!rows.length) return null;
+  const wins = rows.filter((trade) => trade.result === "WIN").length;
+  return { count: rows.length, winRate: (wins / rows.length) * 100 };
+}
+
+function counterTrendInsight() {
+  const withTrend = biasWinRate("With Trend");
+  const counterTrend = biasWinRate("Counter Trend");
+  if (!withTrend || !counterTrend || counterTrend.winRate >= withTrend.winRate) return "";
+  return `Counter Trend trades win ${counterTrend.winRate.toFixed(0)}% vs ${withTrend.winRate.toFixed(0)}% with trend.`;
 }
 
 function insight(icon, title, text) {
@@ -928,7 +1115,15 @@ function patienceAnalysis() {
   `;
 }
 
+function bestWinRateKey(catKey, field) {
+  if (!["levels", "tfs", "sessions"].includes(catKey)) return "";
+  const groups = grouped(catKey, field).filter((item) => item.count >= 3);
+  if (!groups.length) return "";
+  return groups.sort((a, b) => b.winRate - a.winRate || b.count - a.count || b.pnl - a.pnl)[0].key;
+}
+
 function analysisTable(title, catKey, field) {
+  const bestKey = bestWinRateKey(catKey, field);
   const rows = (state.options[catKey] || []).map((key) => {
     const g = grouped(catKey, field).find((item) => item.key === key) || { key, count: 0, wins: 0, pnl: 0, winRate: 0, group: [] };
     const losses = g.group.filter((trade) => trade.result === "LOSS").length;
@@ -940,26 +1135,26 @@ function analysisTable(title, catKey, field) {
     const color = g.winRate >= 60 ? "var(--green)" : g.winRate >= 40 ? "var(--amber)" : "var(--red)";
     return `
       <tr>
-        <td class="key-cell">${escapeHtml(key)}</td>
-        <td>${g.count}</td>
-        <td class="pos">${g.wins}</td>
-        <td class="neg">${losses}</td>
-        <td class="neutral">${bes}</td>
-        <td>
+        <td class="key-cell" data-label="Name">${escapeHtml(key)}${bestKey === key ? ` <span class="best-badge">⭐ Best</span>` : ""}</td>
+        <td data-label="Trades"><span class="count-chip chip-total">${g.count}</span></td>
+        <td class="pos" data-label="Wins"><span class="count-chip chip-win">${g.wins}</span></td>
+        <td class="neg" data-label="Losses"><span class="count-chip chip-loss">${losses}</span></td>
+        <td class="neutral" data-label="BE"><span class="count-chip chip-be">${bes}</span></td>
+        <td data-label="Win Rate">
           <div class="wr-cell">
             <div class="wr-bar"><div class="wr-fill" style="width:${g.winRate.toFixed(0)}%;background:${color}"></div></div>
             <span>${g.count ? `${g.winRate.toFixed(0)}%` : "-"}</span>
           </div>
         </td>
-        <td class="${moneyClass(g.pnl)}">${g.count ? signed(g.pnl) : "-"}</td>
-        <td>${avgRR ? `1:${avgRR.toFixed(2)}` : "-"}</td>
+        <td class="${moneyClass(g.pnl)}" data-label="Total P&L">${g.count ? signed(g.pnl) : "-"}</td>
+        <td data-label="Avg Win RR">${avgRR ? `1:${avgRR.toFixed(2)}` : "-"}</td>
       </tr>
     `;
   }).join("");
 
   return `
     <div class="a-section">
-      <div class="panel-title"><span>${escapeHtml(title)}</span></div>
+      <div class="panel-title"><span>${escapeHtml(title)}</span><span class="section-pill">auto ranked</span></div>
       <div class="table-shell" style="margin:0">
         <table class="a-table">
           <thead><tr><th>Name</th><th>Trades</th><th>Wins</th><th>Losses</th><th>BE</th><th>Win Rate</th><th>Total P&L</th><th>Avg Win RR</th></tr></thead>
@@ -996,6 +1191,92 @@ function crossTable() {
       </div>
     </div>
   `;
+}
+
+function comboAnalysisRows(closedTrades = performance().closed) {
+  const map = new Map();
+  closedTrades.forEach((trade) => {
+    const level = trade.level || "-";
+    const tf = trade.tf || "-";
+    const session = trade.session || "-";
+    const confirmationType = trade.confirmationType || "-";
+    const key = [level, tf, session, confirmationType].join("||");
+    if (!map.has(key)) {
+      map.set(key, {
+        level,
+        tf,
+        session,
+        confirmationType,
+        trades: 0,
+        wins: 0,
+        losses: 0,
+        be: 0,
+        pnl: 0
+      });
+    }
+    const row = map.get(key);
+    row.trades += 1;
+    row.wins += trade.result === "WIN" ? 1 : 0;
+    row.losses += trade.result === "LOSS" ? 1 : 0;
+    row.be += trade.result === "BE" ? 1 : 0;
+    row.pnl = round1(row.pnl + (parseFloat(trade.pnl) || parseFloat(calcPnl(trade.risk, trade.reward, trade.result)) || 0));
+  });
+
+  return Array.from(map.values())
+    .map((row) => ({ ...row, winRate: row.trades ? (row.wins / row.trades) * 100 : 0 }))
+    .sort((a, b) => b.trades - a.trades || b.winRate - a.winRate || b.pnl - a.pnl || a.level.localeCompare(b.level));
+}
+
+function comboAnalysisTable() {
+  const minTrades = Math.max(1, parseInt(uiState.comboMinTrades, 10) || 2);
+  const rows = comboAnalysisRows().filter((row) => row.trades >= minTrades);
+  const body = rows.length ? rows.map((row) => {
+    const color = row.winRate >= 60 ? "var(--green)" : row.winRate >= 40 ? "var(--amber)" : "var(--red)";
+    return `
+      <tr>
+        <td class="key-cell" data-label="Level">${escapeHtml(row.level)}</td>
+        <td data-label="TF">${escapeHtml(row.tf)}</td>
+        <td class="key-cell" data-label="Session">${escapeHtml(row.session)}</td>
+        <td class="key-cell" data-label="Confirmation">${escapeHtml(row.confirmationType)}</td>
+        <td data-label="Trades"><span class="count-chip chip-total">${row.trades}</span></td>
+        <td class="pos" data-label="Wins"><span class="count-chip chip-win">${row.wins}</span></td>
+        <td class="neg" data-label="Losses"><span class="count-chip chip-loss">${row.losses}</span></td>
+        <td class="neutral" data-label="BE"><span class="count-chip chip-be">${row.be}</span></td>
+        <td data-label="Win Rate">
+          <div class="wr-cell">
+            <div class="wr-bar"><div class="wr-fill" style="width:${row.winRate.toFixed(0)}%;background:${color}"></div></div>
+            <span>${row.winRate.toFixed(0)}%</span>
+          </div>
+        </td>
+        <td class="${moneyClass(row.pnl)}" data-label="Total P&L">${signed(row.pnl)}</td>
+      </tr>
+    `;
+  }).join("") : `<tr><td colspan="10" class="cell-nil">No closed trades yet.</td></tr>`;
+
+  return `
+    <div class="a-section">
+      <div class="panel-title"><span>Level x Timeframe x Session x Confirmation Type Win Rate</span><span class="section-pill">edge scanner</span></div>
+      <div class="combo-filter">
+        <label class="field compact-field">
+          <span>Min trades</span>
+          <input id="combo-min-trades" type="number" min="1" step="1" value="${minTrades}" onchange="updateComboMinTrades(this.value)">
+        </label>
+      </div>
+      <div class="cross-wrap">
+        <table class="a-table combo-table">
+          <thead>
+            <tr><th>Level</th><th>TF</th><th>Session</th><th>Confirmation</th><th>Trades</th><th>Wins</th><th>Losses</th><th>BE</th><th>Win Rate</th><th>Total P&L</th></tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function updateComboMinTrades(value) {
+  uiState.comboMinTrades = Math.max(1, parseInt(value, 10) || 1);
+  renderAnalysis();
 }
 
 function isoFromParts(year, month, day) {
@@ -1370,6 +1651,22 @@ function reportAnalysisTable(title, items, field) {
   `;
 }
 
+function reportComboAnalysisTable(items) {
+  const rows = comboAnalysisRows(items.filter(({ trade }) => trade.result).map(({ trade }) => trade));
+  if (!rows.length) return "";
+  return `
+    <section class="r-section">
+      <h2>Level x Timeframe x Session x Confirmation Type Win Rate</h2>
+      <table class="r-table compact">
+        <thead><tr><th>Level</th><th>TF</th><th>Session</th><th>Confirmation</th><th>Trades</th><th>Wins</th><th>Loss</th><th>BE</th><th>Win Rate</th><th>P&L</th></tr></thead>
+        <tbody>
+          ${rows.map((row) => `<tr><td>${escapeHtml(row.level)}</td><td>${escapeHtml(row.tf)}</td><td>${escapeHtml(row.session)}</td><td>${escapeHtml(row.confirmationType)}</td><td>${row.trades}</td><td class="r-pos">${row.wins}</td><td class="r-neg">${row.losses}</td><td>${row.be}</td><td>${row.winRate.toFixed(0)}%</td><td class="${row.pnl >= 0 ? "r-pos" : "r-neg"}">${signed(row.pnl)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </section>
+  `;
+}
+
 function buildReportHtml(range = reportRange()) {
   const items = tradesForRange(range);
   const p = reportPerformance(items);
@@ -1385,13 +1682,18 @@ function buildReportHtml(range = reportRange()) {
       <td>${escapeHtml(trade.setup || "-")}</td>
       <td>${escapeHtml(trade.mistake || "-")}</td>
       <td>${escapeHtml(trade.hold || "-")}</td>
+      <td>${escapeHtml(trade.marketCondition || "-")}</td>
+      <td>${escapeHtml(trade.biasAlignment || "-")}</td>
+      <td>${escapeHtml(trade.confirmationType || "-")}</td>
+      <td>${escapeHtml(trade.slTpPlacement || "-")}</td>
+      <td>${escapeHtml(trade.patienceScore ? `P${trade.patienceScore}` : "-")}</td>
       <td>${escapeHtml(trade.risk || "-")}</td>
       <td>${escapeHtml(trade.reward || "-")}</td>
       <td>${escapeHtml(calcRR(trade.risk, trade.reward) || "-")}</td>
       <td>${reportBadge(trade.result, "result")}</td>
       <td class="${moneyClass(pnl) === "pos" ? "r-pos" : moneyClass(pnl) === "neg" ? "r-neg" : ""}">${pnl === "" ? "-" : signed(pnl)}</td>
       <td>${cum === "" ? "-" : signed(cum)}</td>
-      <td>${escapeHtml(trade.reason || "")}</td>
+      <td class="r-note-cell">${escapeHtml(trade.reason || "-")}</td>
     </tr>
   `).join("");
 
@@ -1417,9 +1719,9 @@ function buildReportHtml(range = reportRange()) {
       </section>
       <section class="r-section">
         <h2>Trade Log</h2>
-        <table class="r-table">
-          <thead><tr><th>#</th><th>Date</th><th>Session</th><th>Side</th><th>Level</th><th>TF</th><th>Setup</th><th>Mistake</th><th>Hold</th><th>Risk</th><th>Reward</th><th>RR</th><th>Result</th><th>P&L</th><th>Cum</th><th>Notes</th></tr></thead>
-          <tbody>${rows || `<tr><td colspan="16">No trades found for this range.</td></tr>`}</tbody>
+        <table class="r-table full-log">
+          <thead><tr><th>#</th><th>Date</th><th>Session</th><th>Side</th><th>Level</th><th>TF</th><th>Setup</th><th>Mistake</th><th>Hold</th><th>Market</th><th>Bias</th><th>Confirm</th><th>SL/TP</th><th>Patience</th><th>Risk</th><th>Reward</th><th>RR</th><th>Result</th><th>P&L</th><th>Cum</th><th>Notes / Reason</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="21">No trades found for this range.</td></tr>`}</tbody>
         </table>
       </section>
       <div class="r-analysis-grid">
@@ -1427,7 +1729,13 @@ function buildReportHtml(range = reportRange()) {
         ${reportAnalysisTable("Level Analysis", items, "level")}
         ${reportAnalysisTable("Setup Analysis", items, "setup")}
         ${reportAnalysisTable("Mistake Analysis", items, "mistake")}
+        ${reportAnalysisTable("Hold Quality Analysis", items, "hold")}
+        ${reportAnalysisTable("Market Condition Analysis", items, "marketCondition")}
+        ${reportAnalysisTable("Bias Alignment Analysis", items, "biasAlignment")}
+        ${reportAnalysisTable("Confirmation Type Analysis", items, "confirmationType")}
+        ${reportAnalysisTable("SL/TP Placement Analysis", items, "slTpPlacement")}
       </div>
+      ${reportComboAnalysisTable(items)}
     </div>
   `;
 }
@@ -1548,21 +1856,249 @@ function resetOptions() {
   toast("Options reset to default.");
 }
 
+async function clearAllTrades() {
+  if (!state.trades.length) {
+    toast("No trades to clear.");
+    return;
+  }
+  if (!confirm("Clear all trades from this device and Firebase? This cannot be undone.")) return;
+  state.trades = [];
+  try {
+    localStorage.setItem(KEY, JSON.stringify(state));
+  } catch (error) {
+    console.warn("Could not clear local trade cache", error);
+  }
+  renderTrades();
+  if (document.getElementById("tab-analysis")?.classList.contains("active")) renderAnalysis();
+  if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
+
+  if (currentUser && window.firebaseDb) {
+    try {
+      updateSyncStatus("syncing");
+      await clearFirestoreCollection(currentUser.uid, "trades");
+      updateSyncStatus("synced");
+      toast("All trades cleared from device and Firebase.");
+      return;
+    } catch (error) {
+      console.warn("Could not clear Firebase trades", error);
+      updateSyncStatus("offline");
+      toast("Local trades cleared. Firebase clear failed.");
+      return;
+    }
+  }
+
+  toast("All local trades cleared.");
+}
+
+function openMobileMenu() {
+  document.body.classList.add("mobile-menu-open");
+}
+
+function closeMobileMenu() {
+  document.body.classList.remove("mobile-menu-open");
+}
+
+function showLoginScreen() {
+  document.getElementById("login-screen")?.removeAttribute("hidden");
+  document.querySelector(".app")?.setAttribute("hidden", "");
+  document.querySelector(".mobile-topbar")?.setAttribute("hidden", "");
+  document.querySelector(".bottom-nav")?.setAttribute("hidden", "");
+}
+
+function hideLoginScreen() {
+  document.getElementById("login-screen")?.setAttribute("hidden", "");
+  document.querySelector(".app")?.removeAttribute("hidden");
+  document.querySelector(".mobile-topbar")?.removeAttribute("hidden");
+  document.querySelector(".bottom-nav")?.removeAttribute("hidden");
+}
+
+async function signInWithGoogle() {
+  if (!window.firebaseAuth || !window.GoogleAuthProvider || !window.signInWithPopup) {
+    toast("Firebase is still loading.");
+    return;
+  }
+  const provider = new window.GoogleAuthProvider();
+  await window.signInWithPopup(window.firebaseAuth, provider);
+}
+
+async function signOutUser() {
+  if (!window.firebaseAuth || !window.firebaseSignOut) return;
+  await window.firebaseSignOut(window.firebaseAuth);
+}
+
+function updateUserRow(user) {
+  const row = document.getElementById("user-row");
+  const avatar = document.getElementById("user-avatar");
+  const name = document.getElementById("user-name");
+  if (!row || !avatar || !name) return;
+  if (!user) {
+    row.hidden = true;
+    avatar.src = "";
+    name.textContent = "";
+    return;
+  }
+  row.hidden = false;
+  avatar.src = user.photoURL || "";
+  name.textContent = user.displayName || user.email || "Signed in";
+}
+
+function updateSyncStatus(status) {
+  const wrap = document.getElementById("sync-status");
+  if (!wrap) return;
+  const dot = wrap.querySelector(".sync-dot");
+  const label = wrap.querySelector(".sync-label");
+  if (!dot || !label) return;
+  dot.className = `sync-dot ${status}`;
+  label.textContent = status === "synced" ? "Synced" : status === "syncing" ? "Syncing..." : "Offline - local only";
+}
+
+function userDocRef(uid, collectionName, documentId) {
+  return window.firestoreDoc(window.firebaseDb, "users", uid, collectionName, documentId);
+}
+
+function userCollectionRef(uid, collectionName) {
+  return window.firestoreCollection(window.firebaseDb, "users", uid, collectionName);
+}
+
+async function loadFromFirestore(uid) {
+  if (!window.firebaseDb) return;
+  updateSyncStatus("syncing");
+  try {
+    const [optionsSnap, settingsSnap, tradesSnap, reviewsSnap] = await Promise.all([
+      window.firestoreGetDoc(userDocRef(uid, "options", "data")),
+      window.firestoreGetDoc(userDocRef(uid, "settings", "data")),
+      window.firestoreGetDocs(userCollectionRef(uid, "trades")),
+      window.firestoreGetDocs(userCollectionRef(uid, "weeklyReviews"))
+    ]);
+
+    const cloudTrades = tradesSnap.docs.map((docSnap) => normalizeTrade({ id: docSnap.id, ...docSnap.data() }));
+    const cloudReviews = reviewsSnap.docs.map((docSnap) => normalizeWeeklyReview({ id: docSnap.id, ...docSnap.data() }));
+    const useCloud = cloudTrades.length > state.trades.length;
+
+    if (useCloud) {
+      state.ownerUid = uid;
+      state.trades = cloudTrades.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+      if (optionsSnap.exists()) state.options = normalizeOptions(optionsSnap.data());
+      if (settingsSnap.exists()) state.settings = Object.assign({ defaultRisk: "" }, settingsSnap.data() || {});
+      state.weeklyReviews = cloudReviews;
+      localStorage.setItem(KEY, JSON.stringify(state));
+      renderFilters();
+      renderTrades();
+      renderSummary();
+      if (document.getElementById("tab-analysis")?.classList.contains("active")) renderAnalysis();
+      if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
+      if (document.getElementById("tab-weekly")?.classList.contains("active")) renderWeeklyReviews();
+      if (document.getElementById("tab-manage")?.classList.contains("active")) renderManage();
+    } else if (state.trades.length || state.weeklyReviews.length) {
+      await saveToFirestore();
+      return;
+    }
+
+    updateSyncStatus("synced");
+  } catch (error) {
+    console.warn("Could not load from Firestore", error);
+    updateSyncStatus("offline");
+  }
+}
+
+async function syncCollection(uid, collectionName, rows) {
+  const colRef = userCollectionRef(uid, collectionName);
+  const existing = await window.firestoreGetDocs(colRef);
+  const keep = new Set(rows.map((row) => row.id));
+  await Promise.all(rows.map((row) => window.firestoreSetDoc(userDocRef(uid, collectionName, row.id), row, { merge: true })));
+  await Promise.all(existing.docs.filter((docSnap) => !keep.has(docSnap.id)).map((docSnap) => window.firestoreDeleteDoc(userDocRef(uid, collectionName, docSnap.id))));
+}
+
+async function clearFirestoreCollection(uid, collectionName) {
+  const existing = await window.firestoreGetDocs(userCollectionRef(uid, collectionName));
+  await Promise.all(existing.docs.map((docSnap) => window.firestoreDeleteDoc(userDocRef(uid, collectionName, docSnap.id))));
+}
+
+async function saveToFirestore() {
+  if (!currentUser || !window.firebaseDb) return;
+  updateSyncStatus("syncing");
+  const uid = currentUser.uid;
+  state.ownerUid = uid;
+  const trades = state.trades.map((trade) => normalizeTrade(trade));
+  const weeklyReviews = state.weeklyReviews.map((review) => normalizeWeeklyReview(review));
+  state.trades = trades;
+  state.weeklyReviews = weeklyReviews;
+  try {
+    localStorage.setItem(KEY, JSON.stringify(state));
+  } catch (error) {
+    console.warn("Could not refresh local cache", error);
+  }
+
+  await Promise.all([
+    syncCollection(uid, "trades", trades),
+    syncCollection(uid, "weeklyReviews", weeklyReviews),
+    window.firestoreSetDoc(userDocRef(uid, "options", "data"), clone(state.options), { merge: true }),
+    window.firestoreSetDoc(userDocRef(uid, "settings", "data"), clone(state.settings), { merge: true })
+  ]);
+  updateSyncStatus("synced");
+}
+
+function initRealtimeSync() {
+  if (!window.firebaseRtdb || !window.rtdbRef || !window.rtdbOnValue) return;
+  window.rtdbOnValue(window.rtdbRef(window.firebaseRtdb, ".info/connected"), (snapshot) => {
+    updateSyncStatus(snapshot.val() ? "synced" : "offline");
+  }, () => updateSyncStatus("offline"));
+}
+
+function initFirebaseAuth() {
+  if (firebaseReady || !window.initializeFirebaseServices) return;
+  firebaseReady = true;
+  if (!hasFirebaseConfig()) {
+    console.warn("Firebase config missing. Copy firebase-config.example.js to firebase-config.js and fill your project values.");
+    updateSyncStatus("offline");
+    showLoginScreen();
+    return;
+  }
+  try {
+    window.initializeFirebaseServices(FIREBASE_CONFIG);
+  } catch (error) {
+    console.warn("Firebase initialization failed", error);
+    updateSyncStatus("offline");
+    showLoginScreen();
+    return;
+  }
+  if (!window.firebaseAuth || !window.onAuthStateChanged) return;
+  window.onAuthStateChanged(window.firebaseAuth, async (user) => {
+    currentUser = user || null;
+    updateUserRow(user);
+    if (!user) {
+      firestoreLoadComplete = false;
+      showLoginScreen();
+      updateSyncStatus("offline");
+      return;
+    }
+    hideLoginScreen();
+    loadState();
+    state.ownerUid = user.uid;
+    renderFilters();
+    renderTrades();
+    renderSummary();
+    initRealtimeSync();
+    await loadFromFirestore(user.uid);
+    firestoreLoadComplete = true;
+  });
+}
+
 function switchTab(name, button) {
-  document.querySelectorAll(".nav-btn").forEach((btn) => btn.classList.remove("active"));
+  document.querySelectorAll(".nav-btn, .bottom-nav-btn").forEach((btn) => btn.classList.toggle("active", btn.dataset.tab === name));
   document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.remove("active"));
-  if (button) button.classList.add("active");
   document.getElementById(`tab-${name}`)?.classList.add("active");
-  if (name === "analysis") renderAnalysis();
+  if (name === "analysis") renderAnalysisWithDelay();
   if (name === "pnl") renderPnl();
   if (name === "weekly") renderWeeklyReviews();
   if (name === "manage") renderManage();
+  closeMobileMenu();
   refreshIcons();
 }
 
 function exportRows() {
   recalcCum();
-  const headers = ["#", "Date", "Session", "Side", "Level", "TF", "Setup", "Mistake", "Hold", "Risk(pips)", "Reward(pips)", "RR", "Result", "P&L(pips)", "Cumul P&L", "Notes"];
+  const headers = ["#", "Date", "Session", "Side", "Level", "TF", "Setup", "Mistake", "Hold", "Market Condition", "Bias Alignment", "Confirmation Type", "SL/TP Placement", "Patience Score", "Risk(pips)", "Reward(pips)", "RR", "Result", "P&L(pips)", "Cumul P&L", "Notes"];
   const rows = state.trades.map((trade, index) => ({ trade, index })).reverse().map(({ trade, index }) => [
     index + 1,
     formatDateDisplay(trade.date),
@@ -1573,6 +2109,11 @@ function exportRows() {
     trade.setup,
     trade.mistake,
     trade.hold,
+    trade.marketCondition,
+    trade.biasAlignment,
+    trade.confirmationType,
+    trade.slTpPlacement,
+    trade.patienceScore,
     trade.risk,
     trade.reward,
     calcRR(trade.risk, trade.reward),
@@ -1598,7 +2139,7 @@ function exportExcel() {
   const { headers, rows } = exportRows();
   const wb = XLSX.utils.book_new();
   const wsTrades = XLSX.utils.aoa_to_sheet([headers, ...rows]);
-  wsTrades["!cols"] = [4, 12, 24, 8, 14, 8, 12, 18, 18, 10, 12, 9, 9, 10, 12, 34].map((wch) => ({ wch }));
+  wsTrades["!cols"] = [4, 12, 24, 8, 14, 8, 12, 18, 18, 18, 22, 20, 18, 14, 10, 12, 9, 9, 10, 12, 34].map((wch) => ({ wch }));
   XLSX.utils.book_append_sheet(wb, wsTrades, "Trade Log");
 
   const p = performance();
@@ -1617,6 +2158,37 @@ function exportExcel() {
   const wsSummary = XLSX.utils.aoa_to_sheet(summary);
   wsSummary["!cols"] = [{ wch: 22 }, { wch: 16 }];
   XLSX.utils.book_append_sheet(wb, wsSummary, "Summary");
+
+  const comboRows = comboAnalysisRows();
+  const comboSheet = [
+    ["Level", "TF", "Session", "Confirmation Type", "Trades", "Wins", "Losses", "BE", "Win Rate %", "Total P&L"],
+    ...comboRows.map((row) => [
+      row.level,
+      row.tf,
+      row.session,
+      row.confirmationType,
+      row.trades,
+      row.wins,
+      row.losses,
+      row.be,
+      +row.winRate.toFixed(1),
+      +row.pnl.toFixed(1)
+    ])
+  ];
+  const wsCombo = XLSX.utils.aoa_to_sheet(comboSheet);
+  wsCombo["!cols"] = [14, 8, 24, 20, 10, 8, 8, 8, 12, 12].map((wch) => ({ wch }));
+  XLSX.utils.book_append_sheet(wb, wsCombo, "Combo Analysis");
+
+  const weeklySheet = [
+    ["Week Of", "Learned", "Pattern", "Improve"],
+    ...state.weeklyReviews
+      .slice()
+      .sort((a, b) => String(b.weekOf).localeCompare(String(a.weekOf)))
+      .map((review) => [formatDateDisplay(review.weekOf) || review.weekOf, review.learned, review.pattern, review.improve])
+  ];
+  const wsWeekly = XLSX.utils.aoa_to_sheet(weeklySheet);
+  wsWeekly["!cols"] = [{ wch: 14 }, { wch: 42 }, { wch: 42 }, { wch: 42 }];
+  XLSX.utils.book_append_sheet(wb, wsWeekly, "Weekly Reviews");
 
   XLSX.writeFile(wb, "Gold_Trading_Journal.xlsx");
 }
@@ -1686,6 +2258,8 @@ if (typeof document !== "undefined") {
   renderFilters();
   renderTrades();
   renderSummary();
+  showLoginScreen();
+  updateSyncStatus("syncing");
   refreshIcons();
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !document.getElementById("trade-modal")?.hidden) closeTradeModal();
@@ -1696,4 +2270,6 @@ if (typeof document !== "undefined") {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch((error) => console.warn("Service worker registration failed", error));
   }
+  window.addEventListener("firebase-sdk-ready", initFirebaseAuth);
+  if (window.initializeFirebaseServices) initFirebaseAuth();
 }

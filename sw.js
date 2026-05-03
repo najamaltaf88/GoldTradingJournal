@@ -1,9 +1,8 @@
-const CACHE_NAME = "gold-journal-v1";
+const CACHE_NAME = "gold-journal-v10";
 const APP_FILES = [
   "./",
-  "./index.html",
-  "./styles.css",
-  "./app.js",
+  "./styles.css?v=20260503-clear-trades-v10",
+  "./app.js?v=20260503-clear-trades-v10",
   "./manifest.json",
   "./icon.svg"
 ];
@@ -24,13 +23,39 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
+
+  if (event.request.mode === "navigate") {
+    event.respondWith(
+      fetch(event.request).catch(() => caches.match("./"))
+    );
+    return;
+  }
+
+  const url = new URL(event.request.url);
+  const isAppAsset = url.origin === self.location.origin && (
+    url.pathname.endsWith("/styles.css") ||
+    url.pathname.endsWith("/app.js") ||
+    url.pathname.endsWith("/sw.js")
+  );
+
+  if (isAppAsset) {
+    event.respondWith(
+      fetch(event.request).then((response) => {
+        const copy = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        return response;
+      }).catch(() => caches.match(event.request))
+    );
+    return;
+  }
+
   event.respondWith(
     caches.match(event.request).then((cached) =>
       cached || fetch(event.request).then((response) => {
         const copy = response.clone();
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
-      }).catch(() => caches.match("./index.html"))
+      }).catch(() => caches.match("./"))
     )
   );
 });
