@@ -7,7 +7,7 @@ Gold Strategytestor is a dark-theme XAUUSD trading journal web app for logging t
 - Trade log with modal-based trade entry
 - Dynamic dropdown options with custom values
 - Analysis dashboard with performance breakdowns
-- Monthly PnL calendar in pips
+- Monthly PnL calendar in $
 - Weekly review notes
 - CSV, Excel, and PDF export
 - Installable PWA support

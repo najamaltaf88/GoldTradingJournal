@@ -14,6 +14,9 @@ function hasFirebaseConfig() {
 
 const KEY = "xau_journal_v6";
 const LEGACY_KEY = "xau_journal_v5";
+const SKIPPED_KEY = "skippedTrades";
+const ACCOUNTS_KEY = "xau_journal_accounts_v1";
+const DEFAULT_ACCOUNT_ID = "main";
 
 const FIXED = {
   sessions: ["Asian (5am-8am)", "Post-Asian (8am-10am)", "London (11am-2pm)", "Post-London (2pm-4pm)", "New York (5pm-8pm)", "Post-NY (8pm-3am)"],
@@ -25,7 +28,18 @@ const FIXED = {
   marketConditions: ["Bullish", "Bearish", "Ranging", "Choppy"],
   biasAlignments: ["With Trend", "Counter Trend"],
   confirmationTypes: ["BOS", "CHoCH", "Engulfing", "Pin Bar", "Rejection Wick", "None"],
-  slTpPlacements: ["Above/Below Structure", "Fixed Pips", "ATR Based", "Arbitrary"]
+  slTpPlacements: ["Above/Below Structure", "Fixed $", "ATR Based", "Arbitrary"],
+  skipReasons: [
+    "Fear - H1/15m too slow",
+    "Fear - SL looked too big",
+    "No confirmation candle",
+    "Wrong session timing",
+    "Already missed entry",
+    "Distracted / not at screen",
+    "Low confidence in level",
+    "Other"
+  ],
+  skipOutcomes: ["TP Hit - Full", "TP Hit - Partial", "SL Would Have Hit", "No Reaction", "Still Playing"]
 };
 
 const CAT_META = {
@@ -38,18 +52,19 @@ const CAT_META = {
   marketConditions: { label: "Market Condition" },
   biasAlignments: { label: "Trade Direction vs Bias" },
   confirmationTypes: { label: "Confirmation Type" },
-  slTpPlacements: { label: "SL/TP Placement" }
+  slTpPlacements: { label: "SL/TP Placement" },
+  skipReasons: { label: "Skipped Trade Reasons" },
+  skipOutcomes: { label: "Skipped Trade Outcomes" }
 };
 
 const DATE_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const SKIP_REASONS = FIXED.skipReasons;
+const SKIP_OUTCOMES = FIXED.skipOutcomes;
 
-let state = {
-  ownerUid: "",
-  trades: [],
-  options: clone(FIXED),
-  settings: { defaultRisk: "" },
-  weeklyReviews: []
-};
+let state = emptyJournalState();
+let accounts = [];
+let accountData = {};
+let activeAccountId = DEFAULT_ACCOUNT_ID;
 
 let pnlView = {
   year: new Date().getFullYear(),
@@ -58,6 +73,7 @@ let pnlView = {
 };
 
 let modalEditingIndex = null;
+let skippedEditingIndex = null;
 let analysisTimer = null;
 let currentUser = null;
 let firebaseReady = false;
@@ -72,43 +88,205 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function emptyJournalState(ownerUid = "") {
+  return {
+    ownerUid,
+    trades: [],
+    skippedTrades: [],
+    options: clone(FIXED),
+    settings: { defaultRisk: "" },
+    weeklyReviews: []
+  };
+}
+
+function defaultAccount() {
+  return {
+    id: DEFAULT_ACCOUNT_ID,
+    name: "Main Account",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
 function generateId(prefix = "id") {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
+function normalizeAccount(account = {}) {
+  const fallback = defaultAccount();
+  return {
+    id: account.id || fallback.id,
+    name: String(account.name || account.label || fallback.name).trim() || fallback.name,
+    createdAt: account.createdAt || fallback.createdAt,
+    updatedAt: account.updatedAt || new Date().toISOString()
+  };
+}
+
+function normalizeJournalState(data = {}) {
+  return {
+    ownerUid: currentUser?.uid || data.ownerUid || "",
+    trades: Array.isArray(data.trades) ? data.trades.map(normalizeTrade) : [],
+    skippedTrades: Array.isArray(data.skippedTrades) ? data.skippedTrades.map(normalizeSkippedTrade) : [],
+    options: normalizeOptions(data.options || FIXED),
+    settings: Object.assign({ defaultRisk: "" }, data.settings || {}),
+    weeklyReviews: Array.isArray(data.weeklyReviews) ? data.weeklyReviews.map(normalizeWeeklyReview) : []
+  };
+}
+
+function activeAccount() {
+  return accounts.find((account) => account.id === activeAccountId) || accounts[0] || defaultAccount();
+}
+
+function ensureAccountState() {
+  if (!accounts.length) accounts = [defaultAccount()];
+  if (!accounts.some((account) => account.id === activeAccountId)) activeAccountId = accounts[0].id;
+  if (!accountData[activeAccountId]) accountData[activeAccountId] = emptyJournalState();
+  state = normalizeJournalState(accountData[activeAccountId]);
+}
+
+function journalRowCount(data = {}) {
+  return (data.trades?.length || 0) + (data.skippedTrades?.length || 0) + (data.weeklyReviews?.length || 0);
+}
+
+function mergeRows(localRows = [], cloudRows = []) {
+  const map = new Map();
+  [...localRows, ...cloudRows].forEach((row) => {
+    if (!row?.id) return;
+    map.set(row.id, row);
+  });
+  return Array.from(map.values());
+}
+
+function mergeJournalStates(base = {}, incoming = {}) {
+  const baseState = normalizeJournalState(base);
+  const incomingState = normalizeJournalState(incoming);
+  return normalizeJournalState({
+    ownerUid: incomingState.ownerUid || baseState.ownerUid,
+    trades: mergeRows(baseState.trades, incomingState.trades),
+    skippedTrades: mergeRows(baseState.skippedTrades, incomingState.skippedTrades),
+    weeklyReviews: mergeRows(baseState.weeklyReviews, incomingState.weeklyReviews),
+    options: mergeOptions(baseState.options, incomingState.options),
+    settings: Object.assign({}, baseState.settings, incomingState.settings)
+  });
+}
+
+function mergeOptions(baseOptions = {}, incomingOptions = {}) {
+  const merged = clone(FIXED);
+  Object.keys(FIXED).forEach((key) => {
+    merged[key] = Array.from(new Set([...(baseOptions[key] || []), ...(incomingOptions[key] || [])].filter(Boolean)));
+  });
+  return normalizeOptions(merged);
+}
+
 function loadState() {
+  const accountStore = loadAccountStore();
+  if (accountStore) {
+    accounts = accountStore.accounts;
+    accountData = accountStore.data;
+    activeAccountId = accountStore.activeAccountId;
+    ensureAccountState();
+    return;
+  }
+
+  const savedSkippedTrades = loadSkippedTradesFromLocal();
   const raw = localStorage.getItem(KEY) || localStorage.getItem(LEGACY_KEY);
-  if (!raw) return;
+  accounts = [defaultAccount()];
+  accountData = {};
+  activeAccountId = DEFAULT_ACCOUNT_ID;
+  if (!raw) {
+    state = emptyJournalState();
+    state.skippedTrades = savedSkippedTrades;
+    accountData[activeAccountId] = clone(state);
+    persistLocalState();
+    return;
+  }
   try {
     const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.trades)) return;
-    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.uid) {
-      state = {
-        ownerUid: currentUser.uid,
-        trades: [],
-        options: clone(FIXED),
-        settings: { defaultRisk: "" },
-        weeklyReviews: []
-      };
+    if (!parsed || !Array.isArray(parsed.trades)) {
+      state = emptyJournalState();
+      state.skippedTrades = savedSkippedTrades;
+      accountData[activeAccountId] = clone(state);
+      persistLocalState();
       return;
     }
-    state.ownerUid = currentUser?.uid || parsed.ownerUid || "";
-    state.trades = parsed.trades.map(normalizeTrade);
-    state.options = normalizeOptions(parsed.options || FIXED);
-    state.settings = Object.assign({ defaultRisk: "" }, parsed.settings || {});
-    state.weeklyReviews = Array.isArray(parsed.weeklyReviews) ? parsed.weeklyReviews.map(normalizeWeeklyReview) : [];
+    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.uid) {
+      state = emptyJournalState(currentUser.uid);
+      accountData[activeAccountId] = clone(state);
+      persistLocalState();
+      return;
+    }
+    state = normalizeJournalState({
+      ...parsed,
+      skippedTrades: savedSkippedTrades.length ? savedSkippedTrades : parsed.skippedTrades
+    });
+    accountData[activeAccountId] = clone(state);
+    persistLocalState();
   } catch (error) {
     console.warn("Could not load journal state", error);
   }
 }
 
+function loadAccountStore() {
+  const raw = localStorage.getItem(ACCOUNTS_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.accounts) || !parsed.data) return null;
+    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.uid) return null;
+    const normalizedAccounts = parsed.accounts.map(normalizeAccount).filter((account) => account.id);
+    const nextAccounts = normalizedAccounts.length ? normalizedAccounts : [defaultAccount()];
+    const nextData = {};
+    nextAccounts.forEach((account) => {
+      nextData[account.id] = normalizeJournalState(parsed.data[account.id] || {});
+    });
+    const selected = nextAccounts.some((account) => account.id === parsed.activeAccountId) ? parsed.activeAccountId : nextAccounts[0].id;
+    return { accounts: nextAccounts, data: nextData, activeAccountId: selected };
+  } catch (error) {
+    console.warn("Could not load account store", error);
+    return null;
+  }
+}
+
+function loadSkippedTradesFromLocal() {
+  const raw = localStorage.getItem(SKIPPED_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(normalizeSkippedTrade) : [];
+  } catch (error) {
+    console.warn("Could not load skipped trades", error);
+    return [];
+  }
+}
+
+function persistLocalState() {
+  if (currentUser) state.ownerUid = currentUser.uid;
+  state = normalizeJournalState(state);
+  if (!accounts.length) accounts = [defaultAccount()];
+  if (!accounts.some((account) => account.id === activeAccountId)) activeAccountId = accounts[0].id;
+  accountData[activeAccountId] = clone(state);
+  const store = {
+    ownerUid: currentUser?.uid || state.ownerUid || "",
+    activeAccountId,
+    accounts,
+    data: accountData
+  };
+  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(store));
+  localStorage.setItem(KEY, JSON.stringify(state));
+  localStorage.setItem(SKIPPED_KEY, JSON.stringify(state.skippedTrades));
+}
+
 function normalizeOptions(options) {
   const next = clone(FIXED);
   Object.keys(FIXED).forEach((key) => {
-    const custom = Array.isArray(options[key]) ? options[key] : [];
+    const custom = Array.isArray(options[key]) ? options[key].map(normalizeUnitLabel) : [];
     next[key] = Array.from(new Set([...FIXED[key], ...custom].filter(Boolean)));
   });
   return next;
+}
+
+function normalizeUnitLabel(value) {
+  return String(value || "").replace(/\bpips\b/gi, "$");
 }
 
 function normalizeTrade(trade) {
@@ -125,7 +303,7 @@ function normalizeTrade(trade) {
     marketCondition: trade.marketCondition || "",
     biasAlignment: trade.biasAlignment || "",
     confirmationType: trade.confirmationType || "",
-    slTpPlacement: trade.slTpPlacement || "",
+    slTpPlacement: normalizeUnitLabel(trade.slTpPlacement || ""),
     patienceScore: normalizePatienceScore(trade.patienceScore),
     risk: trade.risk || "",
     reward: trade.reward || "",
@@ -136,7 +314,33 @@ function normalizeTrade(trade) {
   };
 }
 
+function normalizeSkippedTrade(trade = {}) {
+  return {
+    id: trade.id || generateId("skipped"),
+    date: trade.date || "",
+    session: trade.session || "",
+    level: trade.level || "",
+    tf: trade.tf || "",
+    direction: trade.direction || trade.entry || "",
+    skipReason: normalizeDashValue(trade.skipReason || trade.reason || ""),
+    confidence: normalizeConfidence(trade.confidence),
+    notes: trade.notes || "",
+    outcome: normalizeDashValue(trade.outcome || ""),
+    pipsMissed: trade.pipsMissed ?? ""
+  };
+}
+
+function normalizeDashValue(value) {
+  return String(value || "").replace(/\s+\u2014\s+/g, " - ");
+}
+
 function normalizePatienceScore(value) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n)) return "";
+  return String(Math.min(5, Math.max(1, n)));
+}
+
+function normalizeConfidence(value) {
   const n = parseInt(value, 10);
   if (!Number.isFinite(n)) return "";
   return String(Math.min(5, Math.max(1, n)));
@@ -155,8 +359,8 @@ function normalizeWeeklyReview(review) {
 
 async function save() {
   try {
-    if (currentUser) state.ownerUid = currentUser.uid;
-    localStorage.setItem(KEY, JSON.stringify(state));
+    persistLocalState();
+    renderAccountSelector();
   } catch (error) {
     console.warn("Could not save journal state", error);
     updateSyncStatus("offline");
@@ -219,7 +423,7 @@ function parseDateInput(value) {
 }
 
 function currentSession() {
-  const hour = new Date().getHours();
+  const hour = new Date().getUTCHours();
   if (hour >= 5 && hour < 8) return "Asian (5am-8am)";
   if (hour >= 8 && hour < 10) return "Post-Asian (8am-10am)";
   if (hour >= 11 && hour < 14) return "London (11am-2pm)";
@@ -336,9 +540,9 @@ function renderSummary() {
     strip.innerHTML = [
       metric("Closed Trades", p.closed.length, `${open} open`),
       metric("Win Rate", `${p.winRate.toFixed(1)}%`, `${p.wins.length}W / ${p.losses.length}L`, p.winRate >= 50 ? "pos" : "neg"),
-      metric("Total P&L", `${signed(p.totalPnl)} pips`, "auto calculated", moneyClass(p.totalPnl)),
+      metric("Total P&L", `${signed(p.totalPnl)} $`, "auto calculated", moneyClass(p.totalPnl)),
       metric("Profit Factor", p.profitFactor.toFixed(2), p.profitFactor >= 1 ? "Healthy" : "Needs work", p.profitFactor >= 1 ? "pos" : "neg"),
-      metric("Expectancy", `${signed(p.expectancy)} pips`, "per closed trade", moneyClass(p.expectancy))
+      metric("Expectancy", `${signed(p.expectancy)} $`, "per closed trade", moneyClass(p.expectancy))
     ].join("");
   }
 
@@ -356,6 +560,92 @@ function renderSummary() {
   const sub = document.getElementById("log-sub");
   if (sub) {
     sub.textContent = `${state.trades.length} trades saved, ${p.closed.length} closed, ${p.winRate.toFixed(0)}% win rate.`;
+  }
+}
+
+function renderAccountSelector() {
+  const select = document.getElementById("account-select");
+  if (!select) return;
+  const current = select.value || activeAccountId;
+  select.innerHTML = accounts.map((account) => `<option value="${escapeHtml(account.id)}">${escapeHtml(account.name)}</option>`).join("");
+  select.value = accounts.some((account) => account.id === activeAccountId) ? activeAccountId : current;
+}
+
+function renderCurrentAccount() {
+  renderAccountSelector();
+  renderFilters();
+  renderTrades();
+  renderSkippedTrades();
+  renderSummary();
+  if (document.getElementById("tab-analysis")?.classList.contains("active")) renderAnalysisWithDelay();
+  if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
+  if (document.getElementById("tab-weekly")?.classList.contains("active")) renderWeeklyReviews();
+  if (document.getElementById("tab-manage")?.classList.contains("active")) renderManage();
+  refreshIcons();
+}
+
+async function addAccount() {
+  const name = prompt("New account name:")?.trim();
+  if (!name) return;
+  const account = normalizeAccount({
+    id: generateId("account"),
+    name,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  });
+  accounts.push(account);
+  activeAccountId = account.id;
+  state = emptyJournalState();
+  accountData[activeAccountId] = clone(state);
+  try {
+    persistLocalState();
+    if (currentUser && firestoreLoadComplete) await saveToFirestore();
+  } catch (error) {
+    console.warn("Could not save account", error);
+    updateSyncStatus("offline");
+  }
+  renderCurrentAccount();
+  toast("Account added.");
+}
+
+async function renameAccount() {
+  const account = activeAccount();
+  const name = prompt("Account name:", account.name)?.trim();
+  if (!name || name === account.name) return;
+  account.name = name;
+  account.updatedAt = new Date().toISOString();
+  try {
+    persistLocalState();
+    if (currentUser && firestoreLoadComplete) await saveToFirestore();
+    renderCurrentAccount();
+    toast("Account renamed.");
+  } catch (error) {
+    console.warn("Could not rename account", error);
+    updateSyncStatus("offline");
+    toast("Account rename failed.");
+  }
+}
+
+async function switchAccount(accountId) {
+  if (!accountId || accountId === activeAccountId) return;
+  const nextAccount = accounts.find((account) => account.id === accountId);
+  if (!nextAccount) return;
+  try {
+    await save();
+    activeAccountId = accountId;
+    state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState());
+    persistLocalState();
+    renderCurrentAccount();
+    if (currentUser && firestoreLoadComplete) {
+      await loadAccountFromFirestore(currentUser.uid, activeAccountId);
+      persistLocalState();
+      renderCurrentAccount();
+    }
+    toast(`${nextAccount.name} loaded.`);
+  } catch (error) {
+    console.warn("Could not switch account", error);
+    updateSyncStatus("offline");
+    toast("Account switch failed.");
   }
 }
 
@@ -393,6 +683,7 @@ function fillFilter(id, values, label) {
 function renderFilters() {
   fillFilter("session-filter", state.options.sessions || [], "All sessions");
   fillFilter("setup-filter", state.options.setups || [], "All setups");
+  fillFilter("missed-reason-filter", state.options.skipReasons || SKIP_REASONS, "All reasons");
 }
 
 function clearFilters() {
@@ -434,6 +725,13 @@ function filteredTrades() {
       return haystack.includes(search);
     })
     .reverse();
+}
+
+function hasActiveTradeFilters() {
+  return ["search-input", "result-filter", "session-filter", "setup-filter"].some((id) => {
+    const el = document.getElementById(id);
+    return Boolean(el && String(el.value || "").trim());
+  });
 }
 
 function renderTrades() {
@@ -764,6 +1062,7 @@ function handleModalCustomOption(select) {
   fillModalSelect(select.id, state.options[cat], "Select", cat);
   select.value = value;
   renderFilters();
+  if (document.getElementById("tab-missed")?.classList.contains("active")) renderSkippedTrades();
   if (document.getElementById("tab-manage")?.classList.contains("active")) renderManage();
   if (document.getElementById("tab-analysis")?.classList.contains("active")) renderAnalysis();
 }
@@ -826,10 +1125,241 @@ function deleteTrade(index) {
   toast("Trade deleted.");
 }
 
+function skippedTradeTemplate() {
+  return normalizeSkippedTrade({
+    date: todayISO(),
+    session: currentSession()
+  });
+}
+
+function addSkippedTrade() {
+  openSkippedModal();
+}
+
+function openSkippedModal(index = null) {
+  skippedEditingIndex = Number.isInteger(index) ? index : null;
+  fillModalSelect("skipped-session", state.options.sessions, "Select", "sessions");
+  fillModalSelect("skipped-level", state.options.levels, "Select", "levels");
+  fillModalSelect("skipped-tf", state.options.tfs, "Select", "tfs");
+  fillModalSelect("skipped-reason", state.options.skipReasons || SKIP_REASONS, "Select", "skipReasons");
+  fillModalSelect("skipped-outcome", state.options.skipOutcomes || SKIP_OUTCOMES, "Select", "skipOutcomes");
+
+  const trade = skippedEditingIndex === null ? skippedTradeTemplate() : state.skippedTrades[skippedEditingIndex];
+  const title = document.getElementById("skipped-modal-title");
+  if (title) title.textContent = skippedEditingIndex === null ? "LOG_SKIPPED_TRADE" : `EDIT_SKIPPED_TRADE #${skippedEditingIndex + 1}`;
+  setModalValue("skipped-date", trade.date || todayISO());
+  setModalValue("skipped-session", trade.session);
+  setModalValue("skipped-level", trade.level);
+  setModalValue("skipped-tf", trade.tf);
+  setModalValue("skipped-direction", trade.direction);
+  setModalValue("skipped-reason", trade.skipReason);
+  setModalValue("skipped-confidence", trade.confidence);
+  setModalValue("skipped-notes", trade.notes);
+  setModalValue("skipped-outcome", trade.outcome);
+  setModalValue("skipped-pips-missed", trade.pipsMissed);
+
+  const modal = document.getElementById("skipped-modal");
+  if (modal) {
+    modal.hidden = false;
+    document.body.classList.add("modal-open");
+    setTimeout(() => document.getElementById("skipped-date")?.focus(), 40);
+  }
+  refreshIcons();
+}
+
+function closeSkippedModal() {
+  const modal = document.getElementById("skipped-modal");
+  if (modal) modal.hidden = true;
+  document.body.classList.remove("modal-open");
+  skippedEditingIndex = null;
+}
+
+function modalSkippedTradeData() {
+  return normalizeSkippedTrade({
+    date: document.getElementById("skipped-date")?.value || todayISO(),
+    session: document.getElementById("skipped-session")?.value || "",
+    level: document.getElementById("skipped-level")?.value || "",
+    tf: document.getElementById("skipped-tf")?.value || "",
+    direction: document.getElementById("skipped-direction")?.value || "",
+    skipReason: document.getElementById("skipped-reason")?.value || "",
+    confidence: normalizeConfidence(document.getElementById("skipped-confidence")?.value || ""),
+    notes: document.getElementById("skipped-notes")?.value || "",
+    outcome: document.getElementById("skipped-outcome")?.value || "",
+    pipsMissed: document.getElementById("skipped-pips-missed")?.value || ""
+  });
+}
+
+function saveSkippedTradeFromModal() {
+  const skippedTrade = modalSkippedTradeData();
+  if (!skippedTrade.date) {
+    toast("Date required.");
+    return;
+  }
+  const isEdit = skippedEditingIndex !== null;
+  if (skippedEditingIndex === null) {
+    state.skippedTrades.push(skippedTrade);
+  } else {
+    skippedTrade.id = state.skippedTrades[skippedEditingIndex]?.id || skippedTrade.id || generateId("skipped");
+    state.skippedTrades[skippedEditingIndex] = skippedTrade;
+  }
+  save();
+  renderSkippedTrades();
+  closeSkippedModal();
+  toast(isEdit ? "Skipped trade updated." : "Skipped trade saved.");
+}
+
+function deleteSkippedTrade(index) {
+  state.skippedTrades.splice(index, 1);
+  save();
+  renderSkippedTrades();
+  toast("Skipped trade deleted.");
+}
+
+function clearSkippedFilters() {
+  ["missed-outcome-filter", "missed-reason-filter"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+  renderSkippedTrades();
+}
+
+function skippedStats(trades = state.skippedTrades) {
+  const wins = trades.filter((trade) => isSkippedWin(trade.outcome));
+  const losses = trades.filter((trade) => trade.outcome === "SL Would Have Hit");
+  const reasonCounts = new Map();
+  trades.forEach((trade) => {
+    const reason = trade.skipReason || "-";
+    reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1);
+  });
+  const mostCommonReason = Array.from(reasonCounts.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] || "-";
+  const decided = wins.length + losses.length;
+  const winRate = decided ? wins.length / decided * 100 : 0;
+  const winningPips = wins.map((trade) => parseFloat(trade.pipsMissed)).filter((value) => Number.isFinite(value));
+  const avgPipsMissed = winningPips.length ? winningPips.reduce((sum, value) => sum + value, 0) / winningPips.length : 0;
+  return { total: trades.length, wins, losses, mostCommonReason, winRate, avgPipsMissed };
+}
+
+function isSkippedWin(outcome) {
+  const normalized = normalizeDashValue(outcome);
+  return normalized === "TP Hit - Full" || normalized === "TP Hit - Partial";
+}
+
+function optionalDisplay(value) {
+  return value === "" || value === null || value === undefined ? "-" : value;
+}
+
+function filteredSkippedTrades() {
+  const outcome = document.getElementById("missed-outcome-filter")?.value || "";
+  const reason = document.getElementById("missed-reason-filter")?.value || "";
+  return state.skippedTrades
+    .map((trade, index) => ({ trade, index }))
+    .filter(({ trade }) => {
+      if (reason && trade.skipReason !== reason) return false;
+      if (outcome === "tp" && !isSkippedWin(trade.outcome)) return false;
+      if (outcome === "sl" && trade.outcome !== "SL Would Have Hit") return false;
+      if (outcome === "no-reaction" && trade.outcome !== "No Reaction") return false;
+      return true;
+    })
+    .reverse();
+}
+
+function renderSkippedSummary() {
+  const stats = skippedStats();
+  const strip = document.getElementById("missed-summary-strip");
+  if (!strip) return;
+  strip.innerHTML = [
+    metric("Total Skipped", stats.total, "opportunities logged"),
+    metric("Would Win", stats.wins.length, "TP full + partial", stats.wins.length ? "pos" : "neutral"),
+    metric("Would Lose", stats.losses.length, "SL would have hit", stats.losses.length ? "neg" : "neutral"),
+    metric("Top Reason", stats.mostCommonReason, "most common skip"),
+    metric("Skipped Win Rate", `${stats.winRate.toFixed(1)}%`, "TP vs SL outcomes", stats.winRate >= 50 ? "pos" : "neg"),
+    metric("Avg $ Missed", `${stats.avgPipsMissed.toFixed(1)} $`, "winning skips", stats.avgPipsMissed ? "pos" : "neutral")
+  ].join("");
+}
+
+function renderSkippedTrades() {
+  renderSkippedSummary();
+  const tbody = document.getElementById("missed-body");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+
+  const rows = filteredSkippedTrades();
+  if (!state.skippedTrades.length) {
+    tbody.innerHTML = `
+      <tr class="empty-row">
+        <td colspan="11">
+          <div class="empty-state onboarding-state">
+            <div class="onboarding-card">
+              <i data-lucide="crosshair"></i>
+              <strong>Log skipped setups</strong>
+              <span>Track the XAUUSD opportunities you passed on and review what happened next.</span>
+              <div class="onboarding-actions">
+                <button class="primary-btn" onclick="addSkippedTrade()"><i data-lucide="plus"></i><span>Log Skipped Trade</span></button>
+              </div>
+            </div>
+          </div>
+        </td>
+      </tr>
+    `;
+    refreshIcons();
+    return;
+  }
+
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="11"><div class="empty-state"><div><strong>No matching skipped trades</strong><span>Clear filters to see all skipped trades.</span></div></div></td></tr>`;
+    refreshIcons();
+    return;
+  }
+
+  rows.forEach(({ trade, index }) => {
+    const tr = document.createElement("tr");
+    tr.className = isSkippedWin(trade.outcome) ? "row-win" : trade.outcome === "SL Would Have Hit" ? "row-loss" : "";
+    tr.classList.add("clickable-row");
+    tr.addEventListener("click", (event) => {
+      if (event.target.closest("button, input, select, textarea, a")) return;
+      openSkippedModal(index);
+    });
+    tr.appendChild(displayCell("Date", formatDateDisplay(trade.date) || "-", "date-display"));
+    tr.appendChild(displayCell("Session", trade.session || "-", "wrap-text"));
+    tr.appendChild(displayCell("Level", trade.level || "-", "wrap-text"));
+    tr.appendChild(displayCell("TF", trade.tf || "-", "mono"));
+    tr.appendChild(htmlCell("Direction", valuePill(trade.direction, "entry")));
+    tr.appendChild(displayCell("Skip Reason", trade.skipReason || "-", "wrap-text"));
+    tr.appendChild(displayCell("Confidence", trade.confidence ? `${trade.confidence}/5` : "-", "mono"));
+    tr.appendChild(htmlCell("Outcome", valuePill(trade.outcome, "result")));
+    tr.appendChild(displayCell("$ Missed", optionalDisplay(trade.pipsMissed), "mono"));
+    tr.appendChild(displayCell("Notes", trade.notes || "-", "notes-preview"));
+    tr.appendChild(skippedActionCell("Actions", index));
+    tbody.appendChild(tr);
+  });
+
+  refreshIcons();
+}
+
+function skippedActionCell(label, index) {
+  const td = document.createElement("td");
+  td.dataset.label = label;
+  td.className = "action-cell";
+  const edit = document.createElement("button");
+  edit.className = "icon-btn";
+  edit.title = "Edit skipped trade";
+  edit.innerHTML = `<i data-lucide="pencil"></i>`;
+  edit.addEventListener("click", () => openSkippedModal(index));
+  const del = document.createElement("button");
+  del.className = "icon-btn";
+  del.title = "Delete skipped trade";
+  del.innerHTML = `<i data-lucide="trash-2"></i>`;
+  del.addEventListener("click", () => deleteSkippedTrade(index));
+  td.appendChild(edit);
+  td.appendChild(del);
+  return td;
+}
+
 function scrollToLastRow() {
   setTimeout(() => {
     const shell = document.querySelector("#tab-log .table-shell");
     if (shell) shell.scrollTo({ top: 0, behavior: "smooth" });
+    if (hasActiveTradeFilters()) return;
     document.querySelector("#trade-body tr")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }, 40);
 }
@@ -873,8 +1403,8 @@ function renderAnalysis() {
       ${metric("Total Trades", p.closed.length, `${state.trades.length - p.closed.length} open`)}
       ${metric("Wins", p.wins.length, "closed winners", "pos")}
       ${metric("Losses", p.losses.length, "closed losses", "neg")}
-      ${metric("Avg Win", `${p.avgWin.toFixed(1)} pips`, "winning trades", "pos")}
-      ${metric("Avg Loss", `${p.avgLoss.toFixed(1)} pips`, "losing trades", "neg")}
+      ${metric("Avg Win", `${p.avgWin.toFixed(1)} $`, "winning trades", "pos")}
+      ${metric("Avg Loss", `${p.avgLoss.toFixed(1)} $`, "losing trades", "neg")}
     </div>
     <div class="dashboard-strip analysis-strip">
       ${metric("Current Win Streak", streaks.currentWin, "latest closed trades", streaks.currentWin ? "pos" : "neutral")}
@@ -885,7 +1415,7 @@ function renderAnalysis() {
     </div>
     <div class="analysis-grid">
       <div class="panel panel-pad">
-        <div class="panel-title"><span>Equity Curve</span><span class="section-pill ${moneyClass(p.totalPnl)}">${signed(p.totalPnl)} pips</span></div>
+        <div class="panel-title"><span>Equity Curve</span><span class="section-pill ${moneyClass(p.totalPnl)}">${signed(p.totalPnl)} $</span></div>
         ${equitySvg()}
       </div>
       <div class="panel panel-pad">
@@ -955,9 +1485,9 @@ function insightHtml() {
   const patience = patienceCostInsight();
   const counterTrend = counterTrendInsight();
   return [
-    insight("trophy", "Best level", bestLevel ? `${bestLevel.key}: ${signed(bestLevel.pnl)} pips across ${bestLevel.count} trades.` : "No clear level edge yet."),
+    insight("trophy", "Best level", bestLevel ? `${bestLevel.key}: ${signed(bestLevel.pnl)} $ across ${bestLevel.count} trades.` : "No clear level edge yet."),
     insight("clock-3", "Best session", bestSession ? `${bestSession.key}: ${bestSession.winRate.toFixed(0)}% win rate.` : "No clear session edge yet."),
-    insight("alert-triangle", "Costly mistake", costlyMistake ? `${costlyMistake.key}: ${signed(costlyMistake.pnl)} pips. Reduce this first.` : "No mistake pattern detected."),
+    insight("alert-triangle", "Costly mistake", costlyMistake ? `${costlyMistake.key}: ${signed(costlyMistake.pnl)} $. Reduce this first.` : "No mistake pattern detected."),
     insight(streak.type === "WIN" ? "flame" : "activity", "Current streak", streak.count ? `${streak.count} ${streak.type.toLowerCase()} trade(s) in a row.` : "No closed streak yet."),
     insight("calendar-check", "Best day of week", bestDay || "No weekday edge yet."),
     insight("gauge", "Patience insight", patience || "More scored trades are needed for patience insight."),
@@ -995,7 +1525,7 @@ function patienceCostInsight() {
   const lowPatienceLoss = performance().closed
     .filter((trade) => trade.result === "LOSS" && trade.patienceScore && parseInt(trade.patienceScore, 10) < winAvg)
     .reduce((sum, trade) => sum + Math.abs(parseFloat(trade.pnl) || parseFloat(calcPnl(trade.risk, trade.reward, trade.result)) || 0), 0);
-  return `Impatient entries cost you ${round1(lowPatienceLoss)} pips. Score ≥4 trades win ${patienceWinRate((score) => score >= 4)} vs ${patienceWinRate((score) => score <= 2)} for ≤2.`;
+  return `Impatient entries cost you ${round1(lowPatienceLoss)} $. Score ≥4 trades win ${patienceWinRate((score) => score >= 4)} vs ${patienceWinRate((score) => score <= 2)} for ≤2.`;
 }
 
 function biasWinRate(label) {
@@ -1219,7 +1749,7 @@ function comboAnalysisRows(closedTrades = performance().closed) {
     row.wins += trade.result === "WIN" ? 1 : 0;
     row.losses += trade.result === "LOSS" ? 1 : 0;
     row.be += trade.result === "BE" ? 1 : 0;
-    row.pnl = round1(row.pnl + (parseFloat(trade.pnl) || parseFloat(calcPnl(trade.risk, trade.reward, trade.result)) || 0));
+    row.pnl = round1(row.pnl + (parseFloat(trade.pnl) || 0));
   });
 
   return Array.from(map.values())
@@ -1387,7 +1917,7 @@ function renderPnl() {
           <button class="icon-btn" onclick="changePnlMonth(-1)" title="Previous month"><i data-lucide="chevron-left"></i></button>
           <div>
             <h2>${escapeHtml(monthTitle(year, month))}</h2>
-            <p>Daily P&L in pips</p>
+            <p>Daily P&L in $</p>
           </div>
           <button class="icon-btn" onclick="changePnlMonth(1)" title="Next month"><i data-lucide="chevron-right"></i></button>
         </div>
@@ -1407,7 +1937,7 @@ function renderPnl() {
             ${row.week.map((cell) => pnlDayCell(cell, stats)).join("")}
             <div class="pnl-week-total ${pnlClass(row.weekPnl, stats.maxAbs)}">
               <b>Week ${row.weekNo}</b>
-              <strong>${signed(row.weekPnl)} pips</strong>
+              <strong>${signed(row.weekPnl)} $</strong>
               <span>${row.weekTrades} trade${row.weekTrades === 1 ? "" : "s"}</span>
             </div>
           `).join("")}
@@ -1422,20 +1952,20 @@ function renderPnl() {
         </div>
         <div class="pnl-total-card ${moneyClass(stats.totalPnl)}">
           <span>Total P/L</span>
-          <b>${signed(stats.totalPnl)} pips</b>
+          <b>${signed(stats.totalPnl)} $</b>
         </div>
         <div class="pnl-info-card">
           <span>Avg Daily P/L</span>
-          <b>${signed(stats.avgDaily)} pips</b>
+          <b>${signed(stats.avgDaily)} $</b>
         </div>
         <div class="pnl-info-card">
           <span><i data-lucide="trending-up"></i> Best Day</span>
-          <b class="pos">${stats.best ? `${signed(stats.best.pnl)} pips` : "-"}</b>
+          <b class="pos">${stats.best ? `${signed(stats.best.pnl)} $` : "-"}</b>
           <small>${stats.best ? formatDateDisplay(stats.best.date) : "No data"}</small>
         </div>
         <div class="pnl-info-card">
           <span><i data-lucide="trending-down"></i> Worst Day</span>
-          <b class="neg">${stats.worst ? `${signed(stats.worst.pnl)} pips` : "-"}</b>
+          <b class="neg">${stats.worst ? `${signed(stats.worst.pnl)} $` : "-"}</b>
           <small>${stats.worst ? formatDateDisplay(stats.worst.date) : "No data"}</small>
         </div>
         <div class="pnl-win-note">
@@ -1446,7 +1976,7 @@ function renderPnl() {
           <button onclick="clearPnlSelection()" title="Clear selection"><i data-lucide="x"></i></button>
           <span>Selected Day</span>
           <b>${escapeHtml(selectedLabel)}</b>
-          <p>${selected ? `${selected.trades} trade${selected.trades === 1 ? "" : "s"}  ${signed(selected.pnl)} pips` : "No trades"}</p>
+          <p>${selected ? `${selected.trades} trade${selected.trades === 1 ? "" : "s"}  ${signed(selected.pnl)} $` : "No trades"}</p>
         </div>
       </aside>
     </div>
@@ -1470,7 +2000,7 @@ function pnlDayCell(cell, stats) {
   return `
     <button class="pnl-day ${cls} ${selected} ${muted}" onclick="selectPnlDay('${cell.iso}')">
       <span>${cell.day}</span>
-      <b>${day ? `${signed(day.pnl)} pips` : "No data"}</b>
+      <b>${day ? `${signed(day.pnl)} $` : "No data"}</b>
       <small>${day ? `${day.trades} trade${day.trades === 1 ? "" : "s"}` : ""}</small>
     </button>
   `;
@@ -1562,6 +2092,17 @@ function reportRange() {
 function tradesForRange(range = reportRange()) {
   recalcCum();
   return state.trades
+    .map((trade, index) => ({ trade, index }))
+    .filter(({ trade }) => {
+      if (range.from && (!trade.date || trade.date < range.from)) return false;
+      if (range.to && (!trade.date || trade.date > range.to)) return false;
+      return true;
+    })
+    .reverse();
+}
+
+function skippedTradesForRange(range = reportRange()) {
+  return state.skippedTrades
     .map((trade, index) => ({ trade, index }))
     .filter(({ trade }) => {
       if (range.from && (!trade.date || trade.date < range.from)) return false;
@@ -1667,6 +2208,42 @@ function reportComboAnalysisTable(items) {
   `;
 }
 
+function reportSkippedTradesSection(range = reportRange()) {
+  const items = skippedTradesForRange(range);
+  const stats = skippedStats(items.map(({ trade }) => trade));
+  const rows = items.map(({ trade }) => `
+    <tr>
+      <td>${escapeHtml(formatDateDisplay(trade.date) || "-")}</td>
+      <td>${escapeHtml(trade.session || "-")}</td>
+      <td>${escapeHtml(trade.level || "-")}</td>
+      <td>${escapeHtml(trade.tf || "-")}</td>
+      <td>${reportBadge(trade.direction, "entry")}</td>
+      <td>${escapeHtml(trade.skipReason || "-")}</td>
+      <td>${escapeHtml(trade.confidence ? `${trade.confidence}/5` : "-")}</td>
+      <td>${escapeHtml(trade.outcome || "-")}</td>
+      <td>${escapeHtml(optionalDisplay(trade.pipsMissed))}</td>
+      <td class="r-note-cell">${escapeHtml(trade.notes || "-")}</td>
+    </tr>
+  `).join("");
+
+  return `
+    <section class="r-section">
+      <h2>Skipped Trades</h2>
+      <section class="r-summary skipped-r-summary">
+        <div><span>Total Skipped</span><b>${stats.total}</b></div>
+        <div><span>Would Win</span><b class="r-pos">${stats.wins.length}</b></div>
+        <div><span>Would Lose</span><b class="r-neg">${stats.losses.length}</b></div>
+        <div><span>Skipped Win Rate</span><b>${stats.winRate.toFixed(1)}%</b></div>
+        <div><span>Avg $ Missed</span><b>${stats.avgPipsMissed.toFixed(1)} $</b></div>
+      </section>
+      <table class="r-table">
+        <thead><tr><th>Date</th><th>Session</th><th>Level</th><th>TF</th><th>Direction</th><th>Skip Reason</th><th>Confidence</th><th>Outcome</th><th>$ Missed</th><th>Notes</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="10">No skipped trades found for this range.</td></tr>`}</tbody>
+      </table>
+    </section>
+  `;
+}
+
 function buildReportHtml(range = reportRange()) {
   const items = tradesForRange(range);
   const p = reportPerformance(items);
@@ -1713,9 +2290,9 @@ function buildReportHtml(range = reportRange()) {
       <section class="r-summary">
         <div><span>Closed Trades</span><b>${p.closed.length}</b></div>
         <div><span>Win Rate</span><b class="${p.winRate >= 50 ? "r-pos" : "r-neg"}">${p.winRate.toFixed(1)}%</b></div>
-        <div><span>Total P&L</span><b class="${p.totalPnl >= 0 ? "r-pos" : "r-neg"}">${signed(p.totalPnl)} pips</b></div>
+        <div><span>Total P&L</span><b class="${p.totalPnl >= 0 ? "r-pos" : "r-neg"}">${signed(p.totalPnl)} $</b></div>
         <div><span>Profit Factor</span><b>${p.profitFactor.toFixed(2)}</b></div>
-        <div><span>Expectancy</span><b class="${p.expectancy >= 0 ? "r-pos" : "r-neg"}">${signed(p.expectancy)} pips</b></div>
+        <div><span>Expectancy</span><b class="${p.expectancy >= 0 ? "r-pos" : "r-neg"}">${signed(p.expectancy)} $</b></div>
       </section>
       <section class="r-section">
         <h2>Trade Log</h2>
@@ -1724,6 +2301,7 @@ function buildReportHtml(range = reportRange()) {
           <tbody>${rows || `<tr><td colspan="21">No trades found for this range.</td></tr>`}</tbody>
         </table>
       </section>
+      ${reportSkippedTradesSection(range)}
       <div class="r-analysis-grid">
         ${reportAnalysisTable("Session Analysis", items, "session")}
         ${reportAnalysisTable("Level Analysis", items, "level")}
@@ -1861,10 +2439,10 @@ async function clearAllTrades() {
     toast("No trades to clear.");
     return;
   }
-  if (!confirm("Clear all trades from this device and Firebase? This cannot be undone.")) return;
+  if (!confirm("Clear all trades for the selected account from this device and Firebase? This cannot be undone.")) return;
   state.trades = [];
   try {
-    localStorage.setItem(KEY, JSON.stringify(state));
+    persistLocalState();
   } catch (error) {
     console.warn("Could not clear local trade cache", error);
   }
@@ -1875,9 +2453,9 @@ async function clearAllTrades() {
   if (currentUser && window.firebaseDb) {
     try {
       updateSyncStatus("syncing");
-      await clearFirestoreCollection(currentUser.uid, "trades");
+      await clearAccountFirestoreCollection(currentUser.uid, activeAccountId, "trades");
       updateSyncStatus("synced");
-      toast("All trades cleared from device and Firebase.");
+      toast("Selected account trades cleared from device and Firebase.");
       return;
     } catch (error) {
       console.warn("Could not clear Firebase trades", error);
@@ -1887,7 +2465,7 @@ async function clearAllTrades() {
     }
   }
 
-  toast("All local trades cleared.");
+  toast("Selected account local trades cleared.");
 }
 
 function openMobileMenu() {
@@ -1960,38 +2538,41 @@ function userCollectionRef(uid, collectionName) {
   return window.firestoreCollection(window.firebaseDb, "users", uid, collectionName);
 }
 
+function accountDocRef(uid, accountId) {
+  return window.firestoreDoc(window.firebaseDb, "users", uid, "accounts", accountId);
+}
+
+function accountDataDocRef(uid, accountId, collectionName, documentId) {
+  return window.firestoreDoc(window.firebaseDb, "users", uid, "accounts", accountId, collectionName, documentId);
+}
+
+function accountDataCollectionRef(uid, accountId, collectionName) {
+  return window.firestoreCollection(window.firebaseDb, "users", uid, "accounts", accountId, collectionName);
+}
+
 async function loadFromFirestore(uid) {
   if (!window.firebaseDb) return;
   updateSyncStatus("syncing");
   try {
-    const [optionsSnap, settingsSnap, tradesSnap, reviewsSnap] = await Promise.all([
-      window.firestoreGetDoc(userDocRef(uid, "options", "data")),
-      window.firestoreGetDoc(userDocRef(uid, "settings", "data")),
-      window.firestoreGetDocs(userCollectionRef(uid, "trades")),
-      window.firestoreGetDocs(userCollectionRef(uid, "weeklyReviews"))
-    ]);
+    const accountsSnap = await window.firestoreGetDocs(userCollectionRef(uid, "accounts"));
+    const cloudAccounts = accountsSnap.docs.map((docSnap) => normalizeAccount({ id: docSnap.id, ...docSnap.data() }));
 
-    const cloudTrades = tradesSnap.docs.map((docSnap) => normalizeTrade({ id: docSnap.id, ...docSnap.data() }));
-    const cloudReviews = reviewsSnap.docs.map((docSnap) => normalizeWeeklyReview({ id: docSnap.id, ...docSnap.data() }));
-    const useCloud = cloudTrades.length > state.trades.length;
-
-    if (useCloud) {
-      state.ownerUid = uid;
-      state.trades = cloudTrades.sort((a, b) => String(a.date).localeCompare(String(b.date)));
-      if (optionsSnap.exists()) state.options = normalizeOptions(optionsSnap.data());
-      if (settingsSnap.exists()) state.settings = Object.assign({ defaultRisk: "" }, settingsSnap.data() || {});
-      state.weeklyReviews = cloudReviews;
-      localStorage.setItem(KEY, JSON.stringify(state));
-      renderFilters();
-      renderTrades();
-      renderSummary();
-      if (document.getElementById("tab-analysis")?.classList.contains("active")) renderAnalysis();
-      if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
-      if (document.getElementById("tab-weekly")?.classList.contains("active")) renderWeeklyReviews();
-      if (document.getElementById("tab-manage")?.classList.contains("active")) renderManage();
-    } else if (state.trades.length || state.weeklyReviews.length) {
+    if (cloudAccounts.length) {
+      accounts = cloudAccounts.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+      if (!accounts.some((account) => account.id === DEFAULT_ACCOUNT_ID)) accounts.unshift(defaultAccount());
+      if (!accounts.some((account) => account.id === activeAccountId)) activeAccountId = accounts[0].id;
+      await loadAccountFromFirestore(uid, activeAccountId);
+      const legacyState = await readLegacyFirestoreState(uid);
+      if (journalRowCount(legacyState)) {
+        accountData[DEFAULT_ACCOUNT_ID] = mergeJournalStates(accountData[DEFAULT_ACCOUNT_ID] || emptyJournalState(uid), legacyState);
+        if (activeAccountId === DEFAULT_ACCOUNT_ID) state = normalizeJournalState(accountData[DEFAULT_ACCOUNT_ID]);
+        await saveToFirestore();
+      }
+      persistLocalState();
+      renderCurrentAccount();
+    } else {
+      await loadLegacyFirestoreState(uid);
       await saveToFirestore();
-      return;
     }
 
     updateSyncStatus("synced");
@@ -1999,6 +2580,74 @@ async function loadFromFirestore(uid) {
     console.warn("Could not load from Firestore", error);
     updateSyncStatus("offline");
   }
+}
+
+async function loadLegacyFirestoreState(uid) {
+  const legacyState = await readLegacyFirestoreState(uid);
+  if (journalRowCount(legacyState)) {
+    state = mergeJournalStates(state, legacyState);
+  }
+
+  if (!accounts.length) accounts = [defaultAccount()];
+  if (!activeAccountId) activeAccountId = accounts[0].id;
+  accountData[activeAccountId] = normalizeJournalState(state);
+  persistLocalState();
+  renderCurrentAccount();
+}
+
+async function readLegacyFirestoreState(uid) {
+  const [optionsSnap, settingsSnap, tradesSnap, skippedTradesSnap, reviewsSnap] = await Promise.all([
+    window.firestoreGetDoc(userDocRef(uid, "options", "data")),
+    window.firestoreGetDoc(userDocRef(uid, "settings", "data")),
+    window.firestoreGetDocs(userCollectionRef(uid, "trades")),
+    window.firestoreGetDocs(userCollectionRef(uid, "skippedTrades")),
+    window.firestoreGetDocs(userCollectionRef(uid, "weeklyReviews"))
+  ]);
+
+  const cloudTrades = tradesSnap.docs.map((docSnap) => normalizeTrade({ id: docSnap.id, ...docSnap.data() }));
+  const cloudSkippedTrades = skippedTradesSnap.docs.map((docSnap) => normalizeSkippedTrade({ id: docSnap.id, ...docSnap.data() }));
+  const cloudReviews = reviewsSnap.docs.map((docSnap) => normalizeWeeklyReview({ id: docSnap.id, ...docSnap.data() }));
+  return normalizeJournalState({
+    ownerUid: uid,
+    trades: cloudTrades.sort((a, b) => String(a.date).localeCompare(String(b.date))),
+    skippedTrades: cloudSkippedTrades.sort((a, b) => String(a.date).localeCompare(String(b.date))),
+    weeklyReviews: cloudReviews,
+    options: optionsSnap.exists() ? optionsSnap.data() : FIXED,
+    settings: settingsSnap.exists() ? settingsSnap.data() : {}
+  });
+}
+
+async function loadAccountFromFirestore(uid, accountId) {
+  const [accountSnap, optionsSnap, settingsSnap, tradesSnap, skippedTradesSnap, reviewsSnap] = await Promise.all([
+    window.firestoreGetDoc(accountDocRef(uid, accountId)),
+    window.firestoreGetDoc(accountDataDocRef(uid, accountId, "options", "data")),
+    window.firestoreGetDoc(accountDataDocRef(uid, accountId, "settings", "data")),
+    window.firestoreGetDocs(accountDataCollectionRef(uid, accountId, "trades")),
+    window.firestoreGetDocs(accountDataCollectionRef(uid, accountId, "skippedTrades")),
+    window.firestoreGetDocs(accountDataCollectionRef(uid, accountId, "weeklyReviews"))
+  ]);
+
+  if (accountSnap.exists()) {
+    const account = normalizeAccount({ id: accountId, ...accountSnap.data() });
+    const index = accounts.findIndex((item) => item.id === accountId);
+    if (index >= 0) accounts[index] = account;
+  }
+
+  const cloudState = normalizeJournalState({
+    ownerUid: uid,
+    trades: tradesSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
+    skippedTrades: skippedTradesSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
+    weeklyReviews: reviewsSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
+    options: optionsSnap.exists() ? optionsSnap.data() : FIXED,
+    settings: settingsSnap.exists() ? settingsSnap.data() : {}
+  });
+  const localState = normalizeJournalState(accountData[accountId] || {});
+  const cloudRows = cloudState.trades.length + cloudState.skippedTrades.length + cloudState.weeklyReviews.length;
+  const localRows = localState.trades.length + localState.skippedTrades.length + localState.weeklyReviews.length;
+
+  state = cloudRows >= localRows ? cloudState : localState;
+  activeAccountId = accountId;
+  accountData[accountId] = clone(state);
 }
 
 async function syncCollection(uid, collectionName, rows) {
@@ -2009,9 +2658,22 @@ async function syncCollection(uid, collectionName, rows) {
   await Promise.all(existing.docs.filter((docSnap) => !keep.has(docSnap.id)).map((docSnap) => window.firestoreDeleteDoc(userDocRef(uid, collectionName, docSnap.id))));
 }
 
+async function syncAccountCollection(uid, accountId, collectionName, rows) {
+  const colRef = accountDataCollectionRef(uid, accountId, collectionName);
+  const existing = await window.firestoreGetDocs(colRef);
+  const keep = new Set(rows.map((row) => row.id));
+  await Promise.all(rows.map((row) => window.firestoreSetDoc(accountDataDocRef(uid, accountId, collectionName, row.id), row, { merge: true })));
+  await Promise.all(existing.docs.filter((docSnap) => !keep.has(docSnap.id)).map((docSnap) => window.firestoreDeleteDoc(accountDataDocRef(uid, accountId, collectionName, docSnap.id))));
+}
+
 async function clearFirestoreCollection(uid, collectionName) {
   const existing = await window.firestoreGetDocs(userCollectionRef(uid, collectionName));
   await Promise.all(existing.docs.map((docSnap) => window.firestoreDeleteDoc(userDocRef(uid, collectionName, docSnap.id))));
+}
+
+async function clearAccountFirestoreCollection(uid, accountId, collectionName) {
+  const existing = await window.firestoreGetDocs(accountDataCollectionRef(uid, accountId, collectionName));
+  await Promise.all(existing.docs.map((docSnap) => window.firestoreDeleteDoc(accountDataDocRef(uid, accountId, collectionName, docSnap.id))));
 }
 
 async function saveToFirestore() {
@@ -2019,22 +2681,32 @@ async function saveToFirestore() {
   updateSyncStatus("syncing");
   const uid = currentUser.uid;
   state.ownerUid = uid;
+  if (!accounts.length) accounts = [defaultAccount()];
+  const account = activeAccount();
+  account.updatedAt = new Date().toISOString();
   const trades = state.trades.map((trade) => normalizeTrade(trade));
+  const skippedTrades = state.skippedTrades.map((trade) => normalizeSkippedTrade(trade));
   const weeklyReviews = state.weeklyReviews.map((review) => normalizeWeeklyReview(review));
   state.trades = trades;
+  state.skippedTrades = skippedTrades;
   state.weeklyReviews = weeklyReviews;
   try {
-    localStorage.setItem(KEY, JSON.stringify(state));
+    persistLocalState();
   } catch (error) {
     console.warn("Could not refresh local cache", error);
   }
 
-  await Promise.all([
-    syncCollection(uid, "trades", trades),
-    syncCollection(uid, "weeklyReviews", weeklyReviews),
-    window.firestoreSetDoc(userDocRef(uid, "options", "data"), clone(state.options), { merge: true }),
-    window.firestoreSetDoc(userDocRef(uid, "settings", "data"), clone(state.settings), { merge: true })
-  ]);
+  await Promise.all(accounts.map(async (item) => {
+    const data = normalizeJournalState(accountData[item.id] || emptyJournalState(uid));
+    await window.firestoreSetDoc(accountDocRef(uid, item.id), normalizeAccount(item), { merge: true });
+    await Promise.all([
+      syncAccountCollection(uid, item.id, "trades", data.trades),
+      syncAccountCollection(uid, item.id, "skippedTrades", data.skippedTrades),
+      syncAccountCollection(uid, item.id, "weeklyReviews", data.weeklyReviews),
+      window.firestoreSetDoc(accountDataDocRef(uid, item.id, "options", "data"), clone(data.options), { merge: true }),
+      window.firestoreSetDoc(accountDataDocRef(uid, item.id, "settings", "data"), clone(data.settings), { merge: true })
+    ]);
+  }));
   updateSyncStatus("synced");
 }
 
@@ -2075,9 +2747,7 @@ function initFirebaseAuth() {
     hideLoginScreen();
     loadState();
     state.ownerUid = user.uid;
-    renderFilters();
-    renderTrades();
-    renderSummary();
+    renderCurrentAccount();
     initRealtimeSync();
     await loadFromFirestore(user.uid);
     firestoreLoadComplete = true;
@@ -2088,6 +2758,7 @@ function switchTab(name, button) {
   document.querySelectorAll(".nav-btn, .bottom-nav-btn").forEach((btn) => btn.classList.toggle("active", btn.dataset.tab === name));
   document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.remove("active"));
   document.getElementById(`tab-${name}`)?.classList.add("active");
+  if (name === "missed") renderSkippedTrades();
   if (name === "analysis") renderAnalysisWithDelay();
   if (name === "pnl") renderPnl();
   if (name === "weekly") renderWeeklyReviews();
@@ -2098,7 +2769,7 @@ function switchTab(name, button) {
 
 function exportRows() {
   recalcCum();
-  const headers = ["#", "Date", "Session", "Side", "Level", "TF", "Setup", "Mistake", "Hold", "Market Condition", "Bias Alignment", "Confirmation Type", "SL/TP Placement", "Patience Score", "Risk(pips)", "Reward(pips)", "RR", "Result", "P&L(pips)", "Cumul P&L", "Notes"];
+  const headers = ["#", "Date", "Session", "Side", "Level", "TF", "Setup", "Mistake", "Hold", "Market Condition", "Bias Alignment", "Confirmation Type", "SL/TP Placement", "Patience Score", "Risk($)", "Reward($)", "RR", "Result", "P&L($)", "Cumul P&L", "Notes"];
   const rows = state.trades.map((trade, index) => ({ trade, index })).reverse().map(({ trade, index }) => [
     index + 1,
     formatDateDisplay(trade.date),
@@ -2125,10 +2796,50 @@ function exportRows() {
   return { headers, rows };
 }
 
+function skippedExportRows(trades = state.skippedTrades) {
+  const headers = ["Date", "Session", "Level", "TF", "Direction", "Skip Reason", "Confidence", "Outcome", "$ Missed", "Notes"];
+  const rows = trades
+    .slice()
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+    .map((trade) => [
+      formatDateDisplay(trade.date),
+      trade.session,
+      trade.level,
+      trade.tf,
+      trade.direction,
+      trade.skipReason,
+      trade.confidence,
+      trade.outcome,
+      trade.pipsMissed,
+      trade.notes || ""
+    ]);
+  return { headers, rows };
+}
+
 function exportCSV() {
   const { headers, rows } = exportRows();
   const csv = [headers, ...rows].map((row) => row.map((value) => `"${String(value ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
   download(`data:text/csv;charset=utf-8,\uFEFF${encodeURIComponent(csv)}`, "Gold_Journal.csv");
+}
+
+function exportSkippedCSV() {
+  const { headers, rows } = skippedExportRows(filteredSkippedTrades().map(({ trade }) => trade));
+  const csv = [headers, ...rows].map((row) => row.map((value) => `"${String(value ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+  download(`data:text/csv;charset=utf-8,\uFEFF${encodeURIComponent(csv)}`, "Skipped_Trades.csv");
+  toast("Skipped trades CSV downloaded.");
+}
+
+function exportSkippedExcel() {
+  if (typeof XLSX === "undefined") {
+    alert("XLSX library is not loaded. Please reload the page.");
+    return;
+  }
+  const skipped = skippedExportRows(filteredSkippedTrades().map(({ trade }) => trade));
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([skipped.headers, ...skipped.rows]);
+  ws["!cols"] = [14, 24, 14, 8, 10, 30, 12, 18, 12, 42].map((wch) => ({ wch }));
+  XLSX.utils.book_append_sheet(wb, ws, "Skipped Trades");
+  XLSX.writeFile(wb, "Skipped_Trades.xlsx");
 }
 
 function exportExcel() {
@@ -2179,6 +2890,11 @@ function exportExcel() {
   wsCombo["!cols"] = [14, 8, 24, 20, 10, 8, 8, 8, 12, 12].map((wch) => ({ wch }));
   XLSX.utils.book_append_sheet(wb, wsCombo, "Combo Analysis");
 
+  const skipped = skippedExportRows();
+  const wsSkipped = XLSX.utils.aoa_to_sheet([skipped.headers, ...skipped.rows]);
+  wsSkipped["!cols"] = [14, 24, 14, 8, 10, 30, 12, 18, 12, 42].map((wch) => ({ wch }));
+  XLSX.utils.book_append_sheet(wb, wsSkipped, "Skipped Trades");
+
   const weeklySheet = [
     ["Week Of", "Learned", "Pattern", "Improve"],
     ...state.weeklyReviews
@@ -2188,7 +2904,7 @@ function exportExcel() {
   ];
   const wsWeekly = XLSX.utils.aoa_to_sheet(weeklySheet);
   wsWeekly["!cols"] = [{ wch: 14 }, { wch: 42 }, { wch: 42 }, { wch: 42 }];
-  XLSX.utils.book_append_sheet(wb, wsWeekly, "Weekly Reviews");
+  XLSX.utils.book_append_sheet(wb, wsWeekly, "weeklyReviews");
 
   XLSX.writeFile(wb, "Gold_Trading_Journal.xlsx");
 }
@@ -2255,17 +2971,19 @@ function seedDemoTrades() {
 if (typeof document !== "undefined") {
   loadState();
   applyReportPreset();
-  renderFilters();
-  renderTrades();
-  renderSummary();
+  renderCurrentAccount();
   showLoginScreen();
   updateSyncStatus("syncing");
   refreshIcons();
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !document.getElementById("trade-modal")?.hidden) closeTradeModal();
+    if (event.key === "Escape" && !document.getElementById("skipped-modal")?.hidden) closeSkippedModal();
   });
   document.getElementById("trade-modal")?.addEventListener("click", (event) => {
     if (event.target.id === "trade-modal") closeTradeModal();
+  });
+  document.getElementById("skipped-modal")?.addEventListener("click", (event) => {
+    if (event.target.id === "skipped-modal") closeSkippedModal();
   });
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch((error) => console.warn("Service worker registration failed", error));

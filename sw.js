@@ -1,8 +1,8 @@
-const CACHE_NAME = "gold-journal-v10";
+const CACHE_NAME = "gold-journal-v12";
 const APP_FILES = [
   "./",
-  "./styles.css?v=20260503-clear-trades-v10",
-  "./app.js?v=20260503-clear-trades-v10",
+  "./styles.css?v=20260512-missed-download-dollar-v1",
+  "./app.js?v=20260512-missed-download-dollar-v1",
   "./manifest.json",
   "./icon.svg"
 ];

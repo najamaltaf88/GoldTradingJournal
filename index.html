@@ -15,7 +15,7 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260503-clear-trades-v10">
+  <link rel="stylesheet" href="styles.css?v=20260512-missed-download-dollar-v1">
   <script src="firebase-config.js"></script>
 </head>
 <body>
@@ -56,11 +56,23 @@
         <span class="sync-dot syncing"></span>
         <span class="sync-label">Connecting...</span>
       </div>
+      <div class="account-switcher">
+        <label for="account-select">Account</label>
+        <div class="account-select-row">
+          <select id="account-select" onchange="switchAccount(this.value)"></select>
+          <button class="icon-btn" onclick="renameAccount()" title="Rename account" aria-label="Rename account"><i data-lucide="pencil"></i></button>
+          <button class="icon-btn" onclick="addAccount()" title="Add account" aria-label="Add account"><i data-lucide="plus"></i></button>
+        </div>
+      </div>
 
       <nav class="nav" aria-label="Main navigation">
         <button class="nav-btn active" data-tab="log" onclick="switchTab('log', this)">
           <i data-lucide="table-2"></i>
           <span>Trade Log</span>
+        </button>
+        <button class="nav-btn" data-tab="missed" onclick="switchTab('missed', this)">
+          <i data-lucide="crosshair"></i>
+          <span>Missed</span>
         </button>
         <button class="nav-btn" data-tab="analysis" onclick="switchTab('analysis', this)">
           <i data-lucide="bar-chart-3"></i>
@@ -191,6 +203,60 @@
         </div>
       </section>
 
+      <section id="tab-missed" class="tab-panel">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Opportunity tracker</p>
+            <h1>Skipped Trades</h1>
+          </div>
+          <div class="head-actions">
+            <button class="soft-btn" onclick="exportSkippedCSV()"><i data-lucide="file-down"></i><span>Download CSV</span></button>
+            <button class="soft-btn" onclick="exportSkippedExcel()"><i data-lucide="file-spreadsheet"></i><span>Download Excel</span></button>
+            <button class="primary-btn" onclick="addSkippedTrade()"><i data-lucide="plus"></i><span>Log Skipped Trade</span></button>
+          </div>
+        </header>
+
+        <div class="dashboard-strip" id="missed-summary-strip"></div>
+
+        <div class="toolbar">
+          <label class="field">
+            <span>Outcome</span>
+            <select id="missed-outcome-filter" onchange="renderSkippedTrades()">
+              <option value="">All</option>
+              <option value="tp">TP Hit</option>
+              <option value="sl">SL Hit</option>
+              <option value="no-reaction">No Reaction</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Skip Reason</span>
+            <select id="missed-reason-filter" onchange="renderSkippedTrades()"></select>
+          </label>
+          <button class="soft-btn compact" onclick="clearSkippedFilters()"><i data-lucide="x"></i><span>Clear</span></button>
+        </div>
+
+        <div class="table-shell missed-table-shell">
+          <table id="missed-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Session</th>
+                <th>Level</th>
+                <th>TF</th>
+                <th>Direction</th>
+                <th>Skip Reason</th>
+                <th>Confidence</th>
+                <th>Outcome</th>
+                <th>$ Missed</th>
+                <th>Notes</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="missed-body"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section id="tab-analysis" class="tab-panel">
         <header class="page-head">
           <div>
@@ -206,9 +272,9 @@
       <section id="tab-pnl" class="tab-panel">
         <header class="page-head">
           <div>
-            <p class="eyebrow">Pips calendar</p>
+            <p class="eyebrow">$ calendar</p>
             <h1>PnL</h1>
-            <p class="muted">Monthly profit and loss heatmap in pips.</p>
+            <p class="muted">Monthly profit and loss heatmap in $.</p>
           </div>
           <div class="head-actions">
             <button class="soft-btn" onclick="changePnlMonth(-1)"><i data-lucide="chevron-left"></i><span>Prev</span></button>
@@ -272,6 +338,82 @@
         <div class="manage-grid" id="manage-grid"></div>
       </section>
     </main>
+  </div>
+
+  <div class="modal-backdrop" id="skipped-modal" hidden>
+    <div class="trade-modal" role="dialog" aria-modal="true" aria-labelledby="skipped-modal-title">
+      <button class="modal-close" type="button" onclick="closeSkippedModal()" aria-label="Close">
+        <i data-lucide="x"></i>
+      </button>
+      <h2 id="skipped-modal-title">LOG_SKIPPED_TRADE</h2>
+      <div class="modal-grid">
+        <section class="modal-section">
+          <div class="modal-section-title"><span>What did I see</span></div>
+          <div class="modal-section-grid">
+            <label class="modal-field">
+              <span>Date</span>
+              <input id="skipped-date" type="date">
+            </label>
+            <label class="modal-field">
+              <span>Session</span>
+              <select id="skipped-session"></select>
+            </label>
+            <label class="modal-field">
+              <span>Level</span>
+              <select id="skipped-level"></select>
+            </label>
+            <label class="modal-field">
+              <span>Timeframe</span>
+              <select id="skipped-tf"></select>
+            </label>
+            <label class="modal-field">
+              <span>Direction</span>
+              <select id="skipped-direction">
+                <option value="">Select</option>
+                <option value="BUY">BUY</option>
+                <option value="SELL">SELL</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Why did I skip it</span></div>
+          <div class="modal-section-grid">
+            <label class="modal-field">
+              <span>Skip Reason</span>
+              <select id="skipped-reason"></select>
+            </label>
+            <label class="modal-field">
+              <span>Confidence level at the time</span>
+              <input id="skipped-confidence" type="number" min="1" max="5" step="1" placeholder="1 to 5">
+            </label>
+            <label class="modal-field modal-wide">
+              <span>Notes</span>
+              <textarea id="skipped-notes" placeholder="Why did you skip it?"></textarea>
+            </label>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <div class="modal-section-title"><span>What happened after</span></div>
+          <div class="modal-section-grid">
+            <label class="modal-field">
+              <span>Outcome</span>
+              <select id="skipped-outcome"></select>
+            </label>
+            <label class="modal-field">
+              <span>Estimated $ missed</span>
+              <input id="skipped-pips-missed" type="number" min="0" step="0.1">
+            </label>
+          </div>
+        </section>
+      </div>
+      <div class="modal-actions">
+        <button class="soft-btn" type="button" onclick="closeSkippedModal()">Cancel</button>
+        <button class="primary-btn" type="button" onclick="saveSkippedTradeFromModal()">Save Skipped Trade</button>
+      </div>
+    </div>
   </div>
 
   <div class="modal-backdrop" id="trade-modal" hidden>
@@ -368,11 +510,11 @@
           <div class="modal-section-title"><span>Risk</span></div>
           <div class="modal-section-grid">
             <label class="modal-field">
-              <span>Risk (pips)</span>
+              <span>Risk ($)</span>
               <input id="modal-risk" type="number" min="0" step="0.1">
             </label>
             <label class="modal-field">
-              <span>Reward (pips)</span>
+              <span>Reward ($)</span>
               <input id="modal-reward" type="number" min="0" step="0.1">
             </label>
           </div>
@@ -395,6 +537,7 @@
 
   <nav class="bottom-nav" aria-label="Mobile navigation">
     <button class="bottom-nav-btn active" data-tab="log" onclick="switchTab('log', this)"><i data-lucide="table-2"></i><span>Log</span></button>
+    <button class="bottom-nav-btn" data-tab="missed" onclick="switchTab('missed', this)"><i data-lucide="crosshair"></i><span>Missed</span></button>
     <button class="bottom-nav-btn" data-tab="analysis" onclick="switchTab('analysis', this)"><i data-lucide="bar-chart-3"></i><span>Analysis</span></button>
     <button class="bottom-nav-btn" data-tab="pnl" onclick="switchTab('pnl', this)"><i data-lucide="calendar-days"></i><span>PnL</span></button>
     <button class="bottom-nav-btn" data-tab="weekly" onclick="switchTab('weekly', this)"><i data-lucide="notebook-pen"></i><span>Weekly</span></button>
@@ -429,6 +572,6 @@
     };
     window.dispatchEvent(new CustomEvent("firebase-sdk-ready"));
   </script>
-  <script src="app.js?v=20260503-clear-trades-v10"></script>
+  <script src="app.js?v=20260512-missed-download-dollar-v1"></script>
 </body>
 </html>
