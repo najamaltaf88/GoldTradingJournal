@@ -1891,11 +1891,198 @@ function monthPnlStats(year, month) {
   return { map, days, tradingDays, totalTrades, profitable, losing, totalPnl, avgDaily, best, worst, winRate, maxAbs };
 }
 
+function monthTradeRows(year, month) {
+  recalcCum();
+  return state.trades
+    .map((trade, index) => ({ trade, index }))
+    .filter(({ trade }) => {
+      if (!trade.date || !trade.result) return false;
+      const d = new Date(`${trade.date}T00:00:00`);
+      return d.getFullYear() === year && d.getMonth() === month;
+    });
+}
+
+function pnlDashboardStats(year, month, stats) {
+  const trades = monthTradeRows(year, month);
+  const wins = trades.filter(({ trade }) => trade.result === "WIN");
+  const losses = trades.filter(({ trade }) => trade.result === "LOSS");
+  const bes = trades.filter(({ trade }) => trade.result === "BE");
+  const grossWin = round1(wins.reduce((sum, { trade }) => sum + (parseFloat(trade.pnl) || 0), 0));
+  const grossLoss = round1(losses.reduce((sum, { trade }) => sum + Math.abs(parseFloat(trade.pnl) || 0), 0));
+  const profitFactor = grossLoss ? grossWin / grossLoss : grossWin ? grossWin : 0;
+  const expectancy = trades.length ? round1(stats.totalPnl / trades.length) : 0;
+  const winRateTrades = trades.length ? wins.length / trades.length * 100 : 0;
+  const avgWin = wins.length ? round1(grossWin / wins.length) : 0;
+  const avgLoss = losses.length ? round1(grossLoss / losses.length) : 0;
+  const payoff = avgLoss ? avgWin / avgLoss : avgWin ? avgWin : 0;
+  const equity = [];
+  let cum = 0;
+  trades
+    .slice()
+    .sort((a, b) => String(a.trade.date).localeCompare(String(b.trade.date)) || a.index - b.index)
+    .forEach(({ trade }) => {
+      cum = round1(cum + (parseFloat(trade.pnl) || 0));
+      equity.push({ date: trade.date, value: cum });
+    });
+  const drawdowns = [];
+  let peak = 0;
+  equity.forEach((point) => {
+    peak = Math.max(peak, point.value);
+    drawdowns.push({ date: point.date, value: round1(point.value - peak) });
+  });
+  const maxDrawdown = drawdowns.length ? Math.min(...drawdowns.map((point) => point.value), 0) : 0;
+  const streak = bestPnlStreak(stats.days);
+  const consistency = pnlConsistencyScore(stats, maxDrawdown);
+  return { trades, wins, losses, bes, grossWin, grossLoss, profitFactor, expectancy, winRateTrades, avgWin, avgLoss, payoff, equity, drawdowns, maxDrawdown, streak, consistency };
+}
+
+function bestPnlStreak(days = []) {
+  const ordered = days.slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  let currentType = "";
+  let currentCount = 0;
+  const best = { win: 0, loss: 0 };
+  ordered.forEach((day) => {
+    const type = day.pnl > 0 ? "win" : day.pnl < 0 ? "loss" : "flat";
+    if (type === "flat") {
+      currentType = "";
+      currentCount = 0;
+      return;
+    }
+    currentCount = type === currentType ? currentCount + 1 : 1;
+    currentType = type;
+    best[type] = Math.max(best[type], currentCount);
+  });
+  return best;
+}
+
+function pnlConsistencyScore(stats, maxDrawdown) {
+  if (!stats.tradingDays) return 0;
+  const winComponent = Math.min(stats.winRate, 100) * 0.42;
+  const activityComponent = Math.min(stats.tradingDays / 12, 1) * 18;
+  const drawdownDrag = Math.min(Math.abs(maxDrawdown) / Math.max(Math.abs(stats.totalPnl) + stats.maxAbs, 1), 1) * 24;
+  const lossDayDrag = Math.min(stats.losing / Math.max(stats.tradingDays, 1), 1) * 16;
+  return Math.max(0, Math.min(100, Math.round(winComponent + activityComponent + 40 - drawdownDrag - lossDayDrag)));
+}
+
+function pnlSparkline(points, type = "equity") {
+  const values = points.map((point) => point.value);
+  if (!values.length) return `<div class="pnl-empty-chart">No closed trades</div>`;
+  const width = 520;
+  const height = 150;
+  const pad = 14;
+  const min = Math.min(...values, 0);
+  const max = Math.max(...values, 0);
+  const span = Math.max(max - min, 1);
+  const poly = values.map((value, index) => {
+    const x = pad + (index / Math.max(values.length - 1, 1)) * (width - pad * 2);
+    const y = height - pad - ((value - min) / span) * (height - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const zeroY = height - pad - ((0 - min) / span) * (height - pad * 2);
+  const stroke = type === "drawdown" ? "#ff6464" : "#43c783";
+  const fill = type === "drawdown" ? "pnlDrawdownFill" : "pnlEquityFill";
+  return `
+    <svg class="pnl-sparkline ${type}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(type)} chart">
+      <defs>
+        <linearGradient id="${fill}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="${stroke}" stop-opacity="0.26" />
+          <stop offset="100%" stop-color="${stroke}" stop-opacity="0" />
+        </linearGradient>
+      </defs>
+      <line x1="${pad}" y1="${zeroY.toFixed(1)}" x2="${width - pad}" y2="${zeroY.toFixed(1)}" />
+      <polyline points="${pad},${height - pad} ${poly} ${width - pad},${height - pad}" fill="url(#${fill})" />
+      <polyline points="${poly}" />
+    </svg>
+  `;
+}
+
+function pnlGroupRows(trades, field, fallback = "-") {
+  const map = new Map();
+  trades.forEach(({ trade }) => {
+    const key = trade[field] || fallback;
+    if (!map.has(key)) map.set(key, { key, trades: 0, pnl: 0, wins: 0, losses: 0 });
+    const row = map.get(key);
+    row.trades += 1;
+    row.pnl = round1(row.pnl + (parseFloat(trade.pnl) || 0));
+    row.wins += trade.result === "WIN" ? 1 : 0;
+    row.losses += trade.result === "LOSS" ? 1 : 0;
+  });
+  return Array.from(map.values()).sort((a, b) => b.pnl - a.pnl || b.trades - a.trades);
+}
+
+function pnlWeekdayRows(days) {
+  const labels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const rows = labels.map((label) => ({ key: label, trades: 0, pnl: 0, wins: 0, losses: 0 }));
+  days.forEach((day) => {
+    const index = new Date(`${day.date}T00:00:00`).getDay();
+    rows[index].trades += day.trades;
+    rows[index].pnl = round1(rows[index].pnl + day.pnl);
+    rows[index].wins += day.pnl > 0 ? 1 : 0;
+    rows[index].losses += day.pnl < 0 ? 1 : 0;
+  });
+  return rows;
+}
+
+function pnlBars(title, rows, icon) {
+  const active = rows.filter((row) => row.trades || row.pnl);
+  const maxAbs = Math.max(...active.map((row) => Math.abs(row.pnl)), 1);
+  const body = active.length ? active.map((row) => {
+    const width = Math.max(6, Math.round(Math.abs(row.pnl) / maxAbs * 100));
+    const wr = row.trades ? row.wins / row.trades * 100 : 0;
+    return `
+      <div class="pnl-bar-row">
+        <div><b>${escapeHtml(row.key)}</b><span>${row.trades} trades · ${wr.toFixed(0)}% WR</span></div>
+        <div class="pnl-bar-track"><i class="${moneyClass(row.pnl)}" style="width:${width}%"></i></div>
+        <strong class="${moneyClass(row.pnl)}">${signed(row.pnl)} $</strong>
+      </div>
+    `;
+  }).join("") : `<div class="pnl-empty-mini">No data</div>`;
+  return `
+    <section class="pnl-analytics-card">
+      <h3><i data-lucide="${icon}"></i><span>${escapeHtml(title)}</span></h3>
+      <div class="pnl-bars">${body}</div>
+    </section>
+  `;
+}
+
+function pnlDistribution(days, maxAbs) {
+  const body = days.length ? days
+    .slice()
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+    .map((day) => {
+      const height = Math.max(10, Math.round(Math.abs(day.pnl) / Math.max(maxAbs, 1) * 92));
+      return `<button class="pnl-dist-bar ${moneyClass(day.pnl)}" style="height:${height}px" onclick="selectPnlDay('${day.date}')" title="${escapeHtml(formatDateDisplay(day.date))}: ${signed(day.pnl)} $"><span>${new Date(`${day.date}T00:00:00`).getDate()}</span></button>`;
+    }).join("") : `<div class="pnl-empty-mini">No trading days</div>`;
+  return `
+    <section class="pnl-analytics-card">
+      <h3><i data-lucide="bar-chart-3"></i><span>Daily Distribution</span></h3>
+      <div class="pnl-distribution">${body}</div>
+    </section>
+  `;
+}
+
+function pnlSelectedTrades(selected) {
+  if (!selected) return `<div class="pnl-trade-list empty">No trades on selected day</div>`;
+  const rows = selected.indexes.map((tradeNo) => {
+    const trade = state.trades[tradeNo - 1];
+    if (!trade) return "";
+    return `
+      <button class="pnl-trade-row" onclick="openTradeModal(${tradeNo - 1})">
+        <span>#${tradeNo}</span>
+        <b>${escapeHtml(trade.entry || "-")} · ${escapeHtml(trade.level || "-")}</b>
+        <em class="${moneyClass(trade.pnl)}">${signed(trade.pnl)} $</em>
+      </button>
+    `;
+  }).join("");
+  return `<div class="pnl-trade-list">${rows}</div>`;
+}
+
 function renderPnl() {
   const el = document.getElementById("pnl-content");
   if (!el) return;
   const { year, month } = pnlView;
   const stats = monthPnlStats(year, month);
+  const dashboard = pnlDashboardStats(year, month, stats);
   if (!pnlView.selectedDate || !pnlView.selectedDate.startsWith(`${year}-${String(month + 1).padStart(2, "0")}`)) {
     pnlView.selectedDate = isoFromParts(year, month, 1);
   }
@@ -1909,10 +2096,46 @@ function renderPnl() {
   }
   const selected = stats.map.get(pnlView.selectedDate);
   const selectedLabel = `${dayName(pnlView.selectedDate)}, ${formatDateDisplay(pnlView.selectedDate)}`;
+  const sessionRows = pnlGroupRows(dashboard.trades, "session");
+  const setupRows = pnlGroupRows(dashboard.trades, "setup");
+  const weekdayRows = pnlWeekdayRows(stats.days);
 
   el.innerHTML = `
-    <div class="pnl-layout">
-      <div class="pnl-calendar-panel">
+    <div class="pnl-dashboard">
+      <section class="pnl-hero ${moneyClass(stats.totalPnl)}">
+        <div>
+          <span class="pnl-hero-kicker">Monthly Net P&L</span>
+          <b>${signed(stats.totalPnl)} $</b>
+          <p>${escapeHtml(monthTitle(year, month))} · ${dashboard.trades.length} closed trades · ${stats.tradingDays} active days</p>
+        </div>
+        <div class="pnl-score-ring" style="--score:${dashboard.consistency}">
+          <strong>${dashboard.consistency}</strong>
+          <span>Consistency</span>
+        </div>
+      </section>
+
+      <section class="pnl-kpi-grid">
+        ${pnlKpi("Win Rate", `${dashboard.winRateTrades.toFixed(1)}%`, `${dashboard.wins.length}W / ${dashboard.losses.length}L / ${dashboard.bes.length}BE`, "target")}
+        ${pnlKpi("Profit Factor", dashboard.profitFactor.toFixed(2), `${signed(dashboard.grossWin)} $ gross win`, "activity")}
+        ${pnlKpi("Expectancy", `${signed(dashboard.expectancy)} $`, "per closed trade", "calculator")}
+        ${pnlKpi("Max Drawdown", `${signed(dashboard.maxDrawdown)} $`, `${dashboard.streak.loss} day losing streak`, "shield-alert", moneyClass(dashboard.maxDrawdown))}
+        ${pnlKpi("Avg Win", `${signed(dashboard.avgWin)} $`, `Payoff ${dashboard.payoff.toFixed(2)}R`, "trending-up", "pos")}
+        ${pnlKpi("Avg Loss", `${signed(-dashboard.avgLoss)} $`, `${dashboard.streak.win} day winning streak`, "trending-down", "neg")}
+      </section>
+
+      <section class="pnl-chart-grid">
+        <article class="pnl-chart-card">
+          <div class="pnl-card-title"><span>Equity Curve</span><b class="${moneyClass(stats.totalPnl)}">${signed(stats.totalPnl)} $</b></div>
+          ${pnlSparkline(dashboard.equity, "equity")}
+        </article>
+        <article class="pnl-chart-card">
+          <div class="pnl-card-title"><span>Drawdown Curve</span><b class="neg">${signed(dashboard.maxDrawdown)} $</b></div>
+          ${pnlSparkline(dashboard.drawdowns, "drawdown")}
+        </article>
+      </section>
+
+      <div class="pnl-layout">
+        <div class="pnl-calendar-panel">
         <div class="pnl-monthbar">
           <button class="icon-btn" onclick="changePnlMonth(-1)" title="Previous month"><i data-lucide="chevron-left"></i></button>
           <div>
@@ -1977,11 +2200,31 @@ function renderPnl() {
           <span>Selected Day</span>
           <b>${escapeHtml(selectedLabel)}</b>
           <p>${selected ? `${selected.trades} trade${selected.trades === 1 ? "" : "s"}  ${signed(selected.pnl)} $` : "No trades"}</p>
+          ${pnlSelectedTrades(selected)}
         </div>
       </aside>
+      </div>
+
+      <section class="pnl-analytics-grid">
+        ${pnlBars("Session Edge", sessionRows, "clock-3")}
+        ${pnlBars("Setup Quality", setupRows, "layers-3")}
+        ${pnlBars("Weekday P&L", weekdayRows, "calendar-days")}
+        ${pnlDistribution(stats.days, stats.maxAbs)}
+      </section>
     </div>
   `;
   refreshIcons();
+}
+
+function pnlKpi(label, value, detail, icon, tone = "") {
+  return `
+    <article class="pnl-kpi ${tone}">
+      <i data-lucide="${icon}"></i>
+      <span>${escapeHtml(label)}</span>
+      <b>${escapeHtml(value)}</b>
+      <small>${escapeHtml(detail)}</small>
+    </article>
+  `;
 }
 
 function legendItem(cls, label) {
