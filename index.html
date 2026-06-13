@@ -15,7 +15,7 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260613-screenshots-v1">
+  <link rel="stylesheet" href="styles.css?v=20260613-trade-fixes-v1">
   <script src="firebase-config.js"></script>
 </head>
 <body>
@@ -186,7 +186,8 @@
                 <th class="optional-col">Market</th>
                 <th class="optional-col">Bias</th>
                 <th class="optional-col">Confirm</th>
-                <th class="optional-col">SL/TP</th>
+                <th class="optional-col">SL</th>
+                <th class="optional-col">TP</th>
                 <th>Patience</th>
                 <th>Risk</th>
                 <th>Reward</th>
@@ -488,8 +489,12 @@
               <select id="modal-bias-alignment"></select>
             </label>
             <label class="modal-field">
-              <span>SL/TP Placement</span>
+              <span>SL Placement</span>
               <select id="modal-sl-tp-placement"></select>
+            </label>
+            <label class="modal-field">
+              <span>TP Placement</span>
+              <select id="modal-tp-placement"></select>
             </label>
             <label class="modal-field">
               <span>Patience Score</span>
@@ -595,6 +600,6 @@
     };
     window.dispatchEvent(new CustomEvent("firebase-sdk-ready"));
   </script>
-  <script src="app.js?v=20260613-screenshots-v1"></script>
+  <script src="app.js?v=20260613-trade-fixes-v1"></script>
 </body>
 </html>

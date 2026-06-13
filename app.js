@@ -24,24 +24,27 @@ const ACCOUNTS_KEY = "xau_journal_accounts_v1";
 const DEFAULT_ACCOUNT_ID = "main";
 
 const FIXED = {
-  sessions: ["Asian (5am-8am)", "Post-Asian (8am-10am)", "London (11am-2pm)", "Post-London (2pm-4pm)", "New York (5pm-8pm)", "Post-NY (8pm-3am)"],
+  sessions: ["Pre-Asian (3am-5am)", "Asian (5am-8am)", "Post-Asian (8am-10am)", "Pre-London (10am-12pm)", "London (12pm-2pm)", "Post-London (2pm-4pm)", "Pre-NY (4pm-5pm)", "New York (5pm-8pm)", "Post-NY (8pm-3am)"],
   levels: ["SBR/TJL1", "RBS/TJL1", "TJL2", "QML", "FIB", "LVL4", "LVL2"],
   tfs: ["1m", "5m", "15m", "H1", "4H"],
   setups: ["A+", "A", "B"],
-  mistakes: ["No mistake", "Early entry", "Late entry", "SL too tight", "Fear exit", "FOMO trade"],
-  holds: ["Held full TP", "Partial + runner", "Early exit"],
+  mistakes: ["No mistake", "Early entry", "Late entry", "SL too tight", "Fear exit", "FOMO trade", "Not Booking Profit", "Overtrading", "Not following plan"],
+  holds: ["Held full TP", "Partial + runner", "Early exit", "SL hit", "RiskFree"],
   marketConditions: ["Bullish", "Bearish", "Ranging", "Choppy"],
   biasAlignments: ["With Trend", "Counter Trend"],
-  confirmationTypes: ["BOS", "CHoCH", "Engulfing", "Pin Bar", "Rejection Wick", "None"],
-  slTpPlacements: ["Above/Below Structure", "Fixed $", "ATR Based", "Arbitrary"],
+  confirmationTypes: ["BOS", "CHoCH", "Engulfing", "Pin Bar", "Rejection Wick", "Impulse Entry", "None"],
+  slPlacements: ["Above CC", "Below CC", "Fixed $", "Below Zone", "Above Zone"],
+  tpPlacements: ["Fixed 70 to 100pips", "Below Zone", "Above Zone", "Open TP", "Manually Exit"],
   skipReasons: [
     "Fear - H1/15m too slow",
     "Fear - SL looked too big",
     "No confirmation candle",
     "Wrong session timing",
     "Already missed entry",
-    "Distracted / not at screen",
+    "Distracted / not focused",
     "Low confidence in level",
+    "lack of confidence",
+    "Market is too fast",
     "Other"
   ],
   skipOutcomes: ["TP Hit - Full", "TP Hit - Partial", "SL Would Have Hit", "No Reaction", "Still Playing"]
@@ -57,7 +60,8 @@ const CAT_META = {
   marketConditions: { label: "Market Condition" },
   biasAlignments: { label: "Trade Direction vs Bias" },
   confirmationTypes: { label: "Confirmation Type" },
-  slTpPlacements: { label: "SL/TP Placement" },
+  slPlacements: { label: "SL Placement" },
+  tpPlacements: { label: "TP Placement" },
   skipReasons: { label: "Skipped Trade Reasons" },
   skipOutcomes: { label: "Skipped Trade Outcomes" }
 };
@@ -295,7 +299,9 @@ function persistLocalState() {
 function normalizeOptions(options) {
   const next = clone(FIXED);
   Object.keys(FIXED).forEach((key) => {
-    const custom = Array.isArray(options[key]) ? options[key].map(normalizeUnitLabel) : [];
+    const legacyValues = key === "slPlacements" && Array.isArray(options.slTpPlacements) ? options.slTpPlacements : [];
+    const sourceValues = Array.isArray(options[key]) ? options[key] : legacyValues;
+    const custom = sourceValues.map((value) => key === "tpPlacements" ? String(value || "").trim() : normalizeUnitLabel(value));
     next[key] = Array.from(new Set([...FIXED[key], ...custom].filter(Boolean)));
   });
   return next;
@@ -320,6 +326,7 @@ function normalizeTrade(trade) {
     biasAlignment: trade.biasAlignment || "",
     confirmationType: trade.confirmationType || "",
     slTpPlacement: normalizeUnitLabel(trade.slTpPlacement || ""),
+    tpPlacement: String(trade.tpPlacement || "").trim(),
     patienceScore: normalizePatienceScore(trade.patienceScore),
     risk: trade.risk || "",
     reward: trade.reward || "",
@@ -440,11 +447,14 @@ function parseDateInput(value) {
 }
 
 function currentSession() {
-  const hour = new Date().getUTCHours();
+  const hour = (new Date().getUTCHours() + 5) % 24;
+  if (hour >= 3 && hour < 5) return "Pre-Asian (3am-5am)";
   if (hour >= 5 && hour < 8) return "Asian (5am-8am)";
   if (hour >= 8 && hour < 10) return "Post-Asian (8am-10am)";
-  if (hour >= 11 && hour < 14) return "London (11am-2pm)";
+  if (hour >= 10 && hour < 12) return "Pre-London (10am-12pm)";
+  if (hour >= 12 && hour < 14) return "London (12pm-2pm)";
   if (hour >= 14 && hour < 16) return "Post-London (2pm-4pm)";
+  if (hour >= 16 && hour < 17) return "Pre-NY (4pm-5pm)";
   if (hour >= 17 && hour < 20) return "New York (5pm-8pm)";
   return "Post-NY (8pm-3am)";
 }
@@ -738,7 +748,7 @@ function filteredTrades() {
       if (session && trade.session !== session) return false;
       if (setup && trade.setup !== setup) return false;
       if (!search) return true;
-      const haystack = [trade.date, trade.session, trade.entry, trade.level, trade.tf, trade.setup, trade.mistake, trade.hold, trade.marketCondition, trade.biasAlignment, trade.confirmationType, trade.slTpPlacement, trade.patienceScore, trade.result, trade.reason].join(" ").toLowerCase();
+      const haystack = [trade.date, trade.session, trade.entry, trade.level, trade.tf, trade.setup, trade.mistake, trade.hold, trade.marketCondition, trade.biasAlignment, trade.confirmationType, trade.slTpPlacement, trade.tpPlacement, trade.patienceScore, trade.result, trade.reason].join(" ").toLowerCase();
       return haystack.includes(search);
     })
     .reverse();
@@ -763,7 +773,7 @@ function renderTrades() {
   if (!state.trades.length) {
     tbody.innerHTML = `
       <tr class="empty-row">
-        <td colspan="22">
+        <td colspan="23">
           <div class="empty-state onboarding-state">
             <div class="onboarding-card">
               <i data-lucide="clipboard-plus"></i>
@@ -783,7 +793,7 @@ function renderTrades() {
   }
 
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="22"><div class="empty-state"><div><strong>No matching trades</strong><span>Clear filters to see the full journal.</span></div></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="23"><div class="empty-state"><div><strong>No matching trades</strong><span>Clear filters to see the full journal.</span></div></div></td></tr>`;
     refreshIcons();
     return;
   }
@@ -794,7 +804,7 @@ function renderTrades() {
     tr.classList.add("clickable-row");
     tr.addEventListener("click", (event) => {
       if (event.target.closest("button, input, select, textarea, a")) return;
-      openTradeModal(index);
+      openViewTradeModal(index);
     });
     tr.appendChild(textCell("#", index + 1, "row-num"));
     tr.appendChild(displayCell("Date", formatDateDisplay(trade.date) || "-", "date-display"));
@@ -808,7 +818,8 @@ function renderTrades() {
     tr.appendChild(displayCell("Market", trade.marketCondition || "-", "wrap-text optional-col"));
     tr.appendChild(displayCell("Bias", trade.biasAlignment || "-", "wrap-text optional-col"));
     tr.appendChild(displayCell("Confirm", trade.confirmationType || "-", "wrap-text optional-col"));
-    tr.appendChild(displayCell("SL/TP", trade.slTpPlacement || "-", "wrap-text optional-col"));
+    tr.appendChild(displayCell("SL", trade.slTpPlacement || "-", "wrap-text optional-col"));
+    tr.appendChild(displayCell("TP", trade.tpPlacement || "-", "wrap-text optional-col"));
     tr.appendChild(htmlCell("Patience", patienceBadge(index, trade.patienceScore)));
     tr.appendChild(displayCell("Risk", trade.risk || "-", "mono"));
     tr.appendChild(displayCell("Reward", trade.reward || "-", "mono"));
@@ -1043,7 +1054,7 @@ function isCloudinaryConfigured() {
   return Boolean(
     CLOUDINARY_CLOUD_NAME &&
     CLOUDINARY_UPLOAD_PRESET &&
-    !["YOUR_CLOUD_NAME", "goldjournal"].includes(CLOUDINARY_CLOUD_NAME)
+    CLOUDINARY_CLOUD_NAME !== "YOUR_CLOUD_NAME"
   );
 }
 
@@ -1156,7 +1167,8 @@ function openTradeModal(index = null, draft = null) {
   fillModalSelect("modal-market-condition", state.options.marketConditions, "Select", "marketConditions");
   fillModalSelect("modal-bias-alignment", state.options.biasAlignments, "Select", "biasAlignments");
   fillModalSelect("modal-confirmation-type", state.options.confirmationTypes, "Select", "confirmationTypes");
-  fillModalSelect("modal-sl-tp-placement", state.options.slTpPlacements, "Select", "slTpPlacements");
+  fillModalSelect("modal-sl-tp-placement", state.options.slPlacements, "Select", "slPlacements");
+  fillModalSelect("modal-tp-placement", state.options.tpPlacements, "Select", "tpPlacements");
 
   const trade = draft || (modalEditingIndex === null ? newTradeTemplate() : state.trades[modalEditingIndex]);
   const title = document.getElementById("trade-modal-title");
@@ -1174,6 +1186,7 @@ function openTradeModal(index = null, draft = null) {
   setModalValue("modal-bias-alignment", trade.biasAlignment);
   setModalValue("modal-confirmation-type", trade.confirmationType);
   setModalValue("modal-sl-tp-placement", trade.slTpPlacement);
+  setModalValue("modal-tp-placement", trade.tpPlacement);
   setModalValue("modal-patience-score", trade.patienceScore);
   setModalValue("modal-risk", trade.risk);
   setModalValue("modal-reward", trade.reward);
@@ -1233,6 +1246,7 @@ function modalTradeData() {
     biasAlignment: document.getElementById("modal-bias-alignment")?.value || "",
     confirmationType: document.getElementById("modal-confirmation-type")?.value || "",
     slTpPlacement: document.getElementById("modal-sl-tp-placement")?.value || "",
+    tpPlacement: document.getElementById("modal-tp-placement")?.value || "",
     patienceScore: normalizePatienceScore(document.getElementById("modal-patience-score")?.value || ""),
     risk: document.getElementById("modal-risk")?.value || "",
     reward: document.getElementById("modal-reward")?.value || "",
@@ -1331,7 +1345,8 @@ function renderViewTradeModal() {
     ["Market Condition", escapeHtml(trade.marketCondition || "-")],
     ["Trade Direction vs Bias", escapeHtml(trade.biasAlignment || "-")],
     ["Confirmation Type", escapeHtml(trade.confirmationType || "-")],
-    ["SL/TP Placement", escapeHtml(trade.slTpPlacement || "-")],
+    ["SL Placement", escapeHtml(trade.slTpPlacement || "-")],
+    ["TP Placement", escapeHtml(trade.tpPlacement || "-")],
     ["Mistake Type", escapeHtml(trade.mistake || "-")],
     ["Hold Quality", escapeHtml(trade.hold || "-")],
     ["Risk (pips)", escapeHtml(trade.risk || "-")],
@@ -1340,7 +1355,7 @@ function renderViewTradeModal() {
   ];
   const imageHtml = trade.screenshotUrl
     ? `<a class="view-image-link" href="${escapeHtml(trade.screenshotUrl)}" target="_blank" rel="noopener" title="Open screenshot full size">
-        <img class="view-image" src="${escapeHtml(trade.screenshotUrl)}" alt="Trade screenshot" onload="this.classList.add('is-loaded')">
+        <img class="view-image" src="${escapeHtml(trade.screenshotUrl)}" alt="Trade screenshot" onload="this.classList.add('is-loaded')" onerror="this.classList.add('is-loaded')">
       </a>`
     : `<div class="view-image-placeholder">
         <i data-lucide="image-off"></i>
@@ -1683,7 +1698,8 @@ function renderAnalysis() {
     ${analysisTable("Hold Quality Analysis", "holds", "hold")}
     ${analysisTable("Market Condition Analysis", "marketConditions", "marketCondition")}
     ${analysisTable("Confirmation Type Analysis", "confirmationTypes", "confirmationType")}
-    ${analysisTable("SL/TP Placement Analysis", "slTpPlacements", "slTpPlacement")}
+    ${analysisTable("SL Placement Analysis", "slPlacements", "slTpPlacement")}
+    ${analysisTable("TP Placement Analysis", "tpPlacements", "tpPlacement")}
     ${patienceAnalysis()}
     ${crossTable()}
     ${comboAnalysisTable()}
@@ -2319,7 +2335,7 @@ function pnlSelectedTrades(selected) {
     const trade = state.trades[tradeNo - 1];
     if (!trade) return "";
     return `
-      <button class="pnl-trade-row" onclick="openTradeModal(${tradeNo - 1})">
+      <button class="pnl-trade-row" onclick="openViewTradeModal(${tradeNo - 1})">
         <span>#${tradeNo}</span>
         <b>${escapeHtml(trade.entry || "-")} · ${escapeHtml(trade.level || "-")}</b>
         <em class="${moneyClass(trade.pnl)}">${signed(trade.pnl)} $</em>
@@ -2671,7 +2687,7 @@ function reportScreenshotsSection(items) {
               ${reportBadge(trade.result, "result")}
             </header>
             <img src="${escapeHtml(trade.screenshotUrl)}" alt="Trade #${index + 1} screenshot">
-            <p class="r-screenshot-summary">Risk: ${escapeHtml(trade.risk || "-")}pips | Reward: ${escapeHtml(trade.reward || "-")}pips | RR: ${escapeHtml(calcRR(trade.risk, trade.reward) || "-")} | P&amp;L: ${escapeHtml(pnlText)}</p>
+            <p class="r-screenshot-summary">Risk: ${escapeHtml(trade.risk || "-")}pips | Reward: ${escapeHtml(trade.reward || "-")}pips | TP: ${escapeHtml(trade.tpPlacement || "-")} | RR: ${escapeHtml(calcRR(trade.risk, trade.reward) || "-")} | P&amp;L: ${escapeHtml(pnlText)}</p>
             ${trade.reason ? `<p class="r-screenshot-notes">${escapeHtml(trade.reason)}</p>` : ""}
           </article>
         `;
@@ -2786,6 +2802,7 @@ function buildReportHtml(range = reportRange()) {
       <td>${escapeHtml(trade.biasAlignment || "-")}</td>
       <td>${escapeHtml(trade.confirmationType || "-")}</td>
       <td>${escapeHtml(trade.slTpPlacement || "-")}</td>
+      <td>${escapeHtml(trade.tpPlacement || "-")}</td>
       <td>${escapeHtml(trade.patienceScore ? `P${trade.patienceScore}` : "-")}</td>
       <td>${escapeHtml(trade.risk || "-")}</td>
       <td>${escapeHtml(trade.reward || "-")}</td>
@@ -2820,8 +2837,8 @@ function buildReportHtml(range = reportRange()) {
       <section class="r-section">
         <h2>Trade Log</h2>
         <table class="r-table full-log">
-          <thead><tr><th>#</th><th>Date</th><th>Session</th><th>Side</th><th>Level</th><th>TF</th><th>Setup</th><th>Mistake</th><th>Hold</th><th>Market</th><th>Bias</th><th>Confirm</th><th>SL/TP</th><th>Patience</th><th>Risk</th><th>Reward</th><th>RR</th><th>Result</th><th>P&L</th><th>Cum</th><th>Notes / Reason</th></tr></thead>
-          <tbody>${rows || `<tr><td colspan="21">No trades found for this range.</td></tr>`}</tbody>
+          <thead><tr><th>#</th><th>Date</th><th>Session</th><th>Side</th><th>Level</th><th>TF</th><th>Setup</th><th>Mistake</th><th>Hold</th><th>Market</th><th>Bias</th><th>Confirm</th><th>SL</th><th>TP</th><th>Patience</th><th>Risk</th><th>Reward</th><th>RR</th><th>Result</th><th>P&L</th><th>Cum</th><th>Notes / Reason</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="22">No trades found for this range.</td></tr>`}</tbody>
         </table>
       </section>
       ${reportScreenshotsSection(items)}
@@ -2835,7 +2852,8 @@ function buildReportHtml(range = reportRange()) {
         ${reportAnalysisTable("Market Condition Analysis", items, "marketCondition")}
         ${reportAnalysisTable("Bias Alignment Analysis", items, "biasAlignment")}
         ${reportAnalysisTable("Confirmation Type Analysis", items, "confirmationType")}
-        ${reportAnalysisTable("SL/TP Placement Analysis", items, "slTpPlacement")}
+        ${reportAnalysisTable("SL Placement Analysis", items, "slTpPlacement")}
+        ${reportAnalysisTable("TP Placement Analysis", items, "tpPlacement")}
       </div>
       ${reportComboAnalysisTable(items)}
     </div>
@@ -3293,7 +3311,7 @@ function switchTab(name, button) {
 
 function exportRows() {
   recalcCum();
-  const headers = ["#", "Date", "Session", "Side", "Level", "TF", "Setup", "Mistake", "Hold", "Market Condition", "Bias Alignment", "Confirmation Type", "SL/TP Placement", "Patience Score", "Risk($)", "Reward($)", "RR", "Result", "P&L($)", "Cumul P&L", "Notes"];
+  const headers = ["#", "Date", "Session", "Side", "Level", "TF", "Setup", "Mistake", "Hold", "Market Condition", "Bias Alignment", "Confirmation Type", "SL Placement", "TP Placement", "Patience Score", "Risk($)", "Reward($)", "RR", "Result", "P&L($)", "Cumul P&L", "Notes"];
   const rows = state.trades.map((trade, index) => ({ trade, index })).reverse().map(({ trade, index }) => [
     index + 1,
     formatDateDisplay(trade.date),
@@ -3308,6 +3326,7 @@ function exportRows() {
     trade.biasAlignment,
     trade.confirmationType,
     trade.slTpPlacement,
+    trade.tpPlacement,
     trade.patienceScore,
     trade.risk,
     trade.reward,
@@ -3374,7 +3393,7 @@ function exportExcel() {
   const { headers, rows } = exportRows();
   const wb = XLSX.utils.book_new();
   const wsTrades = XLSX.utils.aoa_to_sheet([headers, ...rows]);
-  wsTrades["!cols"] = [4, 12, 24, 8, 14, 8, 12, 18, 18, 18, 22, 20, 18, 14, 10, 12, 9, 9, 10, 12, 34].map((wch) => ({ wch }));
+  wsTrades["!cols"] = [4, 12, 24, 8, 14, 8, 12, 18, 18, 18, 22, 20, 18, 18, 14, 10, 12, 9, 9, 10, 12, 34].map((wch) => ({ wch }));
   XLSX.utils.book_append_sheet(wb, wsTrades, "Trade Log");
 
   const p = performance();
@@ -3475,10 +3494,10 @@ function download(url, filename) {
 function seedDemoTrades() {
   if (state.trades.length && !confirm("Demo trades will be added to your current journal. Continue?")) return;
   const samples = [
-    ["London (11am-2pm)", "BUY", "RBS/TJL1", "5m", "A+", "No mistake", "Held full TP", 22, 60, "WIN", "Clean retest after London sweep."],
+    ["London (12pm-2pm)", "BUY", "RBS/TJL1", "5m", "A+", "No mistake", "Held full TP", 22, 60, "WIN", "Clean retest after London sweep."],
     ["New York (5pm-8pm)", "SELL", "QML", "15m", "A", "Early entry", "Early exit", 28, 52, "LOSS", "Entered before confirmation candle."],
     ["Post-London (2pm-4pm)", "BUY", "FIB", "5m", "B", "Fear exit", "Early exit", 18, 30, "BE", "Moved stop after hesitation."],
-    ["London (11am-2pm)", "SELL", "SBR/TJL1", "1m", "A+", "No mistake", "Partial + runner", 20, 75, "WIN", "Strong rejection from marked level."],
+    ["London (12pm-2pm)", "SELL", "SBR/TJL1", "1m", "A+", "No mistake", "Partial + runner", 20, 75, "WIN", "Strong rejection from marked level."],
     ["Asian (5am-8am)", "BUY", "LVL2", "5m", "B", "FOMO trade", "Early exit", 16, 24, "LOSS", "Low-volume entry without structure."]
   ];
   const today = new Date();
