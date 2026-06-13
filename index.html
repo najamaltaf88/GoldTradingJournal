@@ -15,7 +15,7 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260607-pnl-dashboard-v1">
+  <link rel="stylesheet" href="styles.css?v=20260613-screenshots-v1">
   <script src="firebase-config.js"></script>
 </head>
 <body>
@@ -521,6 +521,19 @@
         </section>
 
         <section class="modal-section">
+          <div class="modal-section-title"><span>Trade Screenshot</span></div>
+          <div class="screenshot-uploader">
+            <label class="dropzone" id="modal-screenshot-dropzone" for="modal-screenshot-input">
+              <input id="modal-screenshot-input" type="file" accept="image/*">
+              <i data-lucide="image-up"></i>
+              <span>Click or drag to upload screenshot</span>
+              <small id="modal-screenshot-status"></small>
+            </label>
+            <div class="screenshot-preview" id="modal-screenshot-preview" hidden></div>
+          </div>
+        </section>
+
+        <section class="modal-section">
           <div class="modal-section-title"><span>Notes</span></div>
           <label class="modal-field modal-wide">
             <span>Notes / Reason</span>
@@ -532,6 +545,16 @@
         <button class="soft-btn" type="button" onclick="closeTradeModal()">Cancel</button>
         <button class="primary-btn" type="button" onclick="saveTradeFromModal()">Save Trade</button>
       </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="view-trade-modal" hidden>
+    <div class="trade-modal view-modal" role="dialog" aria-modal="true" aria-labelledby="view-trade-title">
+      <button class="modal-close" type="button" onclick="closeViewTradeModal()" aria-label="Close">
+        <i data-lucide="x"></i>
+      </button>
+      <h2 id="view-trade-title">VIEW_TRADE</h2>
+      <div id="view-trade-body"></div>
     </div>
   </div>
 
@@ -572,6 +595,6 @@
     };
     window.dispatchEvent(new CustomEvent("firebase-sdk-ready"));
   </script>
-  <script src="app.js?v=20260607-pnl-dashboard-v1"></script>
+  <script src="app.js?v=20260613-screenshots-v1"></script>
 </body>
 </html>

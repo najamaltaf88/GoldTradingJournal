@@ -8,6 +8,11 @@ const FIREBASE_CONFIG = window.FIREBASE_CONFIG || {
   databaseURL: ""
 };
 
+const CLOUDINARY_CLOUD_NAME = "goldjournal";
+const CLOUDINARY_UPLOAD_PRESET = "gold_journal_trades";
+const CLOUDINARY_UPLOAD_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
+const MAX_SCREENSHOT_SIZE = 5 * 1024 * 1024;
+
 function hasFirebaseConfig() {
   return Boolean(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId && FIREBASE_CONFIG.appId);
 }
@@ -74,10 +79,21 @@ let pnlView = {
 
 let modalEditingIndex = null;
 let skippedEditingIndex = null;
+let viewTradeIndex = null;
 let analysisTimer = null;
 let currentUser = null;
 let firebaseReady = false;
 let firestoreLoadComplete = false;
+let cloudinaryConfigWarned = false;
+let screenshotUploadToken = 0;
+
+const screenshotState = {
+  url: "",
+  previewUrl: "",
+  objectUrl: "",
+  status: "idle",
+  error: ""
+};
 
 const uiState = {
   optionalColumns: true,
@@ -309,6 +325,7 @@ function normalizeTrade(trade) {
     reward: trade.reward || "",
     result: trade.result || "",
     reason: trade.reason || trade.notes || "",
+    screenshotUrl: trade.screenshotUrl || "",
     pnl: trade.pnl ?? "",
     cum: trade.cum ?? ""
   };
@@ -933,6 +950,12 @@ function actionCell(label, index) {
   const td = document.createElement("td");
   td.dataset.label = label;
   td.className = "action-cell";
+  const trade = state.trades[index] || {};
+  const view = document.createElement("button");
+  view.className = `icon-btn view-trade-btn${trade.screenshotUrl ? " has-screenshot" : ""}`;
+  view.title = trade.screenshotUrl ? "View trade with screenshot" : "View trade";
+  view.innerHTML = `<i data-lucide="eye"></i>${trade.screenshotUrl ? `<span class="screenshot-dot" aria-hidden="true"></span>` : ""}`;
+  view.addEventListener("click", () => openViewTradeModal(index));
   const edit = document.createElement("button");
   edit.className = "icon-btn";
   edit.title = "Edit trade";
@@ -943,6 +966,7 @@ function actionCell(label, index) {
   del.title = "Delete trade";
   del.innerHTML = `<i data-lucide="trash-2"></i>`;
   del.addEventListener("click", () => deleteTrade(index));
+  td.appendChild(view);
   td.appendChild(edit);
   td.appendChild(del);
   return td;
@@ -1003,6 +1027,124 @@ function setModalValue(id, value) {
   if (el) el.value = value || "";
 }
 
+function resetScreenshotObjectUrl() {
+  if (screenshotState.objectUrl) {
+    URL.revokeObjectURL(screenshotState.objectUrl);
+    screenshotState.objectUrl = "";
+  }
+}
+
+function setScreenshotState(next = {}) {
+  Object.assign(screenshotState, next);
+  renderScreenshotUploader();
+}
+
+function isCloudinaryConfigured() {
+  return Boolean(
+    CLOUDINARY_CLOUD_NAME &&
+    CLOUDINARY_UPLOAD_PRESET &&
+    !["YOUR_CLOUD_NAME", "goldjournal"].includes(CLOUDINARY_CLOUD_NAME)
+  );
+}
+
+function initScreenshotUploader(trade = {}) {
+  screenshotUploadToken += 1;
+  resetScreenshotObjectUrl();
+  screenshotState.url = trade.screenshotUrl || "";
+  screenshotState.previewUrl = trade.screenshotUrl || "";
+  screenshotState.status = "idle";
+  screenshotState.error = "";
+  renderScreenshotUploader();
+}
+
+function renderScreenshotUploader() {
+  const preview = document.getElementById("modal-screenshot-preview");
+  const status = document.getElementById("modal-screenshot-status");
+  const dropzone = document.getElementById("modal-screenshot-dropzone");
+  if (!preview || !status || !dropzone) return;
+
+  dropzone.classList.toggle("is-uploading", screenshotState.status === "uploading");
+  const statusText = {
+    idle: screenshotState.url ? "Uploaded" : "",
+    preview: "Preview ready",
+    uploading: "Uploading...",
+    uploaded: "Uploaded",
+    error: screenshotState.error || "Upload failed"
+  }[screenshotState.status] || "";
+  status.innerHTML = screenshotState.status === "uploading"
+    ? `<span class="upload-spinner" aria-hidden="true"></span>${escapeHtml(statusText)}`
+    : (statusText === "Uploaded" ? `&#10003; ${escapeHtml(statusText)}` : escapeHtml(statusText));
+
+  if (!screenshotState.previewUrl) {
+    preview.hidden = true;
+    preview.innerHTML = "";
+    return;
+  }
+
+  preview.hidden = false;
+  preview.innerHTML = `
+    <div class="screenshot-preview-frame">
+      <img src="${escapeHtml(screenshotState.previewUrl)}" alt="Trade screenshot preview">
+      <button class="icon-btn screenshot-remove" type="button" onclick="removeTradeScreenshot()" title="Remove screenshot" aria-label="Remove screenshot">
+        <i data-lucide="x"></i>
+      </button>
+    </div>
+  `;
+  refreshIcons();
+}
+
+function removeTradeScreenshot() {
+  screenshotUploadToken += 1;
+  resetScreenshotObjectUrl();
+  setScreenshotState({ url: "", previewUrl: "", status: "idle", error: "" });
+  const input = document.getElementById("modal-screenshot-input");
+  if (input) input.value = "";
+}
+
+async function handleScreenshotFile(file) {
+  if (!file) return;
+  if (!file.type || !file.type.startsWith("image/")) {
+    toast("Only image files are supported.");
+    return;
+  }
+  if (file.size > MAX_SCREENSHOT_SIZE) {
+    toast("Image too large (max 5MB)");
+    return;
+  }
+  resetScreenshotObjectUrl();
+  const uploadToken = screenshotUploadToken + 1;
+  screenshotUploadToken = uploadToken;
+  const localUrl = URL.createObjectURL(file);
+  setScreenshotState({ url: "", previewUrl: localUrl, objectUrl: localUrl, status: "uploading", error: "" });
+
+  if (!isCloudinaryConfigured()) {
+    if (!cloudinaryConfigWarned) {
+      toast("Cloudinary not configured. See setup guide in README.");
+      cloudinaryConfigWarned = true;
+    }
+    setScreenshotState({ status: "error", error: "Not configured" });
+    return;
+  }
+
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
+    const response = await fetch(CLOUDINARY_UPLOAD_URL, { method: "POST", body: formData });
+    if (!response.ok) throw new Error(`Cloudinary upload failed: ${response.status}`);
+    const data = await response.json();
+    if (!data.secure_url) throw new Error("Cloudinary response missing secure_url");
+    if (uploadToken !== screenshotUploadToken) return;
+    resetScreenshotObjectUrl();
+    setScreenshotState({ url: data.secure_url, previewUrl: data.secure_url, objectUrl: "", status: "uploaded", error: "" });
+  } catch (error) {
+    if (uploadToken !== screenshotUploadToken) return;
+    console.warn("Screenshot upload failed", error);
+    toast("Screenshot upload failed - trade saved without it");
+    setScreenshotState({ url: "", status: "error", error: "Upload failed" });
+  }
+}
+
 function openTradeModal(index = null, draft = null) {
   modalEditingIndex = Number.isInteger(index) ? index : null;
   fillModalSelect("modal-session", state.options.sessions, "Select", "sessions");
@@ -1036,6 +1178,7 @@ function openTradeModal(index = null, draft = null) {
   setModalValue("modal-risk", trade.risk);
   setModalValue("modal-reward", trade.reward);
   setModalValue("modal-reason", trade.reason);
+  initScreenshotUploader(trade);
 
   const modal = document.getElementById("trade-modal");
   if (modal) {
@@ -1072,6 +1215,8 @@ function closeTradeModal() {
   if (modal) modal.hidden = true;
   document.body.classList.remove("modal-open");
   modalEditingIndex = null;
+  screenshotUploadToken += 1;
+  resetScreenshotObjectUrl();
 }
 
 function modalTradeData() {
@@ -1092,7 +1237,8 @@ function modalTradeData() {
     risk: document.getElementById("modal-risk")?.value || "",
     reward: document.getElementById("modal-reward")?.value || "",
     result: document.getElementById("modal-result")?.value || "",
-    reason: document.getElementById("modal-reason")?.value || ""
+    reason: document.getElementById("modal-reason")?.value || "",
+    screenshotUrl: screenshotState.url || ""
   });
 }
 
@@ -1123,6 +1269,112 @@ function deleteTrade(index) {
   renderTrades();
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
   toast("Trade deleted.");
+}
+
+function openViewTradeModal(index) {
+  viewTradeIndex = Number.isInteger(index) ? index : null;
+  const modal = document.getElementById("view-trade-modal");
+  if (!modal || viewTradeIndex === null || !state.trades[viewTradeIndex]) return;
+  renderViewTradeModal();
+  modal.hidden = false;
+  document.body.classList.add("modal-open");
+  refreshIcons();
+}
+
+function closeViewTradeModal() {
+  const modal = document.getElementById("view-trade-modal");
+  if (modal) modal.hidden = true;
+  viewTradeIndex = null;
+  if (document.getElementById("trade-modal")?.hidden !== false && document.getElementById("skipped-modal")?.hidden !== false) {
+    document.body.classList.remove("modal-open");
+  }
+}
+
+function editTradeFromView() {
+  const index = viewTradeIndex;
+  closeViewTradeModal();
+  if (Number.isInteger(index)) openTradeModal(index);
+}
+
+function viewBadge(value, type) {
+  const key = String(value || "empty").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return `<span class="view-badge badge-${type} badge-${key || "empty"}">${escapeHtml(value || "-")}</span>`;
+}
+
+function readonlyStars(score) {
+  const current = Math.max(0, Math.min(5, parseInt(score, 10) || 0));
+  return `<span class="star-rating-readonly" aria-label="${current} out of 5">${"&#9733;".repeat(current)}${"&#9734;".repeat(5 - current)}</span>`;
+}
+
+function viewInfoItem(label, value, delay) {
+  return `
+    <div class="view-info-item" style="animation-delay:${delay}ms">
+      <span>${escapeHtml(label)}</span>
+      <b>${value || "-"}</b>
+    </div>
+  `;
+}
+
+function renderViewTradeModal() {
+  const trade = state.trades[viewTradeIndex];
+  const body = document.getElementById("view-trade-body");
+  const title = document.getElementById("view-trade-title");
+  if (!trade || !body) return;
+  if (title) title.textContent = `VIEW_TRADE #${viewTradeIndex + 1}`;
+  const pnl = calcPnl(trade.risk, trade.reward, trade.result);
+  const pnlText = pnl === "" ? "- pips" : `${signed(pnl)} pips`;
+  const info = [
+    ["Session", escapeHtml(trade.session || "-")],
+    ["Level", escapeHtml(trade.level || "-")],
+    ["Timeframe", escapeHtml(trade.tf || "-")],
+    ["Setup Quality", escapeHtml(trade.setup || "-")],
+    ["Market Condition", escapeHtml(trade.marketCondition || "-")],
+    ["Trade Direction vs Bias", escapeHtml(trade.biasAlignment || "-")],
+    ["Confirmation Type", escapeHtml(trade.confirmationType || "-")],
+    ["SL/TP Placement", escapeHtml(trade.slTpPlacement || "-")],
+    ["Mistake Type", escapeHtml(trade.mistake || "-")],
+    ["Hold Quality", escapeHtml(trade.hold || "-")],
+    ["Risk (pips)", escapeHtml(trade.risk || "-")],
+    ["Reward (pips)", escapeHtml(trade.reward || "-")],
+    ["Patience Score", readonlyStars(trade.patienceScore)]
+  ];
+  const imageHtml = trade.screenshotUrl
+    ? `<a class="view-image-link" href="${escapeHtml(trade.screenshotUrl)}" target="_blank" rel="noopener" title="Open screenshot full size">
+        <img class="view-image" src="${escapeHtml(trade.screenshotUrl)}" alt="Trade screenshot" onload="this.classList.add('is-loaded')">
+      </a>`
+    : `<div class="view-image-placeholder">
+        <i data-lucide="image-off"></i>
+        <strong>No screenshot added</strong>
+        <button class="link-btn" type="button" onclick="editTradeFromView()">Add Screenshot</button>
+      </div>`;
+
+  body.innerHTML = `
+    <article class="view-card">
+      ${imageHtml}
+      <header class="view-header">
+        <div class="view-header-meta">
+          <span>${escapeHtml(formatDateDisplay(trade.date) || "-")}</span>
+          ${viewBadge(trade.result, "result")}
+          ${viewBadge(trade.entry, "side")}
+        </div>
+        <div class="view-rr">
+          <b>${escapeHtml(calcRR(trade.risk, trade.reward) || "-")}</b>
+          <span class="${moneyClass(pnl)}">${escapeHtml(pnlText)}</span>
+        </div>
+      </header>
+      <div class="view-info-grid">
+        ${info.map(([label, value], itemIndex) => viewInfoItem(label, value, itemIndex * 20)).join("")}
+      </div>
+      <section class="view-notes">
+        <span>Notes / Reason</span>
+        <p>${escapeHtml(trade.reason || "No notes added")}</p>
+      </section>
+      <footer class="view-footer">
+        <button class="primary-btn" type="button" onclick="editTradeFromView()"><i data-lucide="pencil"></i><span>Edit Trade</span></button>
+        <button class="soft-btn" type="button" onclick="closeViewTradeModal()">Close</button>
+      </footer>
+    </article>
+  `;
 }
 
 function skippedTradeTemplate() {
@@ -2400,6 +2652,34 @@ function reportBadge(value, type) {
   return `<span class="r-badge">${v}</span>`;
 }
 
+function reportScreenshotsSection(items) {
+  const rows = items.filter(({ trade }) => trade.screenshotUrl);
+  if (!rows.length) return "";
+  return `
+    <section class="r-section r-screenshots-section">
+      <h2>Trade Screenshots</h2>
+      ${rows.map(({ trade, index }) => {
+        const pnl = calcPnl(trade.risk, trade.reward, trade.result);
+        const pnlText = pnl === "" ? "-" : `${signed(pnl)} pips`;
+        return `
+          <article class="r-screenshot-card">
+            <header>
+              <div>
+                <b>Trade #${index + 1}</b>
+                <span>${escapeHtml(formatDateDisplay(trade.date) || "-")} | ${escapeHtml(trade.level || "-")} | ${escapeHtml(trade.tf || "-")}</span>
+              </div>
+              ${reportBadge(trade.result, "result")}
+            </header>
+            <img src="${escapeHtml(trade.screenshotUrl)}" alt="Trade #${index + 1} screenshot">
+            <p class="r-screenshot-summary">Risk: ${escapeHtml(trade.risk || "-")}pips | Reward: ${escapeHtml(trade.reward || "-")}pips | RR: ${escapeHtml(calcRR(trade.risk, trade.reward) || "-")} | P&amp;L: ${escapeHtml(pnlText)}</p>
+            ${trade.reason ? `<p class="r-screenshot-notes">${escapeHtml(trade.reason)}</p>` : ""}
+          </article>
+        `;
+      }).join("")}
+    </section>
+  `;
+}
+
 function reportGroupRows(items, field) {
   const closed = items.filter(({ trade }) => trade.result);
   const map = new Map();
@@ -2544,6 +2824,7 @@ function buildReportHtml(range = reportRange()) {
           <tbody>${rows || `<tr><td colspan="21">No trades found for this range.</td></tr>`}</tbody>
         </table>
       </section>
+      ${reportScreenshotsSection(items)}
       ${reportSkippedTradesSection(range)}
       <div class="r-analysis-grid">
         ${reportAnalysisTable("Session Analysis", items, "session")}
@@ -3152,7 +3433,22 @@ function exportExcel() {
   XLSX.writeFile(wb, "Gold_Trading_Journal.xlsx");
 }
 
-function exportPDF() {
+function preloadReportImages(report) {
+  const images = Array.from(report.querySelectorAll(".r-screenshot-card img"));
+  if (!images.length) return Promise.resolve();
+  return Promise.all(images.map((img) => new Promise((resolve) => {
+    if (img.complete && img.naturalWidth > 0) {
+      resolve();
+      return;
+    }
+    const done = () => resolve();
+    img.addEventListener("load", done, { once: true });
+    img.addEventListener("error", done, { once: true });
+    setTimeout(done, 4500);
+  }))).then(() => new Promise((resolve) => setTimeout(resolve, 150)));
+}
+
+async function exportPDF() {
   const range = reportRange();
   const report = document.getElementById("print-report");
   if (!report) return;
@@ -3160,6 +3456,7 @@ function exportPDF() {
   const title = document.title;
   document.title = `Gold_Trading_Journal_${range.from || "all"}_${range.to || "trades"}`;
   document.body.classList.add("printing-report");
+  await preloadReportImages(report);
   window.print();
   setTimeout(() => {
     document.title = title;
@@ -3220,14 +3517,39 @@ if (typeof document !== "undefined") {
   refreshIcons();
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !document.getElementById("trade-modal")?.hidden) closeTradeModal();
+    if (event.key === "Escape" && !document.getElementById("view-trade-modal")?.hidden) closeViewTradeModal();
     if (event.key === "Escape" && !document.getElementById("skipped-modal")?.hidden) closeSkippedModal();
   });
   document.getElementById("trade-modal")?.addEventListener("click", (event) => {
     if (event.target.id === "trade-modal") closeTradeModal();
   });
+  document.getElementById("view-trade-modal")?.addEventListener("click", (event) => {
+    if (event.target.id === "view-trade-modal") closeViewTradeModal();
+  });
   document.getElementById("skipped-modal")?.addEventListener("click", (event) => {
     if (event.target.id === "skipped-modal") closeSkippedModal();
   });
+  document.getElementById("modal-screenshot-input")?.addEventListener("change", (event) => {
+    handleScreenshotFile(event.target.files?.[0]);
+  });
+  const screenshotDropzone = document.getElementById("modal-screenshot-dropzone");
+  if (screenshotDropzone) {
+    ["dragenter", "dragover"].forEach((type) => {
+      screenshotDropzone.addEventListener(type, (event) => {
+        event.preventDefault();
+        screenshotDropzone.classList.add("drag-over");
+      });
+    });
+    ["dragleave", "drop"].forEach((type) => {
+      screenshotDropzone.addEventListener(type, (event) => {
+        event.preventDefault();
+        screenshotDropzone.classList.remove("drag-over");
+      });
+    });
+    screenshotDropzone.addEventListener("drop", (event) => {
+      handleScreenshotFile(event.dataTransfer?.files?.[0]);
+    });
+  }
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch((error) => console.warn("Service worker registration failed", error));
   }
