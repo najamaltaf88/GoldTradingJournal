@@ -27,13 +27,13 @@
         return;
       }
       const client = window.supabase.createClient(config.url, config.anonKey, {
-        auth: { detectSessionInUrl: false, persistSession: true, flowType: "pkce" }
+        auth: { detectSessionInUrl: true, persistSession: true, flowType: "pkce" }
       });
       const { error } = await client.auth.exchangeCodeForSession(code);
       if (error) {
         status.textContent = "Sign-in failed: " + error.message;
       } else {
-        window.location.replace("/");
+        window.location.replace("../../");
       }
     })();
   </script>

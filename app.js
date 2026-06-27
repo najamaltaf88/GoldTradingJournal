@@ -10,7 +10,7 @@ let authPasswordVisible = false;
 
 const SUPABASE_AUTH_OPTIONS = {
   auth: {
-    detectSessionInUrl: false,
+    detectSessionInUrl: true,
     persistSession: true,
     autoRefreshToken: true,
     flowType: "pkce"
@@ -3974,7 +3974,7 @@ function hideLoginScreen() {
 }
 
 function authRedirectUrl() {
-  return window.location.origin + "/auth/callback";
+  return window.location.origin + "/auth/callback/";
 }
 
 function setAuthStatus(message = "", type = "") {
@@ -4098,18 +4098,25 @@ async function signInWithGoogle() {
   }
   setAuthBusy(true);
   setAuthStatus("Opening Google sign-in...");
-  const { error } = await supabaseClient.auth.signInWithOAuth({
-    provider: "google",
-    options: {
-      redirectTo: authRedirectUrl(),
-      queryParams: { prompt: "select_account" }
+  try {
+    const { error } = await supabaseClient.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo: authRedirectUrl(),
+        queryParams: { prompt: "select_account" }
+      }
+    });
+    if (error) {
+      console.warn("Google sign-in failed", error);
+      const message = supabaseAuthMessage(error);
+      setAuthStatus(message, "error");
+      toast(message);
+      setAuthBusy(false);
     }
-  });
-  if (error) {
-    console.warn("Google sign-in failed", error);
-    const message = supabaseAuthMessage(error);
-    setAuthStatus(message, "error");
-    toast(message);
+  } catch (err) {
+    console.error("Google sign-in exception", err);
+    setAuthStatus("Connection failed.", "error");
+    toast("Connection failed.");
     setAuthBusy(false);
   }
 }
@@ -4133,15 +4140,22 @@ async function signInWithEmail(event) {
   }
   setAuthBusy(true);
   setAuthStatus("Signing in...");
-  const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
-  if (error) {
-    const message = supabaseAuthMessage(error);
-    setAuthStatus(message, "error");
-    toast(message);
-  } else {
-    setAuthStatus("Signed in. Loading journal...", "success");
+  try {
+    const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+    if (error) {
+      const message = supabaseAuthMessage(error);
+      setAuthStatus(message, "error");
+      toast(message);
+    } else {
+      setAuthStatus("Signed in. Loading journal...", "success");
+    }
+  } catch (err) {
+    console.error("Sign in exception", err);
+    setAuthStatus("Connection failed.", "error");
+    toast("Connection failed.");
+  } finally {
+    setAuthBusy(false);
   }
-  setAuthBusy(false);
 }
 
 async function signUpWithEmail(event) {
@@ -4163,33 +4177,60 @@ async function signUpWithEmail(event) {
   }
   setAuthBusy(true);
   setAuthStatus("Creating account...");
-  const { data, error } = await supabaseClient.auth.signUp({
-    email,
-    password,
-    options: {
-      emailRedirectTo: authRedirectUrl()
+  try {
+    const { data, error } = await supabaseClient.auth.signUp({
+      email,
+      password,
+      options: {
+        emailRedirectTo: authRedirectUrl()
+      }
+    });
+    if (error) {
+      const message = supabaseAuthMessage(error);
+      setAuthStatus(message, "error");
+      toast(message);
+    } else if (data?.session) {
+      const message = "Account created. Loading journal...";
+      setAuthStatus(message, "success");
+      toast(message);
+    } else {
+      const message = "Account created. Check your email to confirm it.";
+      setAuthStatus(message, "success");
+      toast(message);
     }
-  });
-  if (error) {
-    const message = supabaseAuthMessage(error);
-    setAuthStatus(message, "error");
-    toast(message);
-  } else if (data?.session) {
-    const message = "Account created. Loading journal...";
-    setAuthStatus(message, "success");
-    toast(message);
-  } else {
-    const message = "Account created. Check your email to confirm it.";
-    setAuthStatus(message, "success");
-    toast(message);
+  } catch (err) {
+    console.error("Sign up exception", err);
+    setAuthStatus("Connection failed.", "error");
+    toast("Connection failed.");
+  } finally {
+    setAuthBusy(false);
   }
-  setAuthBusy(false);
 }
 
 async function signOutUser() {
   if (!supabaseClient) return;
   authLoadToken += 1;
-  await supabaseClient.auth.signOut();
+  try {
+    await supabaseClient.auth.signOut();
+  } catch (error) {
+    console.warn("Error during Supabase signout", error);
+  }
+  // Clear all local states
+  try {
+    localStorage.removeItem(ACCOUNTS_KEY);
+    localStorage.removeItem(KEY);
+    localStorage.removeItem(SKIPPED_KEY);
+  } catch (err) {
+    console.warn("Could not clear local storage during signout", err);
+  }
+  accounts = [defaultAccount()];
+  accountData = {};
+  activeAccountId = DEFAULT_ACCOUNT_ID;
+  currentUser = null;
+  state = emptyJournalState("");
+  renderCurrentAccount();
+  showLoginScreen();
+  updateSyncStatus("offline");
 }
 
 function updateUserRow(user) {
