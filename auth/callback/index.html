@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Signing in...</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
-  <script src="../../env-config.js"></script>
+  <script src="/env-config.js"></script>
   <style>
     body { background: #080a0d; color: #c9a84c; font-family: sans-serif;
            display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
@@ -21,10 +21,15 @@
         status.textContent = "Config error. Copy .env.example to .env and run: node scripts/generate-config.js";
         return;
       }
+      const code = new URLSearchParams(window.location.search).get("code");
+      if (!code) {
+        status.textContent = "Sign-in failed: missing authorization code.";
+        return;
+      }
       const client = window.supabase.createClient(config.url, config.anonKey, {
-        auth: { detectSessionInUrl: true, flowType: "pkce" }
+        auth: { detectSessionInUrl: false, persistSession: true, flowType: "pkce" }
       });
-      const { error } = await client.auth.exchangeCodeForSession(window.location.href);
+      const { error } = await client.auth.exchangeCodeForSession(code);
       if (error) {
         status.textContent = "Sign-in failed: " + error.message;
       } else {

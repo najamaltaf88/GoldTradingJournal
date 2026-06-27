@@ -3967,12 +3967,16 @@ function hideLoginScreen() {
   document.querySelector(".bottom-nav")?.removeAttribute("hidden");
 }
 
+function authRedirectUrl() {
+  return window.location.origin + "/auth/callback";
+}
+
 async function signInWithGoogle() {
   if (!supabaseClient) { toast("Supabase not ready."); return; }
   const { error } = await supabaseClient.auth.signInWithOAuth({
     provider: "google",
     options: {
-      redirectTo: window.location.origin + "/auth/callback",
+      redirectTo: authRedirectUrl(),
       queryParams: { prompt: "select_account" }
     }
   });
@@ -4000,7 +4004,13 @@ async function signUpWithEmail(event) {
   const email = document.getElementById("login-email")?.value.trim();
   const password = document.getElementById("login-password")?.value || "";
   if (!email || !password) { toast("Enter email and password."); return; }
-  const { error } = await supabaseClient.auth.signUp({ email, password });
+  const { error } = await supabaseClient.auth.signUp({
+    email,
+    password,
+    options: {
+      emailRedirectTo: authRedirectUrl()
+    }
+  });
   if (error) {
     toast(supabaseAuthMessage(error));
   } else {
