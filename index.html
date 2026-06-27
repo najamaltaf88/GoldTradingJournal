@@ -28,17 +28,18 @@
       <div class="brand-mark">AU</div>
       <h1>Gold Trading Journal</h1>
       <p>XAUUSD trade desk</p>
-      <button class="google-btn" onclick="signInWithGoogle()">
+      <button id="google-login-btn" class="google-btn" onclick="signInWithGoogle()">
         <span>G</span>
         <b>Sign in with Google</b>
       </button>
       <div class="auth-divider"><span>or</span></div>
       <form class="email-login-form" onsubmit="signInWithEmail(event)">
         <input id="login-email" type="email" autocomplete="email" placeholder="Email address" required>
-        <input id="login-password" type="password" autocomplete="current-password" placeholder="Password" required>
+        <input id="login-password" type="password" autocomplete="current-password" minlength="6" placeholder="Password" required>
         <button type="submit">Sign in with Email</button>
         <button type="button" class="signup-btn" onclick="signUpWithEmail(event)">Create account</button>
       </form>
+      <small id="auth-status" class="auth-status" role="status"></small>
       <small>Your data is saved to the cloud. Works on any device.</small>
     </div>
   </div>

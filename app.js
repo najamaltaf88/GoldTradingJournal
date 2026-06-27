@@ -1,7 +1,9 @@
 // --- Supabase Client ---
 let supabaseClient = null;
+let supabaseConfig = null;
 let supabaseReady = false;
 let authLoadToken = 0;
+let authProviders = { email: true, google: true };
 
 const SUPABASE_AUTH_OPTIONS = {
   auth: {
@@ -18,6 +20,7 @@ function initSupabase() {
     console.warn("Supabase config missing. Copy .env.example to .env, then run: node scripts/generate-config.js");
     return false;
   }
+  supabaseConfig = config;
   supabaseClient = window.supabase.createClient(config.url, config.anonKey, SUPABASE_AUTH_OPTIONS);
   return true;
 }
@@ -3971,8 +3974,56 @@ function authRedirectUrl() {
   return window.location.origin + "/auth/callback";
 }
 
+function setAuthStatus(message = "", type = "") {
+  const status = document.getElementById("auth-status");
+  if (!status) return;
+  status.textContent = message;
+  if (type) {
+    status.dataset.type = type;
+  } else {
+    delete status.dataset.type;
+  }
+}
+
+function setGoogleLoginEnabled(enabled, message = "") {
+  const button = document.getElementById("google-login-btn");
+  if (!button) return;
+  button.disabled = !enabled;
+  button.title = enabled ? "" : message;
+  if (!enabled && message) setAuthStatus(message, "error");
+}
+
+async function syncAuthProviderAvailability() {
+  if (!supabaseConfig?.url || !supabaseConfig?.anonKey) return;
+  try {
+    const response = await fetch(`${supabaseConfig.url}/auth/v1/settings`, {
+      headers: { apikey: supabaseConfig.anonKey }
+    });
+    if (!response.ok) return;
+    const settings = await response.json();
+    authProviders = {
+      email: settings?.external?.email !== false,
+      google: settings?.external?.google === true
+    };
+    if (!authProviders.google) {
+      setGoogleLoginEnabled(false, "Google sign-in is not enabled in Supabase.");
+    } else {
+      setGoogleLoginEnabled(true);
+    }
+  } catch (error) {
+    console.warn("Could not load auth provider settings", error);
+  }
+}
+
 async function signInWithGoogle() {
   if (!supabaseClient) { toast("Supabase not ready."); return; }
+  if (!authProviders.google) {
+    const message = "Google sign-in is not enabled in Supabase.";
+    setAuthStatus(message, "error");
+    toast(message);
+    return;
+  }
+  setAuthStatus("Opening Google sign-in...");
   const { error } = await supabaseClient.auth.signInWithOAuth({
     provider: "google",
     options: {
@@ -3982,28 +4033,52 @@ async function signInWithGoogle() {
   });
   if (error) {
     console.warn("Google sign-in failed", error);
-    toast("Google sign-in failed: " + error.message);
+    const message = supabaseAuthMessage(error);
+    setAuthStatus(message, "error");
+    toast(message);
   }
 }
 
 async function signInWithEmail(event) {
   event?.preventDefault();
   if (!supabaseClient) { toast("Supabase not ready."); return; }
+  if (!authProviders.email) {
+    const message = "Email sign-in is not enabled in Supabase.";
+    setAuthStatus(message, "error");
+    toast(message);
+    return;
+  }
   const email = document.getElementById("login-email")?.value.trim();
   const password = document.getElementById("login-password")?.value || "";
   if (!email || !password) { toast("Enter email and password."); return; }
+  setAuthStatus("Signing in...");
   const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
   if (error) {
-    toast(supabaseAuthMessage(error));
+    const message = supabaseAuthMessage(error);
+    setAuthStatus(message, "error");
+    toast(message);
   }
 }
 
 async function signUpWithEmail(event) {
   event?.preventDefault();
   if (!supabaseClient) { toast("Supabase not ready."); return; }
+  if (!authProviders.email) {
+    const message = "Email signup is not enabled in Supabase.";
+    setAuthStatus(message, "error");
+    toast(message);
+    return;
+  }
   const email = document.getElementById("login-email")?.value.trim();
   const password = document.getElementById("login-password")?.value || "";
   if (!email || !password) { toast("Enter email and password."); return; }
+  if (password.length < 6) {
+    const message = "Password must be at least 6 characters.";
+    setAuthStatus(message, "error");
+    toast(message);
+    return;
+  }
+  setAuthStatus("Creating account...");
   const { error } = await supabaseClient.auth.signUp({
     email,
     password,
@@ -4012,9 +4087,13 @@ async function signUpWithEmail(event) {
     }
   });
   if (error) {
-    toast(supabaseAuthMessage(error));
+    const message = supabaseAuthMessage(error);
+    setAuthStatus(message, "error");
+    toast(message);
   } else {
-    toast("Check your email to confirm your account.");
+    const message = "Signup successful. Check your email to confirm your account.";
+    setAuthStatus(message, "success");
+    toast(message);
   }
 }
 
@@ -4476,6 +4555,7 @@ function initSupabaseAuth() {
     return;
   }
   supabaseReady = true;
+  syncAuthProviderAvailability();
 
   supabaseClient.auth.onAuthStateChange(async (event, session) => {
     const user = session?.user || null;

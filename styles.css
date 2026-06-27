@@ -230,6 +230,17 @@ button {
   font-weight: 800;
 }
 
+.google-btn:disabled {
+  cursor: not-allowed;
+  border-color: var(--line);
+  color: var(--quiet);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.google-btn:disabled span {
+  background: var(--line);
+}
+
 .email-login-form {
   display: grid;
   gap: 9px;
@@ -270,6 +281,20 @@ button {
 .email-login-form .signup-btn:hover {
   border-color: rgba(240, 189, 85, 0.45);
   color: var(--gold);
+}
+
+.auth-status {
+  display: block;
+  min-height: 18px;
+  color: var(--quiet);
+}
+
+.auth-status[data-type="error"] {
+  color: var(--red);
+}
+
+.auth-status[data-type="success"] {
+  color: var(--green);
 }
 
 .user-row {
