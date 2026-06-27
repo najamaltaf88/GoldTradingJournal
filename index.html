@@ -24,24 +24,50 @@
 </head>
 <body>
   <div id="login-screen" hidden>
-    <div class="login-card">
-      <div class="brand-mark">AU</div>
-      <h1>Gold Trading Journal</h1>
-      <p>XAUUSD trade desk</p>
-      <button id="google-login-btn" class="google-btn" onclick="signInWithGoogle()">
-        <span>G</span>
-        <b>Sign in with Google</b>
-      </button>
-      <div class="auth-divider"><span>or</span></div>
-      <form class="email-login-form" onsubmit="signInWithEmail(event)">
-        <input id="login-email" type="email" autocomplete="email" placeholder="Email address" required>
-        <input id="login-password" type="password" autocomplete="current-password" minlength="6" placeholder="Password" required>
-        <button type="submit">Sign in with Email</button>
-        <button type="button" class="signup-btn" onclick="signUpWithEmail(event)">Create account</button>
-      </form>
-      <small id="auth-status" class="auth-status" role="status"></small>
-      <small>Your data is saved to the cloud. Works on any device.</small>
-    </div>
+    <section class="auth-shell" aria-label="Authentication">
+      <div class="auth-brand">
+        <div class="brand-mark">AU</div>
+        <div>
+          <p class="auth-eyebrow">XAUUSD trade desk</p>
+          <h1>Gold Trading Journal</h1>
+          <p>Track trades, reviews, missed setups, screenshots, and account performance in one secure workspace.</p>
+        </div>
+      </div>
+      <div class="auth-card">
+        <div class="auth-card-head">
+          <div>
+            <p class="auth-eyebrow">Secure access</p>
+            <h2 id="auth-title">Sign in</h2>
+          </div>
+          <span class="auth-badge">Supabase</span>
+        </div>
+        <div class="auth-mode" role="tablist" aria-label="Authentication mode">
+          <button id="auth-mode-signin" class="active" type="button" role="tab" aria-selected="true" onclick="setAuthMode('signin')">Sign in</button>
+          <button id="auth-mode-signup" type="button" role="tab" aria-selected="false" onclick="setAuthMode('signup')">Create account</button>
+        </div>
+        <button id="google-login-btn" class="google-btn" type="button" onclick="signInWithGoogle()">
+          <span>G</span>
+          <b>Continue with Google</b>
+        </button>
+        <small id="google-provider-note" class="provider-note"></small>
+        <div class="auth-divider"><span>or</span></div>
+        <form id="auth-form" class="email-login-form" novalidate onsubmit="submitAuthForm(event)">
+          <label>
+            <span>Email</span>
+            <input id="login-email" type="email" autocomplete="email" placeholder="you@example.com" required>
+          </label>
+          <label>
+            <span>Password</span>
+            <div class="password-field">
+              <input id="login-password" type="password" autocomplete="current-password" minlength="6" placeholder="Minimum 6 characters" required>
+              <button id="password-toggle" type="button" onclick="toggleAuthPassword()" aria-label="Show password"><i data-lucide="eye"></i></button>
+            </div>
+          </label>
+          <button id="auth-submit-btn" type="submit">Sign in with Email</button>
+        </form>
+        <small id="auth-status" class="auth-status" role="status"></small>
+      </div>
+    </section>
   </div>
   <div class="mobile-topbar">
     <button class="icon-btn" onclick="openMobileMenu()" aria-label="Open menu"><i data-lucide="menu"></i></button>

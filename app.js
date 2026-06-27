@@ -4,6 +4,9 @@ let supabaseConfig = null;
 let supabaseReady = false;
 let authLoadToken = 0;
 let authProviders = { email: true, google: true };
+let authMode = "signin";
+let authBusy = false;
+let authPasswordVisible = false;
 
 const SUPABASE_AUTH_OPTIONS = {
   auth: {
@@ -3985,12 +3988,81 @@ function setAuthStatus(message = "", type = "") {
   }
 }
 
-function setGoogleLoginEnabled(enabled, message = "") {
+function setGoogleProviderState(enabled, message = "") {
   const button = document.getElementById("google-login-btn");
-  if (!button) return;
-  button.disabled = !enabled;
-  button.title = enabled ? "" : message;
-  if (!enabled && message) setAuthStatus(message, "error");
+  const note = document.getElementById("google-provider-note");
+  if (button) {
+    button.dataset.unavailable = enabled ? "false" : "true";
+    button.title = enabled ? "" : message;
+  }
+  if (note) note.textContent = enabled ? "" : message;
+}
+
+function setAuthBusy(nextBusy) {
+  authBusy = nextBusy;
+  ["google-login-btn", "auth-submit-btn", "auth-mode-signin", "auth-mode-signup"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = nextBusy;
+  });
+}
+
+function setAuthMode(mode = "signin") {
+  authMode = mode === "signup" ? "signup" : "signin";
+  const isSignup = authMode === "signup";
+  const title = document.getElementById("auth-title");
+  const submit = document.getElementById("auth-submit-btn");
+  const password = document.getElementById("login-password");
+  const signInTab = document.getElementById("auth-mode-signin");
+  const signUpTab = document.getElementById("auth-mode-signup");
+
+  if (title) title.textContent = isSignup ? "Create account" : "Sign in";
+  if (submit) submit.textContent = isSignup ? "Create account" : "Sign in with Email";
+  if (password) password.autocomplete = isSignup ? "new-password" : "current-password";
+  if (signInTab) {
+    signInTab.classList.toggle("active", !isSignup);
+    signInTab.setAttribute("aria-selected", String(!isSignup));
+  }
+  if (signUpTab) {
+    signUpTab.classList.toggle("active", isSignup);
+    signUpTab.setAttribute("aria-selected", String(isSignup));
+  }
+  setAuthStatus("");
+  refreshIcons();
+}
+
+function toggleAuthPassword() {
+  const input = document.getElementById("login-password");
+  const button = document.getElementById("password-toggle");
+  if (!input || !button) return;
+  authPasswordVisible = !authPasswordVisible;
+  input.type = authPasswordVisible ? "text" : "password";
+  button.setAttribute("aria-label", authPasswordVisible ? "Hide password" : "Show password");
+  button.innerHTML = authPasswordVisible ? '<i data-lucide="eye-off"></i>' : '<i data-lucide="eye"></i>';
+  refreshIcons();
+}
+
+function authFormValues() {
+  return {
+    email: document.getElementById("login-email")?.value.trim() || "",
+    password: document.getElementById("login-password")?.value || ""
+  };
+}
+
+function validateAuthForm(email, password) {
+  if (!email) return "Enter your email address.";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return "Enter a valid email address.";
+  if (!password) return "Enter your password.";
+  if (password.length < 6) return "Password must be at least 6 characters.";
+  return "";
+}
+
+function submitAuthForm(event) {
+  event?.preventDefault();
+  if (authMode === "signup") {
+    signUpWithEmail(event);
+  } else {
+    signInWithEmail(event);
+  }
 }
 
 async function syncAuthProviderAvailability() {
@@ -4006,9 +4078,9 @@ async function syncAuthProviderAvailability() {
       google: settings?.external?.google === true
     };
     if (!authProviders.google) {
-      setGoogleLoginEnabled(false, "Google sign-in is not enabled in Supabase.");
+      setGoogleProviderState(false, "Google sign-in needs Google Client ID and Secret in Supabase.");
     } else {
-      setGoogleLoginEnabled(true);
+      setGoogleProviderState(true);
     }
   } catch (error) {
     console.warn("Could not load auth provider settings", error);
@@ -4017,12 +4089,14 @@ async function syncAuthProviderAvailability() {
 
 async function signInWithGoogle() {
   if (!supabaseClient) { toast("Supabase not ready."); return; }
+  if (authBusy) return;
   if (!authProviders.google) {
-    const message = "Google sign-in is not enabled in Supabase.";
+    const message = "Google sign-in needs Google Client ID and Secret in Supabase.";
     setAuthStatus(message, "error");
     toast(message);
     return;
   }
+  setAuthBusy(true);
   setAuthStatus("Opening Google sign-in...");
   const { error } = await supabaseClient.auth.signInWithOAuth({
     provider: "google",
@@ -4036,50 +4110,60 @@ async function signInWithGoogle() {
     const message = supabaseAuthMessage(error);
     setAuthStatus(message, "error");
     toast(message);
+    setAuthBusy(false);
   }
 }
 
 async function signInWithEmail(event) {
   event?.preventDefault();
   if (!supabaseClient) { toast("Supabase not ready."); return; }
+  if (authBusy) return;
   if (!authProviders.email) {
     const message = "Email sign-in is not enabled in Supabase.";
     setAuthStatus(message, "error");
     toast(message);
     return;
   }
-  const email = document.getElementById("login-email")?.value.trim();
-  const password = document.getElementById("login-password")?.value || "";
-  if (!email || !password) { toast("Enter email and password."); return; }
+  const { email, password } = authFormValues();
+  const validationError = validateAuthForm(email, password);
+  if (validationError) {
+    setAuthStatus(validationError, "error");
+    toast(validationError);
+    return;
+  }
+  setAuthBusy(true);
   setAuthStatus("Signing in...");
   const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
   if (error) {
     const message = supabaseAuthMessage(error);
     setAuthStatus(message, "error");
     toast(message);
+  } else {
+    setAuthStatus("Signed in. Loading journal...", "success");
   }
+  setAuthBusy(false);
 }
 
 async function signUpWithEmail(event) {
   event?.preventDefault();
   if (!supabaseClient) { toast("Supabase not ready."); return; }
+  if (authBusy) return;
   if (!authProviders.email) {
     const message = "Email signup is not enabled in Supabase.";
     setAuthStatus(message, "error");
     toast(message);
     return;
   }
-  const email = document.getElementById("login-email")?.value.trim();
-  const password = document.getElementById("login-password")?.value || "";
-  if (!email || !password) { toast("Enter email and password."); return; }
-  if (password.length < 6) {
-    const message = "Password must be at least 6 characters.";
-    setAuthStatus(message, "error");
-    toast(message);
+  const { email, password } = authFormValues();
+  const validationError = validateAuthForm(email, password);
+  if (validationError) {
+    setAuthStatus(validationError, "error");
+    toast(validationError);
     return;
   }
+  setAuthBusy(true);
   setAuthStatus("Creating account...");
-  const { error } = await supabaseClient.auth.signUp({
+  const { data, error } = await supabaseClient.auth.signUp({
     email,
     password,
     options: {
@@ -4090,11 +4174,16 @@ async function signUpWithEmail(event) {
     const message = supabaseAuthMessage(error);
     setAuthStatus(message, "error");
     toast(message);
+  } else if (data?.session) {
+    const message = "Account created. Loading journal...";
+    setAuthStatus(message, "success");
+    toast(message);
   } else {
-    const message = "Signup successful. Check your email to confirm your account.";
+    const message = "Account created. Check your email to confirm it.";
     setAuthStatus(message, "success");
     toast(message);
   }
+  setAuthBusy(false);
 }
 
 async function signOutUser() {
@@ -4564,6 +4653,7 @@ function initSupabaseAuth() {
 
     if (!user) {
       authLoadToken += 1;
+      setAuthBusy(false);
       showLoginScreen();
       updateSyncStatus("offline");
       return;
@@ -4576,6 +4666,7 @@ function initSupabaseAuth() {
     }
 
     hideLoginScreen();
+    setAuthBusy(false);
     loadState();
     state.ownerUid = user.id;
     renderCurrentAccount();
@@ -5173,6 +5264,7 @@ if (typeof document !== "undefined") {
   renderCurrentAccount();
   showLoginScreen();
   updateSyncStatus("syncing");
+  setAuthMode("signin");
   refreshIcons();
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !document.getElementById("cash-modal")?.hidden) closeCashModal();
@@ -5218,5 +5310,3 @@ if (typeof document !== "undefined") {
   }
   initSupabaseAuth();
 }
-
-
