@@ -5,9 +5,16 @@ Desktop.ini
 # Logs
 *.log
 
-# Local Firebase config with project keys
+# Secrets — only store keys in .env; env-config.js is generated at build/start
+.env
+.env.local
+env-config.js
 firebase-config.js
-.firebaserc
+firebase-config_example.js
+supabase-config.js
+
+# Node
+node_modules/
 
 # Editor
 .vscode/
@@ -15,6 +22,3 @@ firebase-config.js
 
 # Python cache
 __pycache__/
-
-# Firebase deploy cache
-.firebase/

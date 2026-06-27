@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Signing in...</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <script src="../../env-config.js"></script>
+  <style>
+    body { background: #080a0d; color: #c9a84c; font-family: sans-serif;
+           display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+  </style>
+</head>
+<body>
+  <p>Signing you in...</p>
+  <script>
+    (async () => {
+      const status = document.querySelector("p");
+      const config = window.SUPABASE_CONFIG;
+      if (!config || !config.url || !config.anonKey) {
+        status.textContent = "Config error. Copy .env.example to .env and run: node scripts/generate-config.js";
+        return;
+      }
+      const client = window.supabase.createClient(config.url, config.anonKey, {
+        auth: { detectSessionInUrl: true, flowType: "pkce" }
+      });
+      const { error } = await client.auth.exchangeCodeForSession(window.location.href);
+      if (error) {
+        status.textContent = "Sign-in failed: " + error.message;
+      } else {
+        window.location.replace("/");
+      }
+    })();
+  </script>
+</body>
+</html>

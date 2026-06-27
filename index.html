@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Gold Trading Journal - XAUUSD</title>
   <meta name="theme-color" content="#10141a">
+  <meta name="referrer" content="no-referrer">
   <meta name="application-name" content="Gold Journal">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Gold Journal">
@@ -15,8 +16,11 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260613-trade-fixes-v1">
-  <script src="firebase-config.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="styles.css?v=20260627-supabase-v24">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <script src="env-config.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
 </head>
 <body>
   <div id="login-screen" hidden>
@@ -28,6 +32,13 @@
         <span>G</span>
         <b>Sign in with Google</b>
       </button>
+      <div class="auth-divider"><span>or</span></div>
+      <form class="email-login-form" onsubmit="signInWithEmail(event)">
+        <input id="login-email" type="email" autocomplete="email" placeholder="Email address" required>
+        <input id="login-password" type="password" autocomplete="current-password" placeholder="Password" required>
+        <button type="submit">Sign in with Email</button>
+        <button type="button" class="signup-btn" onclick="signUpWithEmail(event)">Create account</button>
+      </form>
       <small>Your data is saved to the cloud. Works on any device.</small>
     </div>
   </div>
@@ -86,6 +97,10 @@
           <i data-lucide="notebook-pen"></i>
           <span>Weekly Review</span>
         </button>
+        <button class="nav-btn" data-tab="mentor" onclick="switchTab('mentor', this)">
+          <i data-lucide="brain-circuit"></i>
+          <span>AI Mentor</span>
+        </button>
         <button class="nav-btn" data-tab="manage" onclick="switchTab('manage', this)">
           <i data-lucide="sliders-horizontal"></i>
           <span>Options</span>
@@ -110,6 +125,8 @@
             <p id="log-sub" class="muted">Track every XAUUSD decision in one place.</p>
           </div>
           <div class="head-actions">
+            <button class="soft-btn deposit-btn" onclick="openCashModal('deposit')"><i data-lucide="arrow-down-to-line"></i><span>Deposit</span></button>
+            <button class="soft-btn withdraw-btn" onclick="openCashModal('withdraw')"><i data-lucide="arrow-up-from-line"></i><span>Withdraw</span></button>
             <button class="soft-btn" onclick="duplicateLastTrade()"><i data-lucide="copy-plus"></i><span>Duplicate Last</span></button>
             <button class="primary-btn" onclick="addTrade()"><i data-lucide="plus"></i><span>New Trade</span></button>
           </div>
@@ -130,6 +147,8 @@
               <option value="LOSS">Loss</option>
               <option value="BE">Break even</option>
               <option value="OPEN">Open</option>
+              <option value="DEPOSIT">Deposit</option>
+              <option value="WITHDRAW">Withdraw</option>
             </select>
           </label>
           <label class="field">
@@ -194,7 +213,7 @@
                 <th>RR</th>
                 <th>Result</th>
                 <th>P&amp;L</th>
-                <th>Cum</th>
+                <th>Balance</th>
                 <th class="note-col">Notes</th>
                 <th>Actions</th>
               </tr>
@@ -323,6 +342,41 @@
         </div>
       </section>
 
+      <section id="tab-mentor" class="tab-panel">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Accountability coach</p>
+            <h1>AI Mentor</h1>
+            <p class="muted">Get a direct review of your journaled and missed trades.</p>
+          </div>
+          <button class="primary-btn" onclick="runAiMentorReview()"><i data-lucide="sparkles"></i><span>Analyze Trades</span></button>
+        </header>
+        <div class="mentor-grid">
+          <section class="panel panel-pad mentor-settings">
+            <div class="panel-title"><span>OpenRouter Setup</span><span class="section-pill neutral" id="mentor-key-status">not saved</span></div>
+            <label class="modal-field">
+              <span>API Key</span>
+              <input id="mentor-api-key" type="password" autocomplete="off" placeholder="Paste OpenRouter key for this browser">
+            </label>
+            <label class="modal-field">
+              <span>Model Router</span>
+              <input id="mentor-model" type="text" value="openrouter/auto" readonly>
+            </label>
+            <div class="mentor-actions">
+              <button class="soft-btn" type="button" onclick="saveMentorSettings()"><i data-lucide="save"></i><span>Save Locally</span></button>
+              <button class="danger-soft-btn" type="button" onclick="clearMentorSettings()"><i data-lucide="trash-2"></i><span>Clear Key</span></button>
+            </div>
+            <p class="mentor-note">The key stays in this browser only. OpenRouter auto-selects the model for each review.</p>
+          </section>
+          <section class="panel panel-pad mentor-output-panel">
+            <div class="panel-title"><span>Mentor Review</span><span class="section-pill" id="mentor-scope">current account</span></div>
+            <div id="mentor-output" class="mentor-output">
+              <div class="empty-state compact-empty"><div><strong>No review yet</strong><span>Save your OpenRouter key, then analyze your journal.</span></div></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
       <section id="tab-manage" class="tab-panel">
         <header class="page-head">
           <div>
@@ -335,6 +389,25 @@
             <button class="danger-soft-btn" onclick="resetOptions()"><i data-lucide="rotate-ccw"></i><span>Reset Options</span></button>
           </div>
         </header>
+        <section class="profile-card" id="profile-card">
+          <div>
+            <p class="eyebrow">Profile</p>
+            <h2 id="profile-name">Signed in</h2>
+            <p class="muted" id="profile-email">-</p>
+            <div class="tag-list compact-tags" id="profile-providers"></div>
+          </div>
+          <div class="profile-password-panel">
+            <label>
+              <span>New password</span>
+              <input id="profile-new-password" type="password" autocomplete="new-password" minlength="6" placeholder="Minimum 6 characters">
+            </label>
+            <label>
+              <span>Confirm password</span>
+              <input id="profile-confirm-password" type="password" autocomplete="new-password" minlength="6" placeholder="Repeat password">
+            </label>
+            <button class="primary-btn" type="button" onclick="setAccountPassword()"><i data-lucide="key-round"></i><span>Set Email Password</span></button>
+          </div>
+        </section>
         <div class="notice">Custom options appear instantly in the trade table and all analysis reports.</div>
         <div class="manage-grid" id="manage-grid"></div>
       </section>
@@ -413,6 +486,38 @@
       <div class="modal-actions">
         <button class="soft-btn" type="button" onclick="closeSkippedModal()">Cancel</button>
         <button class="primary-btn" type="button" onclick="saveSkippedTradeFromModal()">Save Skipped Trade</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="cash-modal" hidden>
+    <div class="trade-modal cash-modal" role="dialog" aria-modal="true" aria-labelledby="cash-modal-title">
+      <button class="modal-close" type="button" onclick="closeCashModal()" aria-label="Close">
+        <i data-lucide="x"></i>
+      </button>
+      <h2 id="cash-modal-title">DEPOSIT</h2>
+      <div class="modal-grid">
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Cash Entry</span></div>
+          <div class="modal-section-grid">
+            <label class="modal-field">
+              <span>Date</span>
+              <input id="cash-date" type="date">
+            </label>
+            <label class="modal-field">
+              <span>Amount ($)</span>
+              <input id="cash-amount" type="number" min="0" step="0.01" placeholder="1000">
+            </label>
+          </div>
+          <label class="modal-field full-width">
+            <span>Note</span>
+            <textarea id="cash-note" rows="3" placeholder="Initial balance, broker transfer, payout reason..."></textarea>
+          </label>
+        </section>
+      </div>
+      <div class="modal-actions">
+        <button class="soft-btn" type="button" onclick="closeCashModal()">Cancel</button>
+        <button class="primary-btn" type="button" id="cash-save-btn" onclick="saveCashFromModal()">Save Deposit</button>
       </div>
     </div>
   </div>
@@ -548,7 +653,7 @@
       </div>
       <div class="modal-actions">
         <button class="soft-btn" type="button" onclick="closeTradeModal()">Cancel</button>
-        <button class="primary-btn" type="button" onclick="saveTradeFromModal()">Save Trade</button>
+        <button id="modal-save-trade-btn" class="primary-btn" type="button" onclick="saveTradeFromModal()">Save Trade</button>
       </div>
     </div>
   </div>
@@ -569,37 +674,11 @@
     <button class="bottom-nav-btn" data-tab="analysis" onclick="switchTab('analysis', this)"><i data-lucide="bar-chart-3"></i><span>Analysis</span></button>
     <button class="bottom-nav-btn" data-tab="pnl" onclick="switchTab('pnl', this)"><i data-lucide="calendar-days"></i><span>PnL</span></button>
     <button class="bottom-nav-btn" data-tab="weekly" onclick="switchTab('weekly', this)"><i data-lucide="notebook-pen"></i><span>Weekly</span></button>
+    <button class="bottom-nav-btn" data-tab="mentor" onclick="switchTab('mentor', this)"><i data-lucide="brain-circuit"></i><span>Mentor</span></button>
     <button class="bottom-nav-btn" data-tab="manage" onclick="switchTab('manage', this)"><i data-lucide="sliders-horizontal"></i><span>Options</span></button>
   </nav>
   <div class="toast" id="toast"></div>
   <div id="print-report" class="print-report"></div>
-  <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-    import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, doc, setDoc, getDoc, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
-    import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
-
-    window.GoogleAuthProvider = GoogleAuthProvider;
-    window.signInWithPopup = signInWithPopup;
-    window.firebaseSignOut = signOut;
-    window.onAuthStateChanged = onAuthStateChanged;
-    window.firestoreDoc = doc;
-    window.firestoreSetDoc = setDoc;
-    window.firestoreGetDoc = getDoc;
-    window.firestoreCollection = collection;
-    window.firestoreGetDocs = getDocs;
-    window.firestoreDeleteDoc = deleteDoc;
-    window.rtdbRef = ref;
-    window.rtdbOnValue = onValue;
-    window.initializeFirebaseServices = (config) => {
-      window.firebaseApp = initializeApp(config);
-      window.firebaseAuth = getAuth(window.firebaseApp);
-      window.firebaseDb = getFirestore(window.firebaseApp);
-      window.firebaseRtdb = getDatabase(window.firebaseApp);
-      window.dispatchEvent(new CustomEvent("firebase-ready"));
-    };
-    window.dispatchEvent(new CustomEvent("firebase-sdk-ready"));
-  </script>
-  <script src="app.js?v=20260613-trade-fixes-v1"></script>
+  <script src="app.js?v=20260627-supabase-v24"></script>
 </body>
 </html>

@@ -1,0 +1,9 @@
+{
+  "name": "gold-trading-journal",
+  "private": true,
+  "scripts": {
+    "config": "node scripts/generate-config.js",
+    "prestart": "node scripts/generate-config.js",
+    "start": "python -m http.server 8000"
+  }
+}

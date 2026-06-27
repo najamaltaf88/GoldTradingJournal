@@ -1,65 +1,91 @@
-# Gold Strategytestor
+# Gold Trading Journal (XAUUSD)
 
-Gold Strategytestor is a dark-theme XAUUSD trading journal web app for logging trades, reviewing performance, tracking PnL, and exporting reports.
+Dark-theme XAUUSD trading journal for logging trades, reviewing performance, tracking PnL, and exporting reports. Data syncs to **Supabase** (Auth + PostgreSQL + Storage). Deploy on **Netlify**.
 
 ## Features
 
-- Trade log with modal-based trade entry
+- Trade log with modal-based trade entry and screenshot uploads
 - Dynamic dropdown options with custom values
 - Analysis dashboard with performance breakdowns
 - Monthly PnL calendar in $
 - Weekly review notes
+- Skipped / missed trade tracking
+- AI mentor (OpenRouter)
 - CSV, Excel, and PDF export
 - Installable PWA support
 
-## Files
+## Secrets (.env only)
 
-- `index.html` - app structure
-- `styles.css` - app styling
-- `app.js` - app logic and localStorage state
-- `manifest.json` / `sw.js` - installable app support
+All Supabase credentials live in **`.env`** (never commit this file). The app does not read `.env` in the browser directly — a small script generates `env-config.js` at build/start time.
+
+1. Copy `.env.example` to `.env`
+2. Set your values:
+
+```env
+SUPABASE_URL=https://YOUR-PROJECT-ID.supabase.co
+SUPABASE_ANON_KEY=your-anon-public-key-here
+```
+
+3. Generate the runtime config:
+
+```powershell
+node scripts/generate-config.js
+```
+
+Or use `npm run config`. This writes `env-config.js` (gitignored).
+
+On **Netlify**, set the same variables under Site settings → Environment variables. The build runs `node scripts/generate-config.js` automatically (see `netlify.toml`).
+
+The anon key is safe in client-side output. Row Level Security protects data. Never put the `service_role` key in `.env` for this app.
 
 ## Run locally
 
-Open `index.html` directly, or serve the folder with a local server for PWA features:
-
 ```powershell
-python -m http.server 8000
+copy .env.example .env
+# Edit .env with your Supabase URL and anon key
+npm start
 ```
 
-Then visit `http://127.0.0.1:8000`.
+`npm start` generates `env-config.js` then serves on `http://127.0.0.1:8000`.
 
-## Firebase config
+For Google sign-in locally, add `http://127.0.0.1:8000/auth/callback` to Supabase Auth redirect URLs.
 
-The public repo does not include live Firebase keys. To enable Google sign-in and cloud sync:
+## Supabase setup
 
-1. Copy `firebase-config.example.js` to `firebase-config.js`.
-2. Fill `firebase-config.js` with your Firebase web app config.
-3. Enable Google Authentication, Firestore, and Realtime Database in Firebase.
+1. Create a project at [supabase.com](https://supabase.com).
+2. Run `supabase/schema.sql` in **SQL Editor**.
+3. Enable **Google** under Authentication → Providers.
+4. Add redirect URL: `https://YOUR-SITE.netlify.app/auth/callback` (and local URL for dev).
+5. Create a public **screenshots** storage bucket (5MB limit).
+6. Copy **Project URL** and **anon public** key into `.env`.
 
-`firebase-config.js` is ignored by git so project-specific values are not pushed.
+## Files
 
-## Cloudinary screenshots
+- `index.html` — app structure
+- `app.js` — logic and Supabase sync
+- `scripts/generate-config.js` — reads `.env` → writes `env-config.js`
+- `auth/callback/index.html` — Google OAuth redirect
+- `supabase/schema.sql` — database schema
+- `netlify.toml` — Netlify build (runs config generator)
+- `manifest.json` / `sw.js` — PWA
 
-Trade screenshots are uploaded directly to Cloudinary with an unsigned upload preset. Firestore stores only the returned `secure_url`.
+## Deploy to Netlify
 
-1. Create a free Cloudinary account.
-2. Create an unsigned upload preset named `gold_journal_trades`.
-3. In `app.js`, replace `CLOUDINARY_CLOUD_NAME` with your Cloudinary cloud name.
-4. Keep the preset unsigned and restricted to images.
+1. Connect the repo.
+2. Build command: `node scripts/generate-config.js` (already in `netlify.toml`).
+3. Publish directory: `.`
+4. Set `SUPABASE_URL` and `SUPABASE_ANON_KEY` in Netlify environment variables.
 
-If Cloudinary is not configured or an upload fails, trades still save normally without a screenshot.
+## Screenshots
 
-## Storage
+Uploads go to Supabase Storage (`screenshots` bucket). Sign-in required.
 
-The app stores journal data in browser `localStorage` and can sync it to Firebase when configured, including:
+## Storage model
 
-- Trades
-- Trade screenshot URLs
-- Dynamic options
-- Weekly reviews
+- **Supabase** is the source of truth after login.
+- **localStorage** is an offline write buffer only.
 
 ## Export
 
-- Excel export includes trade log, analysis, and weekly reviews
-- PDF export includes formatted trade log, analysis, and trade screenshots when present
+- Excel: trade log, analysis, weekly reviews
+- PDF: trade log, analysis, screenshots when present

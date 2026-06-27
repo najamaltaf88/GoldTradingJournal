@@ -1,27 +1,37 @@
-const FIREBASE_CONFIG = window.FIREBASE_CONFIG || {
-  apiKey: "",
-  authDomain: "",
-  projectId: "",
-  storageBucket: "",
-  messagingSenderId: "",
-  appId: "",
-  databaseURL: ""
+// --- Supabase Client ---
+let supabaseClient = null;
+let supabaseReady = false;
+let authLoadToken = 0;
+
+const SUPABASE_AUTH_OPTIONS = {
+  auth: {
+    detectSessionInUrl: false,
+    persistSession: true,
+    autoRefreshToken: true,
+    flowType: "pkce"
+  }
 };
 
-const CLOUDINARY_CLOUD_NAME = "goldjournal";
-const CLOUDINARY_UPLOAD_PRESET = "gold_journal_trades";
-const CLOUDINARY_UPLOAD_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
-const MAX_SCREENSHOT_SIZE = 5 * 1024 * 1024;
-
-function hasFirebaseConfig() {
-  return Boolean(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId && FIREBASE_CONFIG.appId);
+function initSupabase() {
+  const config = window.SUPABASE_CONFIG;
+  if (!config || !config.url || !config.anonKey) {
+    console.warn("Supabase config missing. Copy .env.example to .env, then run: node scripts/generate-config.js");
+    return false;
+  }
+  supabaseClient = window.supabase.createClient(config.url, config.anonKey, SUPABASE_AUTH_OPTIONS);
+  return true;
 }
+
+const MAX_SCREENSHOT_SIZE = 5 * 1024 * 1024;
 
 const KEY = "xau_journal_v6";
 const LEGACY_KEY = "xau_journal_v5";
 const SKIPPED_KEY = "skippedTrades";
 const ACCOUNTS_KEY = "xau_journal_accounts_v1";
+const MENTOR_KEY = "xau_journal_openrouter_key";
+const MENTOR_MODEL_KEY = "xau_journal_openrouter_model";
 const DEFAULT_ACCOUNT_ID = "main";
+const DEFAULT_MENTOR_MODEL = "openrouter/auto";
 
 const FIXED = {
   sessions: ["Pre-Asian (3am-5am)", "Asian (5am-8am)", "Post-Asian (8am-10am)", "Pre-London (10am-12pm)", "London (12pm-2pm)", "Post-London (2pm-4pm)", "Pre-NY (4pm-5pm)", "New York (5pm-8pm)", "Post-NY (8pm-3am)"],
@@ -78,18 +88,22 @@ let activeAccountId = DEFAULT_ACCOUNT_ID;
 let pnlView = {
   year: new Date().getFullYear(),
   month: new Date().getMonth(),
-  selectedDate: todayISO()
+  selectedDate: null
 };
 
 let modalEditingIndex = null;
+let cashEditingIndex = null;
+let cashModalType = "deposit";
 let skippedEditingIndex = null;
 let viewTradeIndex = null;
 let analysisTimer = null;
 let currentUser = null;
-let firebaseReady = false;
-let firestoreLoadComplete = false;
-let cloudinaryConfigWarned = false;
 let screenshotUploadToken = 0;
+
+let mentorRequestInProgress = false;
+let lastMentorRequestTime = 0;
+const MENTOR_COOLDOWN_MS = 30000; // 30 seconds between requests
+let accountSwitchInProgress = false;
 
 const screenshotState = {
   url: "",
@@ -112,6 +126,7 @@ function emptyJournalState(ownerUid = "") {
   return {
     ownerUid,
     trades: [],
+    cashTransactions: [],
     skippedTrades: [],
     options: clone(FIXED),
     settings: { defaultRisk: "" },
@@ -129,7 +144,11 @@ function defaultAccount() {
 }
 
 function generateId(prefix = "id") {
-  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const timestamp = Date.now().toString(36);
+  const random = typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+    : Math.random().toString(36).slice(2, 14) + Math.random().toString(36).slice(2, 6);
+  return `${prefix}_${timestamp}_${random}`;
 }
 
 function normalizeAccount(account = {}) {
@@ -144,8 +163,9 @@ function normalizeAccount(account = {}) {
 
 function normalizeJournalState(data = {}) {
   return {
-    ownerUid: currentUser?.uid || data.ownerUid || "",
+    ownerUid: currentUser?.id || data.ownerUid || "",
     trades: Array.isArray(data.trades) ? data.trades.map(normalizeTrade) : [],
+    cashTransactions: Array.isArray(data.cashTransactions) ? data.cashTransactions.map(normalizeCashTransaction) : [],
     skippedTrades: Array.isArray(data.skippedTrades) ? data.skippedTrades.map(normalizeSkippedTrade) : [],
     options: normalizeOptions(data.options || FIXED),
     settings: Object.assign({ defaultRisk: "" }, data.settings || {}),
@@ -165,7 +185,7 @@ function ensureAccountState() {
 }
 
 function journalRowCount(data = {}) {
-  return (data.trades?.length || 0) + (data.skippedTrades?.length || 0) + (data.weeklyReviews?.length || 0);
+  return (data.trades?.length || 0) + (data.cashTransactions?.length || 0) + (data.skippedTrades?.length || 0) + (data.weeklyReviews?.length || 0);
 }
 
 function mergeRows(localRows = [], cloudRows = []) {
@@ -183,6 +203,7 @@ function mergeJournalStates(base = {}, incoming = {}) {
   return normalizeJournalState({
     ownerUid: incomingState.ownerUid || baseState.ownerUid,
     trades: mergeRows(baseState.trades, incomingState.trades),
+    cashTransactions: mergeRows(baseState.cashTransactions, incomingState.cashTransactions),
     skippedTrades: mergeRows(baseState.skippedTrades, incomingState.skippedTrades),
     weeklyReviews: mergeRows(baseState.weeklyReviews, incomingState.weeklyReviews),
     options: mergeOptions(baseState.options, incomingState.options),
@@ -229,8 +250,8 @@ function loadState() {
       persistLocalState();
       return;
     }
-    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.uid) {
-      state = emptyJournalState(currentUser.uid);
+    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.id) {
+      state = emptyJournalState(currentUser.id);
       accountData[activeAccountId] = clone(state);
       persistLocalState();
       return;
@@ -252,7 +273,7 @@ function loadAccountStore() {
   try {
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.accounts) || !parsed.data) return null;
-    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.uid) return null;
+    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.id) return null;
     const normalizedAccounts = parsed.accounts.map(normalizeAccount).filter((account) => account.id);
     const nextAccounts = normalizedAccounts.length ? normalizedAccounts : [defaultAccount()];
     const nextData = {};
@@ -280,13 +301,13 @@ function loadSkippedTradesFromLocal() {
 }
 
 function persistLocalState() {
-  if (currentUser) state.ownerUid = currentUser.uid;
+  if (currentUser) state.ownerUid = currentUser.id;
   state = normalizeJournalState(state);
   if (!accounts.length) accounts = [defaultAccount()];
   if (!accounts.some((account) => account.id === activeAccountId)) activeAccountId = accounts[0].id;
   accountData[activeAccountId] = clone(state);
   const store = {
-    ownerUid: currentUser?.uid || state.ownerUid || "",
+    ownerUid: currentUser?.id || state.ownerUid || "",
     activeAccountId,
     accounts,
     data: accountData
@@ -311,6 +332,19 @@ function normalizeUnitLabel(value) {
   return String(value || "").replace(/\bpips\b/gi, "$");
 }
 
+function normalizeCashTransaction(entry = {}) {
+  const type = String(entry.type || "").toLowerCase() === "withdraw" ? "withdraw" : "deposit";
+  const amount = round1(Math.abs(parseFloat(entry.amount) || 0));
+  return {
+    id: entry.id || generateId("cash"),
+    date: entry.date || "",
+    type,
+    amount: amount || "",
+    note: entry.note || entry.reason || "",
+    createdAt: entry.createdAt || new Date().toISOString()
+  };
+}
+
 function normalizeTrade(trade) {
   return {
     id: trade.id || generateId("trade"),
@@ -332,7 +366,7 @@ function normalizeTrade(trade) {
     reward: trade.reward || "",
     result: trade.result || "",
     reason: trade.reason || trade.notes || "",
-    screenshotUrl: trade.screenshotUrl || "",
+    screenshotUrl: safeHttpUrl(trade.screenshotUrl),
     pnl: trade.pnl ?? "",
     cum: trade.cum ?? ""
   };
@@ -382,20 +416,25 @@ function normalizeWeeklyReview(review) {
 }
 
 async function save() {
+  // Guard: never save if no active account
+  if (!activeAccountId || !accounts.some((a) => a.id === activeAccountId)) {
+    console.warn("save() aborted: no valid active account.");
+    return;
+  }
   try {
     persistLocalState();
     renderAccountSelector();
   } catch (error) {
-    console.warn("Could not save journal state", error);
+    console.warn("Could not save local state", error);
     updateSyncStatus("offline");
   }
-
-  if (currentUser && firestoreLoadComplete) {
+  if (currentUser && supabaseReady) {
     try {
-      await saveToFirestore();
+      await saveToSupabase();
     } catch (error) {
-      console.warn("Could not sync to Firestore", error);
+      console.warn("Could not sync to Supabase", error);
       updateSyncStatus("offline");
+      toast("Sync failed. Data saved locally.");
     }
   }
 }
@@ -492,6 +531,74 @@ function recalcCum() {
   });
 }
 
+function accountBalanceSummary() {
+  recalcCum();
+  const deposits = round1((state.cashTransactions || [])
+    .filter((entry) => entry.type === "deposit")
+    .reduce((sum, entry) => sum + (parseFloat(entry.amount) || 0), 0));
+  const withdrawals = round1((state.cashTransactions || [])
+    .filter((entry) => entry.type === "withdraw")
+    .reduce((sum, entry) => sum + (parseFloat(entry.amount) || 0), 0));
+  const tradePnl = performance().totalPnl;
+  const currentBalance = round1(deposits - withdrawals + tradePnl);
+  return { deposits, withdrawals, tradePnl, currentBalance, netFunding: round1(deposits - withdrawals) };
+}
+
+function ledgerEvents() {
+  const events = [];
+  state.trades.forEach((trade, index) => {
+    events.push({ kind: "trade", trade, index, date: trade.date || "", createdAt: trade.date || "" });
+  });
+  (state.cashTransactions || []).forEach((cash, index) => {
+    events.push({ kind: "cash", cash, index, date: cash.date || "", createdAt: cash.createdAt || cash.date || "" });
+  });
+  events.sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.createdAt).localeCompare(String(a.createdAt)));
+  const chronological = events.slice().reverse();
+  let balance = 0;
+  const balanceAfter = new WeakMap();
+  chronological.forEach((event) => {
+    if (event.kind === "cash") {
+      const amount = parseFloat(event.cash.amount) || 0;
+      balance = round1(balance + (event.cash.type === "deposit" ? amount : -amount));
+    } else {
+      const pnl = calcPnl(event.trade.risk, event.trade.reward, event.trade.result);
+      if (pnl !== "") balance = round1(balance + parseFloat(pnl));
+    }
+    balanceAfter.set(event, balance);
+  });
+  events.forEach((event) => {
+    event.balanceAfter = balanceAfter.get(event);
+  });
+  return events;
+}
+
+function filteredLedgerEvents() {
+  const search = document.getElementById("search-input")?.value.trim().toLowerCase() || "";
+  const result = document.getElementById("result-filter")?.value || "";
+  return ledgerEvents().filter((event) => {
+    if (event.kind === "cash") {
+      if (result && result !== "OPEN" && result !== "DEPOSIT" && result !== "WITHDRAW") return false;
+      if (result === "DEPOSIT" && event.cash.type !== "deposit") return false;
+      if (result === "WITHDRAW" && event.cash.type !== "withdraw") return false;
+      if (result === "WIN" || result === "LOSS" || result === "BE") return false;
+      if (!search) return true;
+      const haystack = [event.cash.date, event.cash.type, event.cash.amount, event.cash.note].join(" ").toLowerCase();
+      return haystack.includes(search);
+    }
+    const trade = event.trade;
+    if (result === "OPEN" && trade.result) return false;
+    if (result === "DEPOSIT" || result === "WITHDRAW") return false;
+    if (result && result !== "OPEN" && trade.result !== result) return false;
+    const session = document.getElementById("session-filter")?.value || "";
+    const setup = document.getElementById("setup-filter")?.value || "";
+    if (session && trade.session !== session) return false;
+    if (setup && trade.setup !== setup) return false;
+    if (!search) return true;
+    const haystack = [trade.date, trade.session, trade.entry, trade.level, trade.tf, trade.setup, trade.mistake, trade.hold, trade.marketCondition, trade.biasAlignment, trade.confirmationType, trade.slTpPlacement, trade.tpPlacement, trade.patienceScore, trade.result, trade.reason].join(" ").toLowerCase();
+    return haystack.includes(search);
+  });
+}
+
 function performance() {
   recalcCum();
   const trades = state.trades;
@@ -543,6 +650,18 @@ function escapeHtml(value) {
     .replace(/'/g, "&#039;");
 }
 
+function safeHttpUrl(value, allowBlob = false) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw, window.location.origin);
+    const allowed = allowBlob ? ["http:", "https:", "blob:"] : ["http:", "https:"];
+    return allowed.includes(parsed.protocol) ? parsed.href : "";
+  } catch (error) {
+    return "";
+  }
+}
+
 function refreshIcons() {
   if (typeof window !== "undefined" && window.lucide) {
     window.lucide.createIcons();
@@ -562,31 +681,34 @@ function renderSummary() {
   const p = performance();
   const open = state.trades.length - p.closed.length;
   const bestLevel = bestLevelByPnl();
+  const balance = accountBalanceSummary();
   const strip = document.getElementById("summary-strip");
   if (strip) {
     strip.innerHTML = [
+      metric("Account Balance", `${signed(balance.currentBalance)} $`, `${signed(balance.netFunding)} $ funded + ${signed(balance.tradePnl)} $ trades`, moneyClass(balance.currentBalance)),
+      metric("Deposits", `${signed(balance.deposits)} $`, "total funded in", "pos"),
+      metric("Withdrawals", `${signed(balance.withdrawals)} $`, "total taken out", balance.withdrawals ? "neg" : "neutral"),
       metric("Closed Trades", p.closed.length, `${open} open`),
       metric("Win Rate", `${p.winRate.toFixed(1)}%`, `${p.wins.length}W / ${p.losses.length}L`, p.winRate >= 50 ? "pos" : "neg"),
-      metric("Total P&L", `${signed(p.totalPnl)} $`, "auto calculated", moneyClass(p.totalPnl)),
-      metric("Profit Factor", p.profitFactor.toFixed(2), p.profitFactor >= 1 ? "Healthy" : "Needs work", p.profitFactor >= 1 ? "pos" : "neg"),
-      metric("Expectancy", `${signed(p.expectancy)} $`, "per closed trade", moneyClass(p.expectancy))
+      metric("Trade P&L", `${signed(p.totalPnl)} $`, "closed trades only", moneyClass(p.totalPnl))
     ].join("");
   }
 
   const sidebar = document.getElementById("sidebar-stats");
   if (sidebar) {
     sidebar.innerHTML = `
+      <div class="stat-row"><span class="stat-label">Balance</span><span class="stat-val ${moneyClass(balance.currentBalance)}">${signed(balance.currentBalance)}</span></div>
       <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-val gold">${p.closed.length}</span></div>
       <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-val ${p.winRate >= 50 ? "pos" : "neg"}">${p.winRate.toFixed(0)}%</span></div>
-      <div class="stat-row"><span class="stat-label">Total P&L</span><span class="stat-val ${moneyClass(p.totalPnl)}">${signed(p.totalPnl)}</span></div>
-      <div class="stat-row"><span class="stat-label">Drawdown</span><span class="stat-val ${p.maxDrawdown < 0 ? "neg" : "neutral"}">${signed(p.maxDrawdown)}</span></div>
+      <div class="stat-row"><span class="stat-label">Trade P&L</span><span class="stat-val ${moneyClass(p.totalPnl)}">${signed(p.totalPnl)}</span></div>
       <div class="stat-row"><span class="stat-label">Best Level</span><span class="stat-val gold">${escapeHtml(bestLevel || "-")}</span></div>
     `;
   }
 
   const sub = document.getElementById("log-sub");
   if (sub) {
-    sub.textContent = `${state.trades.length} trades saved, ${p.closed.length} closed, ${p.winRate.toFixed(0)}% win rate.`;
+    const cashCount = (state.cashTransactions || []).length;
+    sub.textContent = `${state.trades.length} trades, ${cashCount} cash entries, ${p.closed.length} closed, ${p.winRate.toFixed(0)}% win rate Â· Balance ${signed(balance.currentBalance)} $.`;
   }
 }
 
@@ -622,11 +744,11 @@ async function addAccount() {
   });
   accounts.push(account);
   activeAccountId = account.id;
-  state = emptyJournalState();
+  state = emptyJournalState(currentUser?.id || "");
   accountData[activeAccountId] = clone(state);
   try {
     persistLocalState();
-    if (currentUser && firestoreLoadComplete) await saveToFirestore();
+    if (currentUser && supabaseReady) await save();
   } catch (error) {
     console.warn("Could not save account", error);
     updateSyncStatus("offline");
@@ -643,7 +765,7 @@ async function renameAccount() {
   account.updatedAt = new Date().toISOString();
   try {
     persistLocalState();
-    if (currentUser && firestoreLoadComplete) await saveToFirestore();
+    if (currentUser && supabaseReady) await save();
     renderCurrentAccount();
     toast("Account renamed.");
   } catch (error) {
@@ -655,24 +777,32 @@ async function renameAccount() {
 
 async function switchAccount(accountId) {
   if (!accountId || accountId === activeAccountId) return;
+  if (accountSwitchInProgress) {
+    toast("Account switch in progress. Please wait.");
+    // Reset selector to current account
+    const select = document.getElementById("account-select");
+    if (select) select.value = activeAccountId;
+    return;
+  }
+  accountSwitchInProgress = true;
   const nextAccount = accounts.find((account) => account.id === accountId);
-  if (!nextAccount) return;
+  if (!nextAccount) {
+    accountSwitchInProgress = false;
+    return;
+  }
   try {
     await save();
     activeAccountId = accountId;
     state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState());
     persistLocalState();
     renderCurrentAccount();
-    if (currentUser && firestoreLoadComplete) {
-      await loadAccountFromFirestore(currentUser.uid, activeAccountId);
-      persistLocalState();
-      renderCurrentAccount();
-    }
     toast(`${nextAccount.name} loaded.`);
   } catch (error) {
     console.warn("Could not switch account", error);
     updateSyncStatus("offline");
     toast("Account switch failed.");
+  } finally {
+    accountSwitchInProgress = false;
   }
 }
 
@@ -769,19 +899,20 @@ function renderTrades() {
   if (!tbody) return;
   tbody.innerHTML = "";
 
-  const rows = filteredTrades();
-  if (!state.trades.length) {
+  const hasEntries = state.trades.length || (state.cashTransactions || []).length;
+  if (!hasEntries) {
     tbody.innerHTML = `
       <tr class="empty-row">
         <td colspan="23">
           <div class="empty-state onboarding-state">
             <div class="onboarding-card">
               <i data-lucide="clipboard-plus"></i>
-              <strong>Start your first trade</strong>
-              <span>Click New Trade, fill the form, and your analysis updates automatically. No spreadsheet needed.</span>
+              <strong>Start your journal</strong>
+              <span>Log a deposit to set your starting balance, then add trades. Withdrawals track real account payouts.</span>
               <div class="onboarding-actions">
+                <button class="soft-btn deposit-btn" onclick="openCashModal('deposit')"><i data-lucide="arrow-down-to-line"></i><span>Deposit</span></button>
                 <button class="primary-btn" onclick="addTrade()"><i data-lucide="plus"></i><span>New Trade</span></button>
-                <button class="soft-btn" onclick="seedDemoTrades()"><i data-lucide="sparkles"></i><span>Or load demo data to explore the app</span></button>
+                <button class="soft-btn" onclick="seedDemoTrades()"><i data-lucide="sparkles"></i><span>Load demo data</span></button>
               </div>
             </div>
           </div>
@@ -792,18 +923,24 @@ function renderTrades() {
     return;
   }
 
+  const rows = filteredLedgerEvents();
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="23"><div class="empty-state"><div><strong>No matching trades</strong><span>Clear filters to see the full journal.</span></div></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="23"><div class="empty-state"><div><strong>No matching entries</strong><span>Clear filters to see the full journal.</span></div></div></td></tr>`;
     refreshIcons();
     return;
   }
 
-  rows.forEach(({ trade, index }) => {
+  rows.forEach((event, displayIndex) => {
+    if (event.kind === "cash") {
+      tbody.appendChild(renderCashRow(event, displayIndex));
+      return;
+    }
+    const { trade, index } = event;
     const tr = document.createElement("tr");
     tr.className = trade.result === "WIN" ? "row-win" : trade.result === "LOSS" ? "row-loss" : trade.result === "BE" ? "row-be" : "";
     tr.classList.add("clickable-row");
-    tr.addEventListener("click", (event) => {
-      if (event.target.closest("button, input, select, textarea, a")) return;
+    tr.addEventListener("click", (clickEvent) => {
+      if (clickEvent.target.closest("button, input, select, textarea, a")) return;
       openViewTradeModal(index);
     });
     tr.appendChild(textCell("#", index + 1, "row-num"));
@@ -826,13 +963,127 @@ function renderTrades() {
     tr.appendChild(htmlCell("RR", `<span class="rr">${escapeHtml(calcRR(trade.risk, trade.reward) || "-")}</span>`));
     tr.appendChild(htmlCell("Result", valuePill(trade.result, "result")));
     tr.appendChild(htmlCell("P&L", pnlHtml(trade.pnl)));
-    tr.appendChild(htmlCell("Cum", pnlHtml(trade.cum)));
+    tr.appendChild(htmlCell("Balance", pnlHtml(event.balanceAfter)));
     tr.appendChild(displayCell("Notes", trade.reason || "-", "notes-preview"));
     tr.appendChild(actionCell("Actions", index));
     tbody.appendChild(tr);
   });
 
   refreshIcons();
+}
+
+function renderCashRow(event, displayIndex) {
+  const { cash, index } = event;
+  const tr = document.createElement("tr");
+  tr.className = cash.type === "deposit" ? "row-deposit" : "row-withdraw";
+  tr.classList.add("cash-row");
+  const amount = parseFloat(cash.amount) || 0;
+  tr.appendChild(textCell("#", `C${index + 1}`, "row-num cash-num"));
+  tr.appendChild(displayCell("Date", formatDateDisplay(cash.date) || "-", "date-display"));
+  tr.appendChild(htmlCell("Session", valuePill(cash.type === "deposit" ? "DEPOSIT" : "WITHDRAW", cash.type === "deposit" ? "result" : "result")));
+  tr.appendChild(htmlCell("Side", `<span class="table-pill pill-cash pill-${cash.type}">${cash.type === "deposit" ? "Deposit" : "Withdraw"}</span>`));
+  tr.appendChild(displayCell("Level", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("TF", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("Setup", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("Mistake", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("Hold", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("Market", "â€”", "muted-cell optional-col"));
+  tr.appendChild(displayCell("Bias", "â€”", "muted-cell optional-col"));
+  tr.appendChild(displayCell("Confirm", "â€”", "muted-cell optional-col"));
+  tr.appendChild(displayCell("SL", "â€”", "muted-cell optional-col"));
+  tr.appendChild(displayCell("TP", "â€”", "muted-cell optional-col"));
+  tr.appendChild(displayCell("Patience", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("Risk", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("Reward", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("RR", "â€”", "muted-cell"));
+  tr.appendChild(htmlCell("Result", valuePill(cash.type === "deposit" ? "DEPOSIT" : "WITHDRAW", "result")));
+  tr.appendChild(htmlCell("P&L", pnlHtml(cash.type === "deposit" ? amount : -amount)));
+  tr.appendChild(htmlCell("Balance", pnlHtml(event.balanceAfter)));
+  tr.appendChild(displayCell("Notes", cash.note || "-", "notes-preview"));
+  tr.appendChild(cashActionCell("Actions", index));
+  return tr;
+}
+
+function cashActionCell(label, index) {
+  const td = document.createElement("td");
+  td.dataset.label = label;
+  td.className = "action-cell";
+  const edit = document.createElement("button");
+  edit.className = "icon-btn";
+  edit.title = "Edit entry";
+  edit.innerHTML = `<i data-lucide="pencil"></i>`;
+  edit.addEventListener("click", () => openCashModal(state.cashTransactions[index]?.type || "deposit", index));
+  const del = document.createElement("button");
+  del.className = "icon-btn";
+  del.title = "Delete entry";
+  del.innerHTML = `<i data-lucide="trash-2"></i>`;
+  del.addEventListener("click", () => deleteCashTransaction(index));
+  td.appendChild(edit);
+  td.appendChild(del);
+  return td;
+}
+
+function openCashModal(type = "deposit", index = null) {
+  cashModalType = type === "withdraw" ? "withdraw" : "deposit";
+  cashEditingIndex = Number.isInteger(index) ? index : null;
+  const modal = document.getElementById("cash-modal");
+  const title = document.getElementById("cash-modal-title");
+  const saveBtn = document.getElementById("cash-save-btn");
+  const entry = Number.isInteger(index) ? state.cashTransactions[index] : null;
+  if (title) title.textContent = entry ? `EDIT_${cashModalType.toUpperCase()}` : cashModalType === "deposit" ? "DEPOSIT" : "WITHDRAW";
+  if (saveBtn) saveBtn.textContent = entry ? "Save Changes" : cashModalType === "deposit" ? "Save Deposit" : "Save Withdrawal";
+  document.getElementById("cash-date").value = entry?.date || todayISO();
+  document.getElementById("cash-amount").value = entry?.amount || "";
+  document.getElementById("cash-note").value = entry?.note || "";
+  modal?.removeAttribute("hidden");
+  setTimeout(() => document.getElementById("cash-amount")?.focus(), 40);
+  refreshIcons();
+}
+
+function closeCashModal() {
+  document.getElementById("cash-modal")?.setAttribute("hidden", "");
+  cashEditingIndex = null;
+}
+
+function saveCashFromModal() {
+  const date = document.getElementById("cash-date")?.value || todayISO();
+  const amount = round1(Math.abs(parseFloat(document.getElementById("cash-amount")?.value) || 0));
+  const note = document.getElementById("cash-note")?.value.trim() || "";
+  if (!amount) {
+    toast("Enter a valid amount.");
+    return;
+  }
+  const entry = normalizeCashTransaction({
+    id: Number.isInteger(cashEditingIndex) ? state.cashTransactions[cashEditingIndex]?.id : undefined,
+    date,
+    type: cashModalType,
+    amount,
+    note,
+    createdAt: Number.isInteger(cashEditingIndex) ? state.cashTransactions[cashEditingIndex]?.createdAt : new Date().toISOString()
+  });
+  if (!state.cashTransactions) state.cashTransactions = [];
+  if (Number.isInteger(cashEditingIndex)) {
+    state.cashTransactions[cashEditingIndex] = entry;
+    toast(cashModalType === "deposit" ? "Deposit updated." : "Withdrawal updated.");
+  } else {
+    state.cashTransactions.push(entry);
+    toast(cashModalType === "deposit" ? "Deposit saved." : "Withdrawal saved.");
+  }
+  save();
+  closeCashModal();
+  renderTrades();
+  if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
+}
+
+function deleteCashTransaction(index) {
+  const entry = state.cashTransactions[index];
+  if (!entry) return;
+  const label = entry.type === "deposit" ? "deposit" : "withdrawal";
+  if (!confirm(`Delete this ${label} of ${signed(entry.amount)} $?`)) return;
+  state.cashTransactions.splice(index, 1);
+  save();
+  renderTrades();
+  toast(`${label.charAt(0).toUpperCase()}${label.slice(1)} deleted.`);
 }
 
 function textCell(label, value, cls = "") {
@@ -1050,14 +1301,6 @@ function setScreenshotState(next = {}) {
   renderScreenshotUploader();
 }
 
-function isCloudinaryConfigured() {
-  return Boolean(
-    CLOUDINARY_CLOUD_NAME &&
-    CLOUDINARY_UPLOAD_PRESET &&
-    CLOUDINARY_CLOUD_NAME !== "YOUR_CLOUD_NAME"
-  );
-}
-
 function initScreenshotUploader(trade = {}) {
   screenshotUploadToken += 1;
   resetScreenshotObjectUrl();
@@ -1075,6 +1318,12 @@ function renderScreenshotUploader() {
   if (!preview || !status || !dropzone) return;
 
   dropzone.classList.toggle("is-uploading", screenshotState.status === "uploading");
+
+  const saveBtn = document.getElementById("modal-save-trade-btn");
+  if (saveBtn) {
+    saveBtn.disabled = screenshotState.status === "uploading";
+    saveBtn.title = screenshotState.status === "uploading" ? "Waiting for screenshot upload to finish" : "";
+  }
   const statusText = {
     idle: screenshotState.url ? "Uploaded" : "",
     preview: "Preview ready",
@@ -1093,9 +1342,10 @@ function renderScreenshotUploader() {
   }
 
   preview.hidden = false;
+  const previewUrl = safeHttpUrl(screenshotState.previewUrl, true) || screenshotState.previewUrl;
   preview.innerHTML = `
     <div class="screenshot-preview-frame">
-      <img src="${escapeHtml(screenshotState.previewUrl)}" alt="Trade screenshot preview">
+      <img src="${escapeHtml(previewUrl)}" alt="Trade screenshot preview" referrerpolicy="no-referrer">
       <button class="icon-btn screenshot-remove" type="button" onclick="removeTradeScreenshot()" title="Remove screenshot" aria-label="Remove screenshot">
         <i data-lucide="x"></i>
       </button>
@@ -1114,44 +1364,62 @@ function removeTradeScreenshot() {
 
 async function handleScreenshotFile(file) {
   if (!file) return;
-  if (!file.type || !file.type.startsWith("image/")) {
-    toast("Only image files are supported.");
+  const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+  const ALLOWED_IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
+  const fileExt = "." + (file.name.split(".").pop() || "").toLowerCase();
+
+  if (!file.type || !ALLOWED_IMAGE_TYPES.includes(file.type)) {
+    toast("Only JPG, PNG, WebP, or GIF files are allowed.");
+    return;
+  }
+  if (!ALLOWED_IMAGE_EXTENSIONS.includes(fileExt)) {
+    toast("File extension not allowed. Use .jpg, .png, .webp, or .gif.");
     return;
   }
   if (file.size > MAX_SCREENSHOT_SIZE) {
     toast("Image too large (max 5MB)");
     return;
   }
+
   resetScreenshotObjectUrl();
   const uploadToken = screenshotUploadToken + 1;
   screenshotUploadToken = uploadToken;
   const localUrl = URL.createObjectURL(file);
   setScreenshotState({ url: "", previewUrl: localUrl, objectUrl: localUrl, status: "uploading", error: "" });
 
-  if (!isCloudinaryConfigured()) {
-    if (!cloudinaryConfigWarned) {
-      toast("Cloudinary not configured. See setup guide in README.");
-      cloudinaryConfigWarned = true;
-    }
-    setScreenshotState({ status: "error", error: "Not configured" });
+  if (!supabaseClient || !currentUser) {
+    toast("Sign in required to upload screenshots.");
+    setScreenshotState({ status: "error", error: "Not signed in" });
     return;
   }
 
   try {
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
-    const response = await fetch(CLOUDINARY_UPLOAD_URL, { method: "POST", body: formData });
-    if (!response.ok) throw new Error(`Cloudinary upload failed: ${response.status}`);
-    const data = await response.json();
-    if (!data.secure_url) throw new Error("Cloudinary response missing secure_url");
+    const ext = file.name.split(".").pop() || "jpg";
+    const filePath = `${currentUser.id}/${Date.now()}_${Math.random().toString(16).slice(2)}.${ext}`;
+
+    const { error: uploadError } = await supabaseClient.storage
+      .from("screenshots")
+      .upload(filePath, file, { cacheControl: "3600", upsert: false });
+
+    if (uploadError) throw uploadError;
     if (uploadToken !== screenshotUploadToken) return;
+
+    const { data: { publicUrl } } = supabaseClient.storage
+      .from("screenshots")
+      .getPublicUrl(filePath);
+
     resetScreenshotObjectUrl();
-    setScreenshotState({ url: data.secure_url, previewUrl: data.secure_url, objectUrl: "", status: "uploaded", error: "" });
+    setScreenshotState({
+      url: publicUrl,
+      previewUrl: publicUrl,
+      objectUrl: "",
+      status: "uploaded",
+      error: ""
+    });
   } catch (error) {
     if (uploadToken !== screenshotUploadToken) return;
     console.warn("Screenshot upload failed", error);
-    toast("Screenshot upload failed - trade saved without it");
+    toast("Screenshot upload failed. Retry or remove it before saving.");
     setScreenshotState({ url: "", status: "error", error: "Upload failed" });
   }
 }
@@ -1230,6 +1498,11 @@ function closeTradeModal() {
   modalEditingIndex = null;
   screenshotUploadToken += 1;
   resetScreenshotObjectUrl();
+  // Reset screenshot state fully on close to avoid stale preview
+  screenshotState.url = "";
+  screenshotState.previewUrl = "";
+  screenshotState.status = "idle";
+  screenshotState.error = "";
 }
 
 function modalTradeData() {
@@ -1257,6 +1530,14 @@ function modalTradeData() {
 }
 
 function saveTradeFromModal() {
+  if (screenshotState.status === "uploading") {
+    toast("Screenshot still uploading - please wait a moment and save again.");
+    return;
+  }
+  if (screenshotState.status === "error" && screenshotState.previewUrl && !screenshotState.url) {
+    toast("Screenshot is not uploaded. Retry upload or remove it before saving.");
+    return;
+  }
   const trade = modalTradeData();
   if (!trade.date) {
     toast("Date required.");
@@ -1278,10 +1559,16 @@ function saveTradeFromModal() {
 }
 
 function deleteTrade(index) {
+  if (!currentUser) { toast("Sign in required."); return; }
+  const trade = state.trades[index];
+  if (!trade) return;
+  if (!confirm(`Delete trade #${index + 1} (${trade.date || "no date"} Â· ${trade.result || "open"})? This cannot be undone.`)) return;
+  const tradeId = trade.id;
   state.trades.splice(index, 1);
   save();
   renderTrades();
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
+  if (tradeId) deleteTradeFromSupabase(tradeId);
   toast("Trade deleted.");
 }
 
@@ -1353,9 +1640,10 @@ function renderViewTradeModal() {
     ["Reward (pips)", escapeHtml(trade.reward || "-")],
     ["Patience Score", readonlyStars(trade.patienceScore)]
   ];
-  const imageHtml = trade.screenshotUrl
-    ? `<a class="view-image-link" href="${escapeHtml(trade.screenshotUrl)}" target="_blank" rel="noopener" title="Open screenshot full size">
-        <img class="view-image" src="${escapeHtml(trade.screenshotUrl)}" alt="Trade screenshot" onload="this.classList.add('is-loaded')" onerror="this.classList.add('is-loaded')">
+  const screenshotUrl = safeHttpUrl(trade.screenshotUrl);
+  const imageHtml = screenshotUrl
+    ? `<a class="view-image-link" href="${escapeHtml(screenshotUrl)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" title="Open screenshot full size">
+        <img class="view-image" src="${escapeHtml(screenshotUrl)}" alt="Trade screenshot" referrerpolicy="no-referrer" onload="this.classList.add('is-loaded')" onerror="this.classList.add('is-loaded')">
       </a>`
     : `<div class="view-image-placeholder">
         <i data-lucide="image-off"></i>
@@ -1476,9 +1764,15 @@ function saveSkippedTradeFromModal() {
 }
 
 function deleteSkippedTrade(index) {
+  if (!currentUser) { toast("Sign in required."); return; }
+  const trade = state.skippedTrades[index];
+  if (!trade) return;
+  if (!confirm(`Delete skipped trade (${trade.date || "no date"} Â· ${trade.level || "no level"})? This cannot be undone.`)) return;
+  const tradeId = trade.id;
   state.skippedTrades.splice(index, 1);
   save();
   renderSkippedTrades();
+  if (tradeId) deleteSkippedFromSupabase(tradeId);
   toast("Skipped trade deleted.");
 }
 
@@ -1650,10 +1944,12 @@ function renderAnalysisWithDelay() {
 }
 
 function renderAnalysis() {
+  destroyCharts("analysis-");
   const el = document.getElementById("analysis-content");
   if (!el) return;
   const p = performance();
   const streaks = streakStats();
+  const hasEquityCurve = state.trades.some((trade) => trade.cum !== "");
   el.innerHTML = `
     <div class="analysis-automation">
       <div>
@@ -1683,12 +1979,38 @@ function renderAnalysis() {
     <div class="analysis-grid">
       <div class="panel panel-pad">
         <div class="panel-title"><span>Equity Curve</span><span class="section-pill ${moneyClass(p.totalPnl)}">${signed(p.totalPnl)} $</span></div>
-        ${equitySvg()}
+        ${hasEquityCurve
+    ? `<div class="chart-card chart-equity"><canvas id="analysis-equity" aria-label="Equity curve chart"></canvas></div>`
+    : `<div class="empty-state" style="min-height:210px"><div><strong>No equity curve yet</strong><span>Close trades to build the curve automatically.</span></div></div>`}
       </div>
       <div class="panel panel-pad">
         <div class="panel-title"><span>Auto Insights</span><span class="section-pill neutral">${p.closed.length} closed</span></div>
         <div class="insight-list">${insightHtml()}</div>
       </div>
+    </div>
+    <div class="charts-row">
+      <div class="chart-card">
+        <h4>Win Rate by Level</h4>
+        <canvas id="analysis-level-wr" aria-label="Win rate by level"></canvas>
+      </div>
+      <div class="chart-card">
+        <h4>Win Rate by Timeframe</h4>
+        <canvas id="analysis-tf-wr" aria-label="Win rate by timeframe"></canvas>
+      </div>
+    </div>
+    <div class="charts-row">
+      <div class="chart-card">
+        <h4>P&amp;L by Session</h4>
+        <canvas id="analysis-session-pnl" aria-label="P and L by session"></canvas>
+      </div>
+      <div class="chart-card">
+        <h4>Mistake Distribution</h4>
+        <canvas id="analysis-mistake" aria-label="Mistake distribution"></canvas>
+      </div>
+    </div>
+    <div class="chart-card chart-tall" style="margin-bottom:14px">
+      <h4>Rolling 10-Trade Win Rate</h4>
+      <canvas id="analysis-rolling-wr" aria-label="Rolling win rate"></canvas>
     </div>
     ${analysisTable("Level Analysis", "levels", "level")}
     ${analysisTable("Timeframe Analysis", "tfs", "tf")}
@@ -1704,6 +2026,7 @@ function renderAnalysis() {
     ${crossTable()}
     ${comboAnalysisTable()}
   `;
+  renderAnalysisCharts();
   refreshIcons();
 }
 
@@ -1793,7 +2116,7 @@ function patienceCostInsight() {
   const lowPatienceLoss = performance().closed
     .filter((trade) => trade.result === "LOSS" && trade.patienceScore && parseInt(trade.patienceScore, 10) < winAvg)
     .reduce((sum, trade) => sum + Math.abs(parseFloat(trade.pnl) || parseFloat(calcPnl(trade.risk, trade.reward, trade.result)) || 0), 0);
-  return `Impatient entries cost you ${round1(lowPatienceLoss)} $. Score ≥4 trades win ${patienceWinRate((score) => score >= 4)} vs ${patienceWinRate((score) => score <= 2)} for ≤2.`;
+  return `Impatient entries cost you ${round1(lowPatienceLoss)} $. Score â‰¥4 trades win ${patienceWinRate((score) => score >= 4)} vs ${patienceWinRate((score) => score <= 2)} for â‰¤2.`;
 }
 
 function biasWinRate(label) {
@@ -1883,6 +2206,478 @@ function streakStats() {
   return { currentWin, currentLoss, bestWin, worstLoss };
 }
 
+window._charts = window._charts || {};
+
+const MENTOR_SECTION_ICONS = {
+  "TRADING REPORT CARD": "ðŸ†",
+  "BRUTAL TRUTH": "ðŸ”´",
+  "BEHAVIORAL ALERTS": "âš ï¸",
+  "WHAT IS WORKING": "âœ…",
+  "WHAT IS COSTING MONEY": "ðŸ’¸",
+  "BLIND SPOT REPORT": "ðŸ”",
+  "MISSED TRADE LESSON": "ðŸ“Œ",
+  "NEXT 5-TRADE RULES": "ðŸ“‹",
+  "STOP IMMEDIATELY": "ðŸ›‘",
+  "REPEAT IMMEDIATELY": "ðŸ”",
+  "WEEKEND HOMEWORK": "ðŸ“š"
+};
+
+const doughnutCenterTextPlugin = {
+  id: "doughnutCenterText",
+  beforeDraw(chart) {
+    const meta = chart.getDatasetMeta(0);
+    if (!meta?.data?.length) return;
+    const { ctx, chartArea } = chart;
+    if (!chartArea) return;
+    ctx.save();
+    ctx.font = "600 13px Inter, sans-serif";
+    ctx.fillStyle = "#e8edf5";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("Mistakes", (chartArea.left + chartArea.right) / 2, (chartArea.top + chartArea.bottom) / 2);
+    ctx.restore();
+  }
+};
+
+function destroyCharts(prefix = "") {
+  Object.keys(window._charts).forEach((key) => {
+    if (prefix && !key.startsWith(prefix)) return;
+    window._charts[key]?.destroy();
+    delete window._charts[key];
+  });
+}
+
+function destroyAllCharts() {
+  destroyCharts();
+}
+
+function winRateBarColor(winRate) {
+  if (winRate >= 60) return "#3ecf8e";
+  if (winRate >= 40) return "#f0bd55";
+  return "#f05252";
+}
+
+function chartFontColor() {
+  return "#e8edf5";
+}
+
+function chartGridColor() {
+  return "rgba(255,255,255,0.05)";
+}
+
+function chartTooltipOptions() {
+  return {
+    backgroundColor: "#1a2030",
+    borderColor: "#f0bd55",
+    borderWidth: 1,
+    titleColor: "#ffd985",
+    bodyColor: "#e8edf5",
+    titleFont: { family: "Inter", size: 12 },
+    bodyFont: { family: "Inter", size: 12 }
+  };
+}
+
+function chartLegendOptions(position = "bottom") {
+  return {
+    position,
+    labels: {
+      color: chartFontColor(),
+      font: { family: "Inter", size: 11 },
+      boxWidth: 12,
+      padding: 12
+    }
+  };
+}
+
+function chartScaleOptions(showY = true, showX = true) {
+  const scales = {};
+  if (showY) {
+    scales.y = {
+      beginAtZero: true,
+      ticks: { color: "rgba(232,237,245,0.75)", font: { family: "Inter", size: 10 } },
+      grid: { color: chartGridColor() },
+      border: { display: false }
+    };
+  }
+  if (showX) {
+    scales.x = {
+      ticks: { color: "rgba(232,237,245,0.75)", font: { family: "Inter", size: 10 } },
+      grid: { color: chartGridColor() },
+      border: { display: false }
+    };
+  }
+  return scales;
+}
+
+function createChart(id, config) {
+  if (typeof Chart === "undefined") return null;
+  const canvas = document.getElementById(id);
+  if (!canvas) return null;
+  if (window._charts[id]) {
+    window._charts[id].destroy();
+    delete window._charts[id];
+  }
+  window._charts[id] = new Chart(canvas, config);
+  return window._charts[id];
+}
+
+function levelWinRateChartData() {
+  return grouped("levels", "level").sort((a, b) => b.winRate - a.winRate);
+}
+
+function tfWinRateChartData() {
+  return grouped("tfs", "tf").sort((a, b) => b.winRate - a.winRate);
+}
+
+function equityCurveChartData() {
+  recalcCum();
+  const closedRows = state.trades
+    .map((trade, index) => ({ trade, index }))
+    .filter(({ trade }) => trade.cum !== "");
+  return {
+    labels: ["Start", ...closedRows.map(({ trade, index }) => `#${index + 1}`)],
+    values: [0, ...closedRows.map(({ trade }) => parseFloat(trade.cum))],
+    dates: ["", ...closedRows.map(({ trade }) => formatDateDisplay(trade.date) || "")]
+  };
+}
+
+function sessionPnlChartData() {
+  return grouped("sessions", "session")
+    .filter((row) => row.count > 0)
+    .sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl));
+}
+
+function mistakeChartData() {
+  return grouped("mistakes", "mistake").filter((row) => row.count > 0 && row.key !== "No mistake");
+}
+
+function monthlyPnlChartData() {
+  const map = new Map();
+  performance().closed.forEach((trade) => {
+    if (!trade.date) return;
+    const parts = trade.date.split("-");
+    const key = `${parts[0]}-${parts[1]}`;
+    const monthIndex = parseInt(parts[1], 10) - 1;
+    const label = `${DATE_MONTHS[monthIndex]?.slice(0, 3) || parts[1]} ${parts[0]}`;
+    if (!map.has(key)) map.set(key, { key, label, pnl: 0, trades: 0 });
+    const row = map.get(key);
+    row.pnl = round1(row.pnl + (parseFloat(trade.pnl) || 0));
+    row.trades += 1;
+  });
+  return Array.from(map.values()).sort((a, b) => a.key.localeCompare(b.key));
+}
+
+function rollingWinRateChartData() {
+  const closed = state.trades.filter((trade) => trade.result);
+  const labels = [];
+  const values = [];
+  closed.forEach((trade, index) => {
+    const start = Math.max(0, index - 9);
+    const window = closed.slice(start, index + 1);
+    const wins = window.filter((row) => row.result === "WIN").length;
+    labels.push(`#${index + 1}`);
+    values.push(window.length ? round1((wins / window.length) * 100) : 0);
+  });
+  return { labels, values, dates: closed.map((trade) => formatDateDisplay(trade.date) || "") };
+}
+
+function renderAnalysisCharts() {
+  if (typeof Chart === "undefined") return;
+  destroyCharts("analysis-");
+
+  const levelData = levelWinRateChartData();
+  if (levelData.length) {
+    createChart("analysis-level-wr", {
+      type: "bar",
+      data: {
+        labels: levelData.map((row) => row.key),
+        datasets: [{
+          label: "Win Rate %",
+          data: levelData.map((row) => round1(row.winRate)),
+          backgroundColor: levelData.map((row) => winRateBarColor(row.winRate)),
+          borderColor: levelData.map((row) => winRateBarColor(row.winRate)),
+          borderWidth: 1,
+          borderRadius: 6
+        }]
+      },
+      options: {
+        indexAxis: "y",
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: chartTooltipOptions()
+        },
+        scales: {
+          x: {
+            min: 0,
+            max: 100,
+            ticks: { color: "rgba(232,237,245,0.75)", font: { family: "Inter" }, callback: (v) => `${v}%` },
+            grid: { color: chartGridColor() },
+            border: { display: false }
+          },
+          y: {
+            ticks: { color: "rgba(232,237,245,0.85)", font: { family: "Inter", size: 11 } },
+            grid: { display: false },
+            border: { display: false }
+          }
+        }
+      }
+    });
+  }
+
+  const tfData = tfWinRateChartData();
+  if (tfData.length) {
+    createChart("analysis-tf-wr", {
+      type: "bar",
+      data: {
+        labels: tfData.map((row) => row.key),
+        datasets: [{
+          label: "Win Rate %",
+          data: tfData.map((row) => round1(row.winRate)),
+          backgroundColor: tfData.map((row) => winRateBarColor(row.winRate)),
+          borderColor: tfData.map((row) => winRateBarColor(row.winRate)),
+          borderWidth: 1,
+          borderRadius: 6
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: chartTooltipOptions()
+        },
+        scales: chartScaleOptions(true, true)
+      }
+    });
+  }
+
+  const equity = equityCurveChartData();
+  if (equity.values.length > 1) {
+    const canvas = document.getElementById("analysis-equity");
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      const gradient = ctx.createLinearGradient(0, 0, 0, 240);
+      gradient.addColorStop(0, "rgba(240,189,85,0.3)");
+      gradient.addColorStop(1, "rgba(240,189,85,0)");
+      createChart("analysis-equity", {
+        type: "line",
+        data: {
+          labels: equity.labels,
+          datasets: [{
+            label: "Cumulative P&L",
+            data: equity.values,
+            borderColor: "#f0bd55",
+            backgroundColor: gradient,
+            fill: true,
+            tension: 0.4,
+            pointRadius: 3,
+            pointHoverRadius: 6,
+            pointBackgroundColor: "#f0bd55",
+            borderWidth: 2
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              ...chartTooltipOptions(),
+              callbacks: {
+                title(items) {
+                  const idx = items[0]?.dataIndex ?? 0;
+                  const tradeNo = equity.labels[idx] || "";
+                  const date = equity.dates[idx] || "";
+                  return date ? `${tradeNo} Â· ${date}` : tradeNo;
+                },
+                label(item) {
+                  return `Cumulative P&L: ${signed(item.parsed.y)} $`;
+                }
+              }
+            }
+          },
+          scales: chartScaleOptions(true, true)
+        }
+      });
+    }
+  }
+
+  const sessionData = sessionPnlChartData();
+  if (sessionData.length) {
+    createChart("analysis-session-pnl", {
+      type: "polarArea",
+      data: {
+        labels: sessionData.map((row) => row.key),
+        datasets: [{
+          label: "Total P&L",
+          data: sessionData.map((row) => Math.abs(row.pnl)),
+          backgroundColor: sessionData.map((row) => (row.pnl >= 0 ? "rgba(62,207,142,0.55)" : "rgba(240,82,82,0.55)")),
+          borderColor: sessionData.map((row) => (row.pnl >= 0 ? "#3ecf8e" : "#f05252")),
+          borderWidth: 1
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: chartLegendOptions("bottom"),
+          tooltip: {
+            ...chartTooltipOptions(),
+            callbacks: {
+              label(context) {
+                const row = sessionData[context.dataIndex];
+                return `${row.key}: ${signed(row.pnl)} $ (${row.count} trades)`;
+              }
+            }
+          }
+        },
+        scales: {
+          r: {
+            ticks: { display: false },
+            grid: { color: chartGridColor() },
+            angleLines: { color: chartGridColor() }
+          }
+        }
+      }
+    });
+  }
+
+  const mistakeData = mistakeChartData();
+  if (mistakeData.length) {
+    const total = mistakeData.reduce((sum, row) => sum + row.count, 0);
+    createChart("analysis-mistake", {
+      type: "doughnut",
+      plugins: [doughnutCenterTextPlugin],
+      data: {
+        labels: mistakeData.map((row) => row.key),
+        datasets: [{
+          data: mistakeData.map((row) => row.count),
+          backgroundColor: ["#f05252", "#f0bd55", "#ff8f66", "#a78bfa", "#62a8ff", "#3ecf8e", "#fb7185", "#fbbf24"],
+          borderColor: "#10141a",
+          borderWidth: 2
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: "62%",
+        plugins: {
+          legend: chartLegendOptions("bottom"),
+          tooltip: {
+            ...chartTooltipOptions(),
+            callbacks: {
+              label(context) {
+                const count = context.parsed || 0;
+                const pct = total ? ((count / total) * 100).toFixed(1) : 0;
+                return `${context.label}: ${count} (${pct}%)`;
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  const rolling = rollingWinRateChartData();
+  if (rolling.values.length) {
+    createChart("analysis-rolling-wr", {
+      type: "line",
+      data: {
+        labels: rolling.labels,
+        datasets: [
+          {
+            label: "Rolling 10-Trade Win Rate",
+            data: rolling.values,
+            borderColor: "#3ecf8e",
+            backgroundColor: "rgba(62,207,142,0.08)",
+            fill: false,
+            tension: 0.35,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2
+          },
+          {
+            label: "50% Reference",
+            data: rolling.values.map(() => 50),
+            borderColor: "#f05252",
+            borderDash: [6, 4],
+            pointRadius: 0,
+            borderWidth: 1,
+            fill: false
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: chartLegendOptions("bottom"),
+          tooltip: {
+            ...chartTooltipOptions(),
+            callbacks: {
+              title(items) {
+                const idx = items[0]?.dataIndex ?? 0;
+                const date = rolling.dates[idx] || "";
+                return date ? `${rolling.labels[idx]} Â· ${date}` : rolling.labels[idx];
+              }
+            }
+          }
+        },
+        scales: {
+          ...chartScaleOptions(true, true),
+          y: {
+            min: 0,
+            max: 100,
+            ticks: { color: "rgba(232,237,245,0.75)", font: { family: "Inter" }, callback: (v) => `${v}%` },
+            grid: { color: chartGridColor() },
+            border: { display: false }
+          }
+        }
+      }
+    });
+  }
+}
+
+function renderPnlCharts() {
+  if (typeof Chart === "undefined") return;
+  destroyCharts("pnl-");
+  const monthly = monthlyPnlChartData();
+  if (!monthly.length) return;
+  createChart("pnl-monthly", {
+    type: "bar",
+    data: {
+      labels: monthly.map((row) => row.label),
+      datasets: [{
+        label: "Monthly P&L",
+        data: monthly.map((row) => row.pnl),
+        backgroundColor: monthly.map((row) => (row.pnl >= 0 ? "rgba(62,207,142,0.75)" : "rgba(240,82,82,0.75)")),
+        borderColor: monthly.map((row) => (row.pnl >= 0 ? "#3ecf8e" : "#f05252")),
+        borderWidth: 1,
+        borderRadius: 6
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          ...chartTooltipOptions(),
+          callbacks: {
+            label(context) {
+              const row = monthly[context.dataIndex];
+              return [`Total: ${signed(row.pnl)} $`, `Trades: ${row.trades}`];
+            }
+          }
+        }
+      },
+      scales: chartScaleOptions(true, true)
+    }
+  });
+}
+
 function avgPatienceFor(result) {
   const rows = performance().closed.filter((trade) => trade.result === result && trade.patienceScore);
   if (!rows.length) return "-";
@@ -1933,7 +2728,7 @@ function analysisTable(title, catKey, field) {
     const color = g.winRate >= 60 ? "var(--green)" : g.winRate >= 40 ? "var(--amber)" : "var(--red)";
     return `
       <tr>
-        <td class="key-cell" data-label="Name">${escapeHtml(key)}${bestKey === key ? ` <span class="best-badge">⭐ Best</span>` : ""}</td>
+        <td class="key-cell" data-label="Name">${escapeHtml(key)}${bestKey === key ? ` <span class="best-badge">â­ Best</span>` : ""}</td>
         <td data-label="Trades"><span class="count-chip chip-total">${g.count}</span></td>
         <td class="pos" data-label="Wins"><span class="count-chip chip-win">${g.wins}</span></td>
         <td class="neg" data-label="Losses"><span class="count-chip chip-loss">${losses}</span></td>
@@ -2099,15 +2894,30 @@ function dailyPnlMap() {
   recalcCum();
   const map = new Map();
   state.trades.forEach((trade, index) => {
-    if (!trade.date || !trade.result) return;
-    if (!map.has(trade.date)) map.set(trade.date, { date: trade.date, pnl: 0, trades: 0, wins: 0, losses: 0, bes: 0, indexes: [] });
+    if (!trade.date) return;
+    if (!map.has(trade.date)) {
+      map.set(trade.date, {
+        date: trade.date,
+        pnl: 0,
+        trades: 0,
+        wins: 0,
+        losses: 0,
+        bes: 0,
+        open: 0,
+        indexes: []
+      });
+    }
     const day = map.get(trade.date);
-    day.pnl = round1(day.pnl + (parseFloat(trade.pnl) || 0));
     day.trades += 1;
+    day.indexes.push(index + 1);
+    if (!trade.result) {
+      day.open += 1;
+      return;
+    }
+    day.pnl = round1(day.pnl + (parseFloat(trade.pnl) || 0));
     day.wins += trade.result === "WIN" ? 1 : 0;
     day.losses += trade.result === "LOSS" ? 1 : 0;
     day.bes += trade.result === "BE" ? 1 : 0;
-    day.indexes.push(index + 1);
   });
   return map;
 }
@@ -2154,9 +2964,85 @@ function monthPnlStats(year, month) {
   const avgDaily = tradingDays ? round1(totalPnl / tradingDays) : 0;
   const best = days.length ? days.slice().sort((a, b) => b.pnl - a.pnl)[0] : null;
   const worst = days.length ? days.slice().sort((a, b) => a.pnl - b.pnl)[0] : null;
+  const mostActive = days.length ? days.slice().sort((a, b) => b.trades - a.trades)[0] : null;
   const winRate = tradingDays ? profitable / tradingDays * 100 : 0;
   const maxAbs = days.length ? Math.max(...days.map((day) => Math.abs(day.pnl)), 1) : 1;
-  return { map, days, tradingDays, totalTrades, profitable, losing, totalPnl, avgDaily, best, worst, winRate, maxAbs };
+  const closedWins = days.reduce((sum, day) => sum + day.wins, 0);
+  const closedLosses = days.reduce((sum, day) => sum + day.losses, 0);
+  const closedBes = days.reduce((sum, day) => sum + day.bes, 0);
+  return {
+    map,
+    days,
+    tradingDays,
+    totalTrades,
+    profitable,
+    losing,
+    totalPnl,
+    avgDaily,
+    best,
+    worst,
+    mostActive,
+    winRate,
+    maxAbs,
+    closedWins,
+    closedLosses,
+    closedBes
+  };
+}
+
+function monthWeekdayRows(year, month) {
+  const cells = monthCells(year, month);
+  const rows = [];
+  for (let i = 0; i < cells.length; i += 7) {
+    const weekDays = cells.slice(i + 1, i + 6);
+    if (weekDays.some((cell) => cell.inMonth)) rows.push({ weekDays });
+  }
+  return rows;
+}
+
+function weekRangeLabel(weekDays) {
+  const start = weekDays[0];
+  const end = weekDays[4];
+  const startDate = new Date(`${start.iso}T00:00:00`);
+  const endDate = new Date(`${end.iso}T00:00:00`);
+  const sm = DATE_MONTHS[startDate.getMonth()].slice(0, 3);
+  const em = DATE_MONTHS[endDate.getMonth()].slice(0, 3);
+  if (sm === em) return `${sm} ${start.day} - ${end.day}`;
+  return `${sm} ${start.day} - ${em} ${end.day}`;
+}
+
+function weekSummaryStats(weekDays, map) {
+  let pnl = 0;
+  let trades = 0;
+  let wins = 0;
+  let losses = 0;
+  let bes = 0;
+  let open = 0;
+  let activeDays = 0;
+  weekDays.forEach((cell) => {
+    const day = map.get(cell.iso);
+    if (!day?.trades) return;
+    activeDays += 1;
+    pnl = round1(pnl + day.pnl);
+    trades += day.trades;
+    wins += day.wins;
+    losses += day.losses;
+    bes += day.bes;
+    open += day.open;
+  });
+  const closed = wins + losses + bes;
+  const winRate = closed ? Math.round((wins / closed) * 100) : 0;
+  return { pnl, trades, wins, losses, bes, open, activeDays, winRate, closed };
+}
+
+function dayStatusLine(day) {
+  if (!day?.trades) return "";
+  const parts = [];
+  if (day.wins) parts.push(`${day.wins} Win`);
+  if (day.losses) parts.push(`${day.losses} Loss`);
+  if (day.bes) parts.push(`${day.bes} BE`);
+  if (day.open) parts.push(`${day.open} Open`);
+  return parts.join(" Â· ");
 }
 
 function monthTradeRows(year, month) {
@@ -2299,7 +3185,7 @@ function pnlBars(title, rows, icon) {
     const wr = row.trades ? row.wins / row.trades * 100 : 0;
     return `
       <div class="pnl-bar-row">
-        <div><b>${escapeHtml(row.key)}</b><span>${row.trades} trades · ${wr.toFixed(0)}% WR</span></div>
+        <div><b>${escapeHtml(row.key)}</b><span>${row.trades} trades Â· ${wr.toFixed(0)}% WR</span></div>
         <div class="pnl-bar-track"><i class="${moneyClass(row.pnl)}" style="width:${width}%"></i></div>
         <strong class="${moneyClass(row.pnl)}">${signed(row.pnl)} $</strong>
       </div>
@@ -2337,7 +3223,7 @@ function pnlSelectedTrades(selected) {
     return `
       <button class="pnl-trade-row" onclick="openViewTradeModal(${tradeNo - 1})">
         <span>#${tradeNo}</span>
-        <b>${escapeHtml(trade.entry || "-")} · ${escapeHtml(trade.level || "-")}</b>
+        <b>${escapeHtml(trade.entry || "-")} Â· ${escapeHtml(trade.level || "-")}</b>
         <em class="${moneyClass(trade.pnl)}">${signed(trade.pnl)} $</em>
       </button>
     `;
@@ -2346,40 +3232,72 @@ function pnlSelectedTrades(selected) {
 }
 
 function renderPnl() {
+  destroyCharts("pnl-");
   const el = document.getElementById("pnl-content");
   if (!el) return;
   const { year, month } = pnlView;
   const stats = monthPnlStats(year, month);
   const dashboard = pnlDashboardStats(year, month, stats);
-  if (!pnlView.selectedDate || !pnlView.selectedDate.startsWith(`${year}-${String(month + 1).padStart(2, "0")}`)) {
-    pnlView.selectedDate = isoFromParts(year, month, 1);
+  const monthPrefix = `${year}-${String(month + 1).padStart(2, "0")}`;
+  if (pnlView.selectedDate && !pnlView.selectedDate.startsWith(monthPrefix)) {
+    pnlView.selectedDate = null;
   }
-  const cells = monthCells(year, month);
-  const weekRows = [];
-  for (let i = 0; i < cells.length; i += 7) {
-    const week = cells.slice(i, i + 7);
-    const weekPnl = round1(week.reduce((sum, cell) => sum + (stats.map.get(cell.iso)?.pnl || 0), 0));
-    const weekTrades = week.reduce((sum, cell) => sum + (stats.map.get(cell.iso)?.trades || 0), 0);
-    weekRows.push({ week, weekPnl, weekTrades, weekNo: weekRows.length + 1 });
-  }
-  const selected = stats.map.get(pnlView.selectedDate);
-  const selectedLabel = `${dayName(pnlView.selectedDate)}, ${formatDateDisplay(pnlView.selectedDate)}`;
+  const weekRows = monthWeekdayRows(year, month);
+  const selected = pnlView.selectedDate ? stats.map.get(pnlView.selectedDate) : null;
+  const selectedLabel = pnlView.selectedDate ? `${dayName(pnlView.selectedDate)}, ${formatDateDisplay(pnlView.selectedDate)}` : "";
   const sessionRows = pnlGroupRows(dashboard.trades, "session");
   const setupRows = pnlGroupRows(dashboard.trades, "setup");
   const weekdayRows = pnlWeekdayRows(stats.days);
+  const monthTone = moneyClass(stats.totalPnl);
 
   el.innerHTML = `
     <div class="pnl-dashboard">
-      <section class="pnl-hero ${moneyClass(stats.totalPnl)}">
-        <div>
-          <span class="pnl-hero-kicker">Monthly Net P&L</span>
-          <b>${signed(stats.totalPnl)} $</b>
-          <p>${escapeHtml(monthTitle(year, month))} · ${dashboard.trades.length} closed trades · ${stats.tradingDays} active days</p>
+      <section class="pnl-cal-board">
+        <div class="pnl-cal-toolbar">
+          <button class="icon-btn" onclick="changePnlMonth(-1)" title="Previous month" aria-label="Previous month"><i data-lucide="chevron-left"></i></button>
+          <div class="pnl-cal-toolbar-title">
+            <h2>${escapeHtml(monthTitle(year, month))}</h2>
+            <p>Daily P&amp;L calendar</p>
+          </div>
+          <button class="icon-btn" onclick="changePnlMonth(1)" title="Next month" aria-label="Next month"><i data-lucide="chevron-right"></i></button>
+          <button class="soft-btn pnl-cal-today" onclick="goCurrentPnlMonth()">Today</button>
         </div>
-        <div class="pnl-score-ring" style="--score:${dashboard.consistency}">
-          <strong>${dashboard.consistency}</strong>
-          <span>Consistency</span>
+
+        <div class="pnl-cal-stats">
+          ${pnlCalendarStat("Monthly P&amp;L", `<span class="${monthTone}">${signed(stats.totalPnl)} $</span>`, "", monthTone)}
+          ${pnlCalendarStat("Trading Days", `${stats.tradingDays}d`, `${stats.profitable} green Â· ${stats.losing} red`)}
+          ${pnlCalendarStat("Trades", `${stats.totalTrades} total`, `${stats.closedWins}W Â· ${stats.closedLosses}L${stats.closedBes ? ` Â· ${stats.closedBes}BE` : ""}`)}
+          ${pnlCalendarStat("Best Day", stats.best ? `<span class="pos">${signed(stats.best.pnl)} $</span>` : "-", stats.best ? formatDateDisplay(stats.best.date) : "No data")}
+          ${pnlCalendarStat("Worst Day", stats.worst ? `<span class="neg">${signed(stats.worst.pnl)} $</span>` : "-", stats.worst ? formatDateDisplay(stats.worst.date) : "No data")}
+          ${pnlCalendarStat("Most Active Day", stats.mostActive ? `${stats.mostActive.trades} trades` : "-", stats.mostActive ? formatDateDisplay(stats.mostActive.date) : "No data")}
+          ${pnlCalendarStat("Avg / Day", `<span class="${monthTone}">${signed(stats.avgDaily)} $</span>`)}
+          ${pnlCalendarStat("Win Rate", `<span class="${stats.winRate >= 50 ? "pos" : "neg"}">${stats.winRate.toFixed(0)}%</span>`, "profitable days")}
         </div>
+
+        <div class="pnl-cal-grid">
+          ${["Mon", "Tue", "Wed", "Thu", "Fri", "Week"].map((label) => `<div class="pnl-cal-head">${label}</div>`).join("")}
+          ${weekRows.map((row) => `
+            ${row.weekDays.map((cell) => pnlDayCell(cell, stats)).join("")}
+            ${pnlWeekCell(row.weekDays, stats)}
+          `).join("")}
+        </div>
+
+        ${pnlView.selectedDate ? `
+          <div class="pnl-cal-selected">
+            <div class="pnl-cal-selected-head">
+              <div>
+                <span>Selected Day</span>
+                <b>${escapeHtml(selectedLabel)}</b>
+              </div>
+              <div class="pnl-cal-selected-meta">
+                <strong class="${moneyClass(selected?.pnl || 0)}">${selected ? signed(selected.pnl) : "$0.00"} $</strong>
+                <small>${selected ? `${selected.trades} trade${selected.trades === 1 ? "" : "s"} Â· ${escapeHtml(dayStatusLine(selected))}` : "No trades"}</small>
+              </div>
+              <button class="icon-btn" onclick="clearPnlSelection()" title="Clear selection" aria-label="Clear selection"><i data-lucide="x"></i></button>
+            </div>
+            ${pnlSelectedTrades(selected)}
+          </div>
+        ` : ""}
       </section>
 
       <section class="pnl-kpi-grid">
@@ -2402,85 +3320,20 @@ function renderPnl() {
         </article>
       </section>
 
-      <div class="pnl-layout">
-        <div class="pnl-calendar-panel">
-        <div class="pnl-monthbar">
-          <button class="icon-btn" onclick="changePnlMonth(-1)" title="Previous month"><i data-lucide="chevron-left"></i></button>
-          <div>
-            <h2>${escapeHtml(monthTitle(year, month))}</h2>
-            <p>Daily P&L in $</p>
-          </div>
-          <button class="icon-btn" onclick="changePnlMonth(1)" title="Next month"><i data-lucide="chevron-right"></i></button>
-        </div>
-        <div class="pnl-scale"><span>Loss</span><div></div><span>Profit</span></div>
-        <div class="pnl-legend">
-          ${legendItem("pnl-heavy-loss", "Heavy Loss")}
-          ${legendItem("pnl-moderate-loss", "Moderate Loss")}
-          ${legendItem("pnl-minor-loss", "Minor Loss")}
-          ${legendItem("pnl-no-data", "No Trades")}
-          ${legendItem("pnl-minor-gain", "Minor Gain")}
-          ${legendItem("pnl-moderate-gain", "Moderate Gain")}
-          ${legendItem("pnl-strong-gain", "Strong Gain")}
-        </div>
-        <div class="pnl-grid">
-          ${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Week"].map((label) => `<div class="pnl-weekday">${label}</div>`).join("")}
-          ${weekRows.map((row) => `
-            ${row.week.map((cell) => pnlDayCell(cell, stats)).join("")}
-            <div class="pnl-week-total ${pnlClass(row.weekPnl, stats.maxAbs)}">
-              <b>Week ${row.weekNo}</b>
-              <strong>${signed(row.weekPnl)} $</strong>
-              <span>${row.weekTrades} trade${row.weekTrades === 1 ? "" : "s"}</span>
-            </div>
-          `).join("")}
-        </div>
-      </div>
-      <aside class="pnl-side-panel">
-        <div class="pnl-stat-grid">
-          ${pnlStat("Trading Days", stats.tradingDays)}
-          ${pnlStat("Total Trades", stats.totalTrades)}
-          ${pnlStat("Profitable", stats.profitable)}
-          ${pnlStat("Losing", stats.losing)}
-        </div>
-        <div class="pnl-total-card ${moneyClass(stats.totalPnl)}">
-          <span>Total P/L</span>
-          <b>${signed(stats.totalPnl)} $</b>
-        </div>
-        <div class="pnl-info-card">
-          <span>Avg Daily P/L</span>
-          <b>${signed(stats.avgDaily)} $</b>
-        </div>
-        <div class="pnl-info-card">
-          <span><i data-lucide="trending-up"></i> Best Day</span>
-          <b class="pos">${stats.best ? `${signed(stats.best.pnl)} $` : "-"}</b>
-          <small>${stats.best ? formatDateDisplay(stats.best.date) : "No data"}</small>
-        </div>
-        <div class="pnl-info-card">
-          <span><i data-lucide="trending-down"></i> Worst Day</span>
-          <b class="neg">${stats.worst ? `${signed(stats.worst.pnl)} $` : "-"}</b>
-          <small>${stats.worst ? formatDateDisplay(stats.worst.date) : "No data"}</small>
-        </div>
-        <div class="pnl-win-note">
-          <i data-lucide="lightbulb"></i>
-          <span>Win Rate: <b>${stats.winRate.toFixed(1)}%</b> of your trading days are profitable.</span>
-        </div>
-        <div class="pnl-selected-card">
-          <button onclick="clearPnlSelection()" title="Clear selection"><i data-lucide="x"></i></button>
-          <span>Selected Day</span>
-          <b>${escapeHtml(selectedLabel)}</b>
-          <p>${selected ? `${selected.trades} trade${selected.trades === 1 ? "" : "s"}  ${signed(selected.pnl)} $` : "No trades"}</p>
-          ${pnlSelectedTrades(selected)}
-        </div>
-      </aside>
-      </div>
-
       <section class="pnl-analytics-grid">
         ${pnlBars("Session Edge", sessionRows, "clock-3")}
         ${pnlBars("Setup Quality", setupRows, "layers-3")}
         ${pnlBars("Weekday P&L", weekdayRows, "calendar-days")}
         ${pnlDistribution(stats.days, stats.maxAbs)}
       </section>
+
+      <section class="chart-card" style="margin-top:16px">
+        <h4>Monthly P&amp;L</h4>
+        <canvas id="pnl-monthly" aria-label="Monthly P and L chart"></canvas>
+      </section>
     </div>
   `;
+  renderPnlCharts();
   refreshIcons();
 }
 
@@ -2503,17 +3356,57 @@ function pnlStat(label, value) {
   return `<div class="pnl-stat"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`;
 }
 
+function pnlCalendarStat(label, value, detail = "", tone = "") {
+  return `
+    <div class="pnl-cal-stat ${tone}">
+      <span>${escapeHtml(label)}</span>
+      <b>${value}</b>
+      ${detail ? `<small>${detail}</small>` : ""}
+    </div>
+  `;
+}
+
 function pnlDayCell(cell, stats) {
   const day = stats.map.get(cell.iso);
-  const cls = pnlClass(day?.pnl || 0, stats.maxAbs);
+  const hasTrades = Boolean(day?.trades);
+  const pnl = day?.pnl || 0;
+  let tone = "empty";
+  if (hasTrades) {
+    if (pnl > 0) tone = "profit";
+    else if (pnl < 0) tone = "loss";
+    else tone = "flat";
+  }
   const selected = cell.iso === pnlView.selectedDate ? "selected" : "";
   const muted = cell.inMonth ? "" : "muted";
+  const pnlText = hasTrades ? `${signed(pnl)} $` : (cell.inMonth ? "$0.00" : "");
   return `
-    <button class="pnl-day ${cls} ${selected} ${muted}" onclick="selectPnlDay('${cell.iso}')">
-      <span>${cell.day}</span>
-      <b>${day ? `${signed(day.pnl)} $` : "No data"}</b>
-      <small>${day ? `${day.trades} trade${day.trades === 1 ? "" : "s"}` : ""}</small>
+    <button type="button" class="pnl-cal-day ${tone} ${selected} ${muted}" onclick="selectPnlDay('${cell.iso}')" ${cell.inMonth ? "" : "tabindex=\"-1\""}>
+      <span class="pnl-cal-date">${cell.day}</span>
+      <strong class="pnl-cal-pnl">${pnlText}</strong>
+      <small class="pnl-cal-trades">${hasTrades ? `${day.trades} trade${day.trades === 1 ? "" : "s"}` : ""}</small>
+      <em class="pnl-cal-status">${escapeHtml(dayStatusLine(day))}</em>
     </button>
+  `;
+}
+
+function pnlWeekCell(weekDays, stats) {
+  const summary = weekSummaryStats(weekDays, stats.map);
+  if (!summary.trades) {
+    return `
+      <div class="pnl-cal-week empty">
+        <span class="pnl-cal-week-range">${escapeHtml(weekRangeLabel(weekDays))}</span>
+        <strong>No trades</strong>
+      </div>
+    `;
+  }
+  const tone = summary.pnl > 0 ? "profit" : summary.pnl < 0 ? "loss" : "flat";
+  return `
+    <div class="pnl-cal-week ${tone}">
+      <span class="pnl-cal-week-range">${escapeHtml(weekRangeLabel(weekDays))}</span>
+      <strong class="pnl-cal-week-pnl">${signed(summary.pnl)} $</strong>
+      <small>${summary.activeDays} day${summary.activeDays === 1 ? "" : "s"} Â· ${summary.trades} trade${summary.trades === 1 ? "" : "s"}</small>
+      <em>${summary.wins} Win Â· ${summary.losses} Loss${summary.bes ? ` Â· ${summary.bes} BE` : ""} Â· ${summary.winRate}%</em>
+    </div>
   `;
 }
 
@@ -2523,7 +3416,7 @@ function selectPnlDay(iso) {
 }
 
 function clearPnlSelection() {
-  pnlView.selectedDate = isoFromParts(pnlView.year, pnlView.month, 1);
+  pnlView.selectedDate = null;
   renderPnl();
 }
 
@@ -2531,7 +3424,7 @@ function changePnlMonth(delta) {
   const d = new Date(pnlView.year, pnlView.month + delta, 1);
   pnlView.year = d.getFullYear();
   pnlView.month = d.getMonth();
-  pnlView.selectedDate = isoFromParts(pnlView.year, pnlView.month, 1);
+  pnlView.selectedDate = null;
   renderPnl();
 }
 
@@ -2641,6 +3534,8 @@ function reportPerformance(items) {
   const grossLoss = losses.reduce((sum, row) => sum + Math.abs(parseFloat(row.pnl) || 0), 0);
   const avgWin = wins.length ? wins.reduce((sum, row) => sum + (parseFloat(row.trade.reward) || 0), 0) / wins.length : 0;
   const avgLoss = losses.length ? losses.reduce((sum, row) => sum + (parseFloat(row.trade.risk) || 0), 0) / losses.length : 0;
+  const cumVals = chronologicalRows.filter((row) => row.cum !== "").map((row) => parseFloat(row.cum));
+  const maxDrawdown = calcMaxDrawdown(cumVals);
   return {
     closed,
     wins,
@@ -2650,6 +3545,7 @@ function reportPerformance(items) {
     winRate,
     profitFactor: grossLoss ? grossWin / grossLoss : grossWin ? grossWin : 0,
     expectancy: closed.length ? (winRate / 100) * avgWin - (1 - winRate / 100) * avgLoss : 0,
+    maxDrawdown,
     rows: chronologicalRows.reverse()
   };
 }
@@ -2669,7 +3565,7 @@ function reportBadge(value, type) {
 }
 
 function reportScreenshotsSection(items) {
-  const rows = items.filter(({ trade }) => trade.screenshotUrl);
+  const rows = items.filter(({ trade }) => safeHttpUrl(trade.screenshotUrl));
   if (!rows.length) return "";
   return `
     <section class="r-section r-screenshots-section">
@@ -2677,6 +3573,7 @@ function reportScreenshotsSection(items) {
       ${rows.map(({ trade, index }) => {
         const pnl = calcPnl(trade.risk, trade.reward, trade.result);
         const pnlText = pnl === "" ? "-" : `${signed(pnl)} pips`;
+        const screenshotUrl = safeHttpUrl(trade.screenshotUrl);
         return `
           <article class="r-screenshot-card">
             <header>
@@ -2686,7 +3583,7 @@ function reportScreenshotsSection(items) {
               </div>
               ${reportBadge(trade.result, "result")}
             </header>
-            <img src="${escapeHtml(trade.screenshotUrl)}" alt="Trade #${index + 1} screenshot">
+            <img src="${escapeHtml(screenshotUrl)}" alt="Trade #${index + 1} screenshot" referrerpolicy="no-referrer">
             <p class="r-screenshot-summary">Risk: ${escapeHtml(trade.risk || "-")}pips | Reward: ${escapeHtml(trade.reward || "-")}pips | TP: ${escapeHtml(trade.tpPlacement || "-")} | RR: ${escapeHtml(calcRR(trade.risk, trade.reward) || "-")} | P&amp;L: ${escapeHtml(pnlText)}</p>
             ${trade.reason ? `<p class="r-screenshot-notes">${escapeHtml(trade.reason)}</p>` : ""}
           </article>
@@ -2719,16 +3616,78 @@ function reportAnalysisTable(title, items, field) {
     <section class="r-section">
       <h2>${escapeHtml(title)}</h2>
       <table class="r-table compact">
-        <thead><tr><th>Name</th><th>Trades</th><th>Wins</th><th>Loss</th><th>BE</th><th>Win Rate</th><th>P&L</th></tr></thead>
+        <thead><tr><th>Name</th><th>Trades</th><th>Wins</th><th>Win%</th><th>Total P&amp;L</th></tr></thead>
         <tbody>
           ${rows.map((row) => {
             const wr = row.trades ? row.wins / row.trades * 100 : 0;
-            return `<tr><td>${escapeHtml(row.key)}</td><td>${row.trades}</td><td class="r-pos">${row.wins}</td><td class="r-neg">${row.losses}</td><td>${row.be}</td><td>${wr.toFixed(0)}%</td><td class="${row.pnl >= 0 ? "r-pos" : "r-neg"}">${signed(row.pnl)}</td></tr>`;
+            return `<tr><td>${escapeHtml(row.key)}</td><td>${row.trades}</td><td class="r-pos">${row.wins}</td><td>${wr.toFixed(0)}%</td><td class="${row.pnl >= 0 ? "r-pos" : "r-neg"}">${signed(row.pnl)}</td></tr>`;
           }).join("")}
         </tbody>
       </table>
     </section>
   `;
+}
+
+function patienceStars(score) {
+  const n = Math.max(0, Math.min(5, parseInt(score, 10) || 0));
+  return `${"â˜…".repeat(n)}${"â˜†".repeat(5 - n)}`;
+}
+
+function reportTradeBorderClass(result) {
+  if (result === "WIN") return "r-border-win";
+  if (result === "LOSS") return "r-border-loss";
+  if (result === "BE") return "r-border-be";
+  return "r-border-open";
+}
+
+function reportTradeCard({ trade, index, pnl, cum }) {
+  const border = reportTradeBorderClass(trade.result);
+  const screenshotUrl = safeHttpUrl(trade.screenshotUrl);
+  const imageBlock = screenshotUrl
+    ? `<img class="r-card-image" src="${escapeHtml(screenshotUrl)}" alt="Trade #${index + 1} screenshot" referrerpolicy="no-referrer">`
+    : `<div class="r-card-placeholder">No screenshot</div>`;
+  const pnlText = pnl === "" ? "-" : `${signed(pnl)} pips`;
+  const cumText = cum === "" ? "-" : `${signed(cum)} pips`;
+  return `
+    <article class="r-trade-card ${border}">
+      <div class="r-card-head">
+        <strong>Trade #${index + 1}</strong>
+        <span>${escapeHtml(formatDateDisplay(trade.date) || "-")}</span>
+        ${reportBadge(trade.result, "result")}
+      </div>
+      <div class="r-card-image-wrap">${imageBlock}</div>
+      <div class="r-card-body">
+        <div class="r-card-row"><b>Level:</b> ${escapeHtml(trade.level || "-")} <b>TF:</b> ${escapeHtml(trade.tf || "-")} <b>Session:</b> ${escapeHtml(trade.session || "-")}</div>
+        <div class="r-card-row"><b>Side:</b> ${escapeHtml(trade.entry || "-")} <b>RR:</b> ${escapeHtml(calcRR(trade.risk, trade.reward) || "-")} <b>Risk:</b> ${escapeHtml(trade.risk || "-")} <b>Reward:</b> ${escapeHtml(trade.reward || "-")}</div>
+        <div class="r-card-row"><b>P&amp;L:</b> ${escapeHtml(pnlText)} <b>Cumul:</b> ${escapeHtml(cumText)}</div>
+      </div>
+      <div class="r-card-meta">
+        <div class="r-card-row"><b>Setup:</b> ${escapeHtml(trade.setup || "-")} <b>Market:</b> ${escapeHtml(trade.marketCondition || "-")} <b>Confirm:</b> ${escapeHtml(trade.confirmationType || "-")}</div>
+        <div class="r-card-row"><b>Bias:</b> ${escapeHtml(trade.biasAlignment || "-")} <b>Mistake:</b> ${escapeHtml(trade.mistake || "-")}</div>
+        <div class="r-card-row"><b>Hold:</b> ${escapeHtml(trade.hold || "-")} <b>Patience:</b> ${trade.patienceScore ? patienceStars(trade.patienceScore) : "-"}</div>
+      </div>
+      <div class="r-card-notes"><b>Notes:</b> ${escapeHtml(trade.reason || "-")}</div>
+    </article>
+  `;
+}
+
+function reportTradeCardPages(rows) {
+  if (!rows.length) {
+    return `<div class="r-page"><div class="r-card-grid"><p>No trades found for this range.</p></div></div>`;
+  }
+  const pages = [];
+  for (let i = 0; i < rows.length; i += 2) {
+    const pair = rows.slice(i, i + 2);
+    pages.push(`
+      <div class="r-page">
+        <div class="r-card-grid">
+          ${pair.map((row) => reportTradeCard(row)).join("")}
+        </div>
+      </div>
+      <div class="r-page-break"></div>
+    `);
+  }
+  return pages.join("");
 }
 
 function reportComboAnalysisTable(items) {
@@ -2787,75 +3746,40 @@ function buildReportHtml(range = reportRange()) {
   const items = tradesForRange(range);
   const p = reportPerformance(items);
   const generated = new Date().toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-  const rows = p.rows.map(({ trade, index, pnl, cum }) => `
-    <tr>
-      <td>#${index + 1}</td>
-      <td>${escapeHtml(formatDateDisplay(trade.date))}</td>
-      <td>${escapeHtml(trade.session || "-")}</td>
-      <td>${reportBadge(trade.entry, "entry")}</td>
-      <td>${escapeHtml(trade.level || "-")}</td>
-      <td>${escapeHtml(trade.tf || "-")}</td>
-      <td>${escapeHtml(trade.setup || "-")}</td>
-      <td>${escapeHtml(trade.mistake || "-")}</td>
-      <td>${escapeHtml(trade.hold || "-")}</td>
-      <td>${escapeHtml(trade.marketCondition || "-")}</td>
-      <td>${escapeHtml(trade.biasAlignment || "-")}</td>
-      <td>${escapeHtml(trade.confirmationType || "-")}</td>
-      <td>${escapeHtml(trade.slTpPlacement || "-")}</td>
-      <td>${escapeHtml(trade.tpPlacement || "-")}</td>
-      <td>${escapeHtml(trade.patienceScore ? `P${trade.patienceScore}` : "-")}</td>
-      <td>${escapeHtml(trade.risk || "-")}</td>
-      <td>${escapeHtml(trade.reward || "-")}</td>
-      <td>${escapeHtml(calcRR(trade.risk, trade.reward) || "-")}</td>
-      <td>${reportBadge(trade.result, "result")}</td>
-      <td class="${moneyClass(pnl) === "pos" ? "r-pos" : moneyClass(pnl) === "neg" ? "r-neg" : ""}">${pnl === "" ? "-" : signed(pnl)}</td>
-      <td>${cum === "" ? "-" : signed(cum)}</td>
-      <td class="r-note-cell">${escapeHtml(trade.reason || "-")}</td>
-    </tr>
-  `).join("");
 
   return `
+    <div class="r-page r-cover-page">
+      <h1 class="r-cover-title">XAUUSD Trading Journal</h1>
+      <p class="r-cover-subtitle">Performance Report</p>
+      <p class="r-cover-range">${escapeHtml(rangeLabel(range))}</p>
+      <p class="r-cover-generated">Generated ${escapeHtml(generated)}</p>
+      <div class="r-cover-kpis">
+        <div class="r-cover-kpi"><span>Closed Trades</span><b>${p.closed.length}</b></div>
+        <div class="r-cover-kpi"><span>Win Rate</span><b class="${p.winRate >= 50 ? "r-pos" : "r-neg"}">${p.winRate.toFixed(1)}%</b></div>
+        <div class="r-cover-kpi"><span>Total P&amp;L</span><b class="${p.totalPnl >= 0 ? "r-pos" : "r-neg"}">${signed(p.totalPnl)} $</b></div>
+        <div class="r-cover-kpi"><span>Profit Factor</span><b>${p.profitFactor.toFixed(2)}</b></div>
+        <div class="r-cover-kpi"><span>Expectancy</span><b class="${p.expectancy >= 0 ? "r-pos" : "r-neg"}">${signed(p.expectancy)} $</b></div>
+        <div class="r-cover-kpi"><span>Max Drawdown</span><b class="r-neg">${signed(p.maxDrawdown)} $</b></div>
+      </div>
+    </div>
+    <div class="r-page-break"></div>
+    ${reportTradeCardPages(p.rows)}
     <div class="r-page">
       <header class="r-header">
         <div>
-          <div class="r-kicker">XAUUSD Trading Journal</div>
-          <h1>Trade Log & Analysis Report</h1>
+          <div class="r-kicker">Analysis Summary</div>
+          <h1>Performance Breakdown</h1>
           <p>${escapeHtml(rangeLabel(range))}</p>
         </div>
-        <div class="r-meta">
-          <b>Gold Journal</b>
-          <span>Generated ${escapeHtml(generated)}</span>
-        </div>
       </header>
-      <section class="r-summary">
-        <div><span>Closed Trades</span><b>${p.closed.length}</b></div>
-        <div><span>Win Rate</span><b class="${p.winRate >= 50 ? "r-pos" : "r-neg"}">${p.winRate.toFixed(1)}%</b></div>
-        <div><span>Total P&L</span><b class="${p.totalPnl >= 0 ? "r-pos" : "r-neg"}">${signed(p.totalPnl)} $</b></div>
-        <div><span>Profit Factor</span><b>${p.profitFactor.toFixed(2)}</b></div>
-        <div><span>Expectancy</span><b class="${p.expectancy >= 0 ? "r-pos" : "r-neg"}">${signed(p.expectancy)} $</b></div>
-      </section>
-      <section class="r-section">
-        <h2>Trade Log</h2>
-        <table class="r-table full-log">
-          <thead><tr><th>#</th><th>Date</th><th>Session</th><th>Side</th><th>Level</th><th>TF</th><th>Setup</th><th>Mistake</th><th>Hold</th><th>Market</th><th>Bias</th><th>Confirm</th><th>SL</th><th>TP</th><th>Patience</th><th>Risk</th><th>Reward</th><th>RR</th><th>Result</th><th>P&L</th><th>Cum</th><th>Notes / Reason</th></tr></thead>
-          <tbody>${rows || `<tr><td colspan="22">No trades found for this range.</td></tr>`}</tbody>
-        </table>
-      </section>
-      ${reportScreenshotsSection(items)}
-      ${reportSkippedTradesSection(range)}
       <div class="r-analysis-grid">
         ${reportAnalysisTable("Session Analysis", items, "session")}
         ${reportAnalysisTable("Level Analysis", items, "level")}
         ${reportAnalysisTable("Setup Analysis", items, "setup")}
         ${reportAnalysisTable("Mistake Analysis", items, "mistake")}
-        ${reportAnalysisTable("Hold Quality Analysis", items, "hold")}
         ${reportAnalysisTable("Market Condition Analysis", items, "marketCondition")}
-        ${reportAnalysisTable("Bias Alignment Analysis", items, "biasAlignment")}
         ${reportAnalysisTable("Confirmation Type Analysis", items, "confirmationType")}
-        ${reportAnalysisTable("SL Placement Analysis", items, "slTpPlacement")}
-        ${reportAnalysisTable("TP Placement Analysis", items, "tpPlacement")}
       </div>
-      ${reportComboAnalysisTable(items)}
     </div>
   `;
 }
@@ -2904,9 +3828,11 @@ function saveWeeklyReview() {
 }
 
 function deleteWeeklyReview(id) {
+  if (!currentUser) { toast("Sign in required."); return; }
   state.weeklyReviews = state.weeklyReviews.filter((review) => review.id !== id);
   save();
   renderWeeklyReviews();
+  if (id) deleteReviewFromSupabase(id);
   toast("Weekly review deleted.");
 }
 
@@ -2981,7 +3907,13 @@ async function clearAllTrades() {
     toast("No trades to clear.");
     return;
   }
-  if (!confirm("Clear all trades for the selected account from this device and Firebase? This cannot be undone.")) return;
+  const accountName = activeAccount().name;
+  if (!confirm(`Clear ALL trades for "${accountName}"? This permanently deletes them from Supabase too. This cannot be undone.`)) return;
+  // Double-check account is still the same
+  if (activeAccountId !== activeAccount().id) {
+    toast("Account changed. Please try again.");
+    return;
+  }
   state.trades = [];
   try {
     persistLocalState();
@@ -2992,17 +3924,20 @@ async function clearAllTrades() {
   if (document.getElementById("tab-analysis")?.classList.contains("active")) renderAnalysis();
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
 
-  if (currentUser && window.firebaseDb) {
+  if (currentUser && supabaseReady) {
     try {
       updateSyncStatus("syncing");
-      await clearAccountFirestoreCollection(currentUser.uid, activeAccountId, "trades");
+      await supabaseClient.from("trades")
+        .delete()
+        .eq("user_id", currentUser.id)
+        .eq("account_id", activeAccountId);
       updateSyncStatus("synced");
-      toast("Selected account trades cleared from device and Firebase.");
+      toast("Trades cleared from device and Supabase.");
       return;
     } catch (error) {
-      console.warn("Could not clear Firebase trades", error);
+      console.warn("Could not clear Supabase trades", error);
       updateSyncStatus("offline");
-      toast("Local trades cleared. Firebase clear failed.");
+      toast("Local trades cleared. Supabase clear failed.");
       return;
     }
   }
@@ -3033,23 +3968,57 @@ function hideLoginScreen() {
 }
 
 async function signInWithGoogle() {
-  if (!window.firebaseAuth || !window.GoogleAuthProvider || !window.signInWithPopup) {
-    toast("Firebase is still loading.");
-    return;
+  if (!supabaseClient) { toast("Supabase not ready."); return; }
+  const { error } = await supabaseClient.auth.signInWithOAuth({
+    provider: "google",
+    options: {
+      redirectTo: window.location.origin + "/auth/callback",
+      queryParams: { prompt: "select_account" }
+    }
+  });
+  if (error) {
+    console.warn("Google sign-in failed", error);
+    toast("Google sign-in failed: " + error.message);
   }
-  const provider = new window.GoogleAuthProvider();
-  await window.signInWithPopup(window.firebaseAuth, provider);
+}
+
+async function signInWithEmail(event) {
+  event?.preventDefault();
+  if (!supabaseClient) { toast("Supabase not ready."); return; }
+  const email = document.getElementById("login-email")?.value.trim();
+  const password = document.getElementById("login-password")?.value || "";
+  if (!email || !password) { toast("Enter email and password."); return; }
+  const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+  if (error) {
+    toast(supabaseAuthMessage(error));
+  }
+}
+
+async function signUpWithEmail(event) {
+  event?.preventDefault();
+  if (!supabaseClient) { toast("Supabase not ready."); return; }
+  const email = document.getElementById("login-email")?.value.trim();
+  const password = document.getElementById("login-password")?.value || "";
+  if (!email || !password) { toast("Enter email and password."); return; }
+  const { error } = await supabaseClient.auth.signUp({ email, password });
+  if (error) {
+    toast(supabaseAuthMessage(error));
+  } else {
+    toast("Check your email to confirm your account.");
+  }
 }
 
 async function signOutUser() {
-  if (!window.firebaseAuth || !window.firebaseSignOut) return;
-  await window.firebaseSignOut(window.firebaseAuth);
+  if (!supabaseClient) return;
+  authLoadToken += 1;
+  await supabaseClient.auth.signOut();
 }
 
 function updateUserRow(user) {
   const row = document.getElementById("user-row");
   const avatar = document.getElementById("user-avatar");
   const name = document.getElementById("user-name");
+  updateProfileCard(user);
   if (!row || !avatar || !name) return;
   if (!user) {
     row.hidden = true;
@@ -3058,8 +4027,55 @@ function updateUserRow(user) {
     return;
   }
   row.hidden = false;
-  avatar.src = user.photoURL || "";
-  name.textContent = user.displayName || user.email || "Signed in";
+  avatar.src = user.user_metadata?.avatar_url || "";
+  name.textContent = user.user_metadata?.full_name || user.email || "Signed in";
+}
+
+function updateProfileCard(user = currentUser) {
+  const name = document.getElementById("profile-name");
+  const email = document.getElementById("profile-email");
+  const providers = document.getElementById("profile-providers");
+  if (!name || !email || !providers) return;
+  if (!user) {
+    name.textContent = "Signed out";
+    email.textContent = "-";
+    providers.innerHTML = "";
+    return;
+  }
+  name.textContent = user.user_metadata?.full_name || "Signed in";
+  email.textContent = user.email || "No email";
+  const providerList = user.app_metadata?.providers || [];
+  providers.innerHTML = providerList.map((p) => {
+    const label = p === "google" ? "Google" : p === "email" ? "Email password" : p;
+    return `<span class="tag">${escapeHtml(label)}</span>`;
+  }).join("");
+}
+
+function supabaseAuthMessage(error) {
+  const msg = error?.message || "";
+  if (msg.includes("Invalid login credentials")) return "Email or password is incorrect.";
+  if (msg.includes("User already registered")) return "This email is already registered. Sign in instead.";
+  if (msg.includes("Password should be")) return "Password must be at least 6 characters.";
+  if (msg.includes("Email not confirmed")) return "Please confirm your email first.";
+  return "Authentication failed: " + msg;
+}
+
+async function setAccountPassword() {
+  if (!supabaseClient) { toast("Supabase not ready."); return; }
+  const passwordInput = document.getElementById("profile-new-password");
+  const confirmInput = document.getElementById("profile-confirm-password");
+  const password = passwordInput?.value || "";
+  const confirm = confirmInput?.value || "";
+  if (password.length < 6) { toast("Password must be at least 6 characters."); return; }
+  if (password !== confirm) { toast("Passwords do not match."); return; }
+  const { error } = await supabaseClient.auth.updateUser({ password });
+  if (error) {
+    toast(supabaseAuthMessage(error));
+  } else {
+    if (passwordInput) passwordInput.value = "";
+    if (confirmInput) confirmInput.value = "";
+    toast("Password updated.");
+  }
 }
 
 function updateSyncStatus(status) {
@@ -3072,231 +4088,424 @@ function updateSyncStatus(status) {
   label.textContent = status === "synced" ? "Synced" : status === "syncing" ? "Syncing..." : "Offline - local only";
 }
 
-function userDocRef(uid, collectionName, documentId) {
-  return window.firestoreDoc(window.firebaseDb, "users", uid, collectionName, documentId);
-}
+// =============================================
+// SUPABASE DATA FUNCTIONS
+// =============================================
 
-function userCollectionRef(uid, collectionName) {
-  return window.firestoreCollection(window.firebaseDb, "users", uid, collectionName);
-}
-
-function accountDocRef(uid, accountId) {
-  return window.firestoreDoc(window.firebaseDb, "users", uid, "accounts", accountId);
-}
-
-function accountDataDocRef(uid, accountId, collectionName, documentId) {
-  return window.firestoreDoc(window.firebaseDb, "users", uid, "accounts", accountId, collectionName, documentId);
-}
-
-function accountDataCollectionRef(uid, accountId, collectionName) {
-  return window.firestoreCollection(window.firebaseDb, "users", uid, "accounts", accountId, collectionName);
-}
-
-async function loadFromFirestore(uid) {
-  if (!window.firebaseDb) return;
+async function loadFromSupabase(userId) {
+  if (!supabaseClient) return false;
+  const loadToken = authLoadToken + 1;
+  authLoadToken = loadToken;
   updateSyncStatus("syncing");
   try {
-    const accountsSnap = await window.firestoreGetDocs(userCollectionRef(uid, "accounts"));
-    const cloudAccounts = accountsSnap.docs.map((docSnap) => normalizeAccount({ id: docSnap.id, ...docSnap.data() }));
+    const { data: cloudAccounts, error: accErr } = await supabaseClient
+      .from("accounts")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at");
 
-    if (cloudAccounts.length) {
-      accounts = cloudAccounts.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
-      if (!accounts.some((account) => account.id === DEFAULT_ACCOUNT_ID)) accounts.unshift(defaultAccount());
-      if (!accounts.some((account) => account.id === activeAccountId)) activeAccountId = accounts[0].id;
-      await loadAccountFromFirestore(uid, activeAccountId);
-      const legacyState = await readLegacyFirestoreState(uid);
-      if (journalRowCount(legacyState)) {
-        accountData[DEFAULT_ACCOUNT_ID] = mergeJournalStates(accountData[DEFAULT_ACCOUNT_ID] || emptyJournalState(uid), legacyState);
-        if (activeAccountId === DEFAULT_ACCOUNT_ID) state = normalizeJournalState(accountData[DEFAULT_ACCOUNT_ID]);
-        await saveToFirestore();
+    if (accErr) throw accErr;
+    if (loadToken !== authLoadToken) return false;
+
+    if (!cloudAccounts || cloudAccounts.length === 0) {
+      if (!accounts.length) accounts = [defaultAccount()];
+      if (!accounts.some((a) => a.id === activeAccountId)) activeAccountId = accounts[0].id;
+
+      for (const account of accounts) {
+        await upsertAccountToSupabase(userId, account);
       }
+      if (loadToken !== authLoadToken) return false;
+
+      accounts.forEach((account) => {
+        if (!accountData[account.id]) {
+          accountData[account.id] = emptyJournalState(userId);
+        } else {
+          accountData[account.id] = normalizeJournalState({
+            ...accountData[account.id],
+            ownerUid: userId
+          });
+        }
+      });
+
+      state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState(userId));
       persistLocalState();
       renderCurrentAccount();
-    } else {
-      await loadLegacyFirestoreState(uid);
-      await saveToFirestore();
+      await saveToSupabase({ quiet: true });
+      if (loadToken !== authLoadToken) return false;
+
+      updateSyncStatus("synced");
+      return true;
     }
 
+    accounts = cloudAccounts.map((row) => normalizeAccount({
+      id: row.id,
+      name: row.name,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
+
+    if (!accounts.some((a) => a.id === activeAccountId)) {
+      activeAccountId = accounts[0].id;
+    }
+
+    accountData = {};
+    for (const account of accounts) {
+      accountData[account.id] = await loadAccountDataFromSupabase(userId, account.id);
+      if (loadToken !== authLoadToken) return false;
+    }
+
+    state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState(userId));
+    persistLocalState();
+    renderCurrentAccount();
     updateSyncStatus("synced");
+    return true;
   } catch (error) {
-    console.warn("Could not load from Firestore", error);
-    updateSyncStatus("offline");
+    console.warn("Could not load from Supabase", error);
+    if (loadToken === authLoadToken) {
+      updateSyncStatus("offline");
+      toast("Sync failed. Working offline with local data.");
+    }
+    return false;
   }
 }
 
-async function loadLegacyFirestoreState(uid) {
-  const legacyState = await readLegacyFirestoreState(uid);
-  if (journalRowCount(legacyState)) {
-    state = mergeJournalStates(state, legacyState);
-  }
-
-  if (!accounts.length) accounts = [defaultAccount()];
-  if (!activeAccountId) activeAccountId = accounts[0].id;
-  accountData[activeAccountId] = normalizeJournalState(state);
-  persistLocalState();
-  renderCurrentAccount();
-}
-
-async function readLegacyFirestoreState(uid) {
-  const [optionsSnap, settingsSnap, tradesSnap, skippedTradesSnap, reviewsSnap] = await Promise.all([
-    window.firestoreGetDoc(userDocRef(uid, "options", "data")),
-    window.firestoreGetDoc(userDocRef(uid, "settings", "data")),
-    window.firestoreGetDocs(userCollectionRef(uid, "trades")),
-    window.firestoreGetDocs(userCollectionRef(uid, "skippedTrades")),
-    window.firestoreGetDocs(userCollectionRef(uid, "weeklyReviews"))
+async function loadAccountDataFromSupabase(userId, accountId) {
+  const [
+    tradesRes,
+    cashRes,
+    skippedRes,
+    reviewsRes,
+    metaRes
+  ] = await Promise.all([
+    supabaseClient.from("trades").select("*").eq("user_id", userId).eq("account_id", accountId).order("date"),
+    supabaseClient.from("cash_transactions").select("*").eq("user_id", userId).eq("account_id", accountId).order("date"),
+    supabaseClient.from("skipped_trades").select("*").eq("user_id", userId).eq("account_id", accountId).order("date"),
+    supabaseClient.from("weekly_reviews").select("*").eq("user_id", userId).eq("account_id", accountId).order("week_of"),
+    supabaseClient.from("journal_meta").select("*").eq("user_id", userId).eq("account_id", accountId).maybeSingle()
   ]);
 
-  const cloudTrades = tradesSnap.docs.map((docSnap) => normalizeTrade({ id: docSnap.id, ...docSnap.data() }));
-  const cloudSkippedTrades = skippedTradesSnap.docs.map((docSnap) => normalizeSkippedTrade({ id: docSnap.id, ...docSnap.data() }));
-  const cloudReviews = reviewsSnap.docs.map((docSnap) => normalizeWeeklyReview({ id: docSnap.id, ...docSnap.data() }));
+  const errors = [tradesRes.error, cashRes.error, skippedRes.error, reviewsRes.error, metaRes.error].filter(Boolean);
+  if (errors.length) throw errors[0];
+
+  const meta = metaRes.data;
+
   return normalizeJournalState({
-    ownerUid: uid,
-    trades: cloudTrades.sort((a, b) => String(a.date).localeCompare(String(b.date))),
-    skippedTrades: cloudSkippedTrades.sort((a, b) => String(a.date).localeCompare(String(b.date))),
-    weeklyReviews: cloudReviews,
-    options: optionsSnap.exists() ? optionsSnap.data() : FIXED,
-    settings: settingsSnap.exists() ? settingsSnap.data() : {}
+    ownerUid: userId,
+    trades: (tradesRes.data || []).map(dbRowToTrade),
+    cashTransactions: (cashRes.data || []).map(dbRowToCash),
+    skippedTrades: (skippedRes.data || []).map(dbRowToSkipped),
+    weeklyReviews: (reviewsRes.data || []).map(dbRowToReview),
+    options: meta?.options || FIXED,
+    settings: meta?.settings || {}
   });
 }
 
-async function loadAccountFromFirestore(uid, accountId) {
-  const [accountSnap, optionsSnap, settingsSnap, tradesSnap, skippedTradesSnap, reviewsSnap] = await Promise.all([
-    window.firestoreGetDoc(accountDocRef(uid, accountId)),
-    window.firestoreGetDoc(accountDataDocRef(uid, accountId, "options", "data")),
-    window.firestoreGetDoc(accountDataDocRef(uid, accountId, "settings", "data")),
-    window.firestoreGetDocs(accountDataCollectionRef(uid, accountId, "trades")),
-    window.firestoreGetDocs(accountDataCollectionRef(uid, accountId, "skippedTrades")),
-    window.firestoreGetDocs(accountDataCollectionRef(uid, accountId, "weeklyReviews"))
-  ]);
+function dbRowToTrade(row) {
+  return normalizeTrade({
+    id: row.id,
+    date: row.date,
+    session: row.session,
+    entry: row.entry,
+    level: row.level,
+    tf: row.tf,
+    setup: row.setup,
+    mistake: row.mistake,
+    hold: row.hold,
+    marketCondition: row.market_condition,
+    biasAlignment: row.bias_alignment,
+    confirmationType: row.confirmation_type,
+    slTpPlacement: row.sl_tp_placement,
+    tpPlacement: row.tp_placement,
+    patienceScore: row.patience_score,
+    risk: row.risk,
+    reward: row.reward,
+    result: row.result,
+    reason: row.reason,
+    screenshotUrl: row.screenshot_url,
+    pnl: row.pnl,
+    cum: row.cum
+  });
+}
 
-  if (accountSnap.exists()) {
-    const account = normalizeAccount({ id: accountId, ...accountSnap.data() });
-    const index = accounts.findIndex((item) => item.id === accountId);
-    if (index >= 0) accounts[index] = account;
+function dbRowToCash(row) {
+  return normalizeCashTransaction({
+    id: row.id,
+    date: row.date,
+    type: row.type,
+    amount: row.amount,
+    note: row.note,
+    createdAt: row.created_at
+  });
+}
+
+function dbRowToSkipped(row) {
+  return normalizeSkippedTrade({
+    id: row.id,
+    date: row.date,
+    session: row.session,
+    level: row.level,
+    tf: row.tf,
+    direction: row.direction,
+    skipReason: row.skip_reason,
+    confidence: row.confidence,
+    notes: row.notes,
+    outcome: row.outcome,
+    pipsMissed: row.pips_missed
+  });
+}
+
+function dbRowToReview(row) {
+  return normalizeWeeklyReview({
+    id: row.id,
+    weekOf: row.week_of,
+    learned: row.learned,
+    pattern: row.pattern,
+    improve: row.improve,
+    createdAt: row.created_at
+  });
+}
+
+function tradeToDbRow(userId, accountId, trade) {
+  return {
+    id: trade.id,
+    user_id: userId,
+    account_id: accountId,
+    date: trade.date,
+    session: trade.session,
+    entry: trade.entry,
+    level: trade.level,
+    tf: trade.tf,
+    setup: trade.setup,
+    mistake: trade.mistake,
+    hold: trade.hold,
+    market_condition: trade.marketCondition,
+    bias_alignment: trade.biasAlignment,
+    confirmation_type: trade.confirmationType,
+    sl_tp_placement: trade.slTpPlacement,
+    tp_placement: trade.tpPlacement,
+    patience_score: trade.patienceScore,
+    risk: trade.risk,
+    reward: trade.reward,
+    result: trade.result,
+    reason: trade.reason,
+    screenshot_url: trade.screenshotUrl,
+    pnl: trade.pnl === "" ? null : trade.pnl,
+    cum: trade.cum === "" ? null : trade.cum
+  };
+}
+
+async function syncSupabaseTable(table, userId, accountId, rows, toDbRow) {
+  const keep = new Set(rows.map((row) => row.id));
+  if (rows.length > 0) {
+    const { error } = await supabaseClient.from(table).upsert(rows.map((row) => toDbRow(userId, accountId, row)), { onConflict: "id" });
+    if (error) throw error;
   }
-
-  const cloudState = normalizeJournalState({
-    ownerUid: uid,
-    trades: tradesSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
-    skippedTrades: skippedTradesSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
-    weeklyReviews: reviewsSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
-    options: optionsSnap.exists() ? optionsSnap.data() : FIXED,
-    settings: settingsSnap.exists() ? settingsSnap.data() : {}
-  });
-  const localState = normalizeJournalState(accountData[accountId] || {});
-  const cloudRows = cloudState.trades.length + cloudState.skippedTrades.length + cloudState.weeklyReviews.length;
-  const localRows = localState.trades.length + localState.skippedTrades.length + localState.weeklyReviews.length;
-
-  state = cloudRows >= localRows ? cloudState : localState;
-  activeAccountId = accountId;
-  accountData[accountId] = clone(state);
+  const { data: existing, error: fetchErr } = await supabaseClient.from(table).select("id").eq("user_id", userId).eq("account_id", accountId);
+  if (fetchErr) throw fetchErr;
+  const staleIds = (existing || []).map((row) => row.id).filter((id) => !keep.has(id));
+  if (staleIds.length > 0) {
+    const { error: delErr } = await supabaseClient.from(table).delete().in("id", staleIds).eq("user_id", userId);
+    if (delErr) throw delErr;
+  }
 }
 
-async function syncCollection(uid, collectionName, rows) {
-  const colRef = userCollectionRef(uid, collectionName);
-  const existing = await window.firestoreGetDocs(colRef);
-  const keep = new Set(rows.map((row) => row.id));
-  await Promise.all(rows.map((row) => window.firestoreSetDoc(userDocRef(uid, collectionName, row.id), row, { merge: true })));
-  await Promise.all(existing.docs.filter((docSnap) => !keep.has(docSnap.id)).map((docSnap) => window.firestoreDeleteDoc(userDocRef(uid, collectionName, docSnap.id))));
-}
-
-async function syncAccountCollection(uid, accountId, collectionName, rows) {
-  const colRef = accountDataCollectionRef(uid, accountId, collectionName);
-  const existing = await window.firestoreGetDocs(colRef);
-  const keep = new Set(rows.map((row) => row.id));
-  await Promise.all(rows.map((row) => window.firestoreSetDoc(accountDataDocRef(uid, accountId, collectionName, row.id), row, { merge: true })));
-  await Promise.all(existing.docs.filter((docSnap) => !keep.has(docSnap.id)).map((docSnap) => window.firestoreDeleteDoc(accountDataDocRef(uid, accountId, collectionName, docSnap.id))));
-}
-
-async function clearFirestoreCollection(uid, collectionName) {
-  const existing = await window.firestoreGetDocs(userCollectionRef(uid, collectionName));
-  await Promise.all(existing.docs.map((docSnap) => window.firestoreDeleteDoc(userDocRef(uid, collectionName, docSnap.id))));
-}
-
-async function clearAccountFirestoreCollection(uid, accountId, collectionName) {
-  const existing = await window.firestoreGetDocs(accountDataCollectionRef(uid, accountId, collectionName));
-  await Promise.all(existing.docs.map((docSnap) => window.firestoreDeleteDoc(accountDataDocRef(uid, accountId, collectionName, docSnap.id))));
-}
-
-async function saveToFirestore() {
-  if (!currentUser || !window.firebaseDb) return;
+async function saveToSupabase(options = {}) {
+  const { quiet = false } = options;
+  if (!supabaseClient || !currentUser) return;
   updateSyncStatus("syncing");
-  const uid = currentUser.uid;
-  state.ownerUid = uid;
+  const userId = currentUser.id;
+  state.ownerUid = userId;
   if (!accounts.length) accounts = [defaultAccount()];
-  const account = activeAccount();
-  account.updatedAt = new Date().toISOString();
-  const trades = state.trades.map((trade) => normalizeTrade(trade));
-  const skippedTrades = state.skippedTrades.map((trade) => normalizeSkippedTrade(trade));
-  const weeklyReviews = state.weeklyReviews.map((review) => normalizeWeeklyReview(review));
-  state.trades = trades;
-  state.skippedTrades = skippedTrades;
-  state.weeklyReviews = weeklyReviews;
+
   try {
     persistLocalState();
   } catch (error) {
     console.warn("Could not refresh local cache", error);
   }
 
-  await Promise.all(accounts.map(async (item) => {
-    const data = normalizeJournalState(accountData[item.id] || emptyJournalState(uid));
-    await window.firestoreSetDoc(accountDocRef(uid, item.id), normalizeAccount(item), { merge: true });
-    await Promise.all([
-      syncAccountCollection(uid, item.id, "trades", data.trades),
-      syncAccountCollection(uid, item.id, "skippedTrades", data.skippedTrades),
-      syncAccountCollection(uid, item.id, "weeklyReviews", data.weeklyReviews),
-      window.firestoreSetDoc(accountDataDocRef(uid, item.id, "options", "data"), clone(data.options), { merge: true }),
-      window.firestoreSetDoc(accountDataDocRef(uid, item.id, "settings", "data"), clone(data.settings), { merge: true })
-    ]);
-  }));
-  updateSyncStatus("synced");
-}
-
-function initRealtimeSync() {
-  if (!window.firebaseRtdb || !window.rtdbRef || !window.rtdbOnValue) return;
-  window.rtdbOnValue(window.rtdbRef(window.firebaseRtdb, ".info/connected"), (snapshot) => {
-    updateSyncStatus(snapshot.val() ? "synced" : "offline");
-  }, () => updateSyncStatus("offline"));
-}
-
-function initFirebaseAuth() {
-  if (firebaseReady || !window.initializeFirebaseServices) return;
-  firebaseReady = true;
-  if (!hasFirebaseConfig()) {
-    console.warn("Firebase config missing. Copy firebase-config.example.js to firebase-config.js and fill your project values.");
-    updateSyncStatus("offline");
-    showLoginScreen();
-    return;
-  }
   try {
-    window.initializeFirebaseServices(FIREBASE_CONFIG);
+    await Promise.all(accounts.map(async (account) => {
+      const accountId = account.id;
+      const hasAccountData = Object.prototype.hasOwnProperty.call(accountData, accountId);
+      await upsertAccountToSupabase(userId, normalizeAccount(account));
+      if (!hasAccountData) return;
+      const data = normalizeJournalState(accountData[accountId]);
+
+      await Promise.all([
+        syncSupabaseTable("trades", userId, accountId, data.trades, tradeToDbRow),
+        syncSupabaseTable("cash_transactions", userId, accountId, data.cashTransactions, (uid, accId, c) => ({
+          id: c.id, user_id: uid, account_id: accId,
+          date: c.date, type: c.type, amount: c.amount || null, note: c.note, created_at: c.createdAt
+        })),
+        syncSupabaseTable("skipped_trades", userId, accountId, data.skippedTrades, (uid, accId, s) => ({
+          id: s.id, user_id: uid, account_id: accId,
+          date: s.date, session: s.session, level: s.level, tf: s.tf,
+          direction: s.direction, skip_reason: s.skipReason, confidence: s.confidence,
+          notes: s.notes, outcome: s.outcome, pips_missed: s.pipsMissed
+        })),
+        syncSupabaseTable("weekly_reviews", userId, accountId, data.weeklyReviews, (uid, accId, r) => ({
+          id: r.id, user_id: uid, account_id: accId,
+          week_of: r.weekOf, learned: r.learned, pattern: r.pattern, improve: r.improve, created_at: r.createdAt
+        })),
+        (async () => {
+          const { error } = await supabaseClient.from("journal_meta").upsert({
+            id: accountId,
+            user_id: userId,
+            account_id: accountId,
+            options: data.options,
+            settings: data.settings,
+            updated_at: new Date().toISOString()
+          }, { onConflict: "id" });
+          if (error) throw error;
+        })()
+      ]);
+    }));
+
+    updateSyncStatus("synced");
   } catch (error) {
-    console.warn("Firebase initialization failed", error);
+    console.warn("Could not save to Supabase", error);
+    updateSyncStatus("offline");
+    if (!quiet) toast("Cloud sync failed. Data is saved locally.");
+  }
+}
+
+async function deleteTradeFromSupabase(tradeId) {
+  if (!supabaseClient || !currentUser || !tradeId) return;
+  const { error } = await supabaseClient
+    .from("trades")
+    .delete()
+    .eq("id", tradeId)
+    .eq("user_id", currentUser.id);
+  if (error) console.warn("Could not delete trade from Supabase:", error);
+}
+
+async function deleteSkippedFromSupabase(tradeId) {
+  if (!supabaseClient || !currentUser || !tradeId) return;
+  const { error } = await supabaseClient
+    .from("skipped_trades")
+    .delete()
+    .eq("id", tradeId)
+    .eq("user_id", currentUser.id);
+  if (error) console.warn("Could not delete skipped trade from Supabase:", error);
+}
+
+async function deleteCashFromSupabase(cashId) {
+  if (!supabaseClient || !currentUser || !cashId) return;
+  const { error } = await supabaseClient
+    .from("cash_transactions")
+    .delete()
+    .eq("id", cashId)
+    .eq("user_id", currentUser.id);
+  if (error) console.warn("Could not delete cash transaction from Supabase:", error);
+}
+
+async function deleteReviewFromSupabase(reviewId) {
+  if (!supabaseClient || !currentUser || !reviewId) return;
+  const { error } = await supabaseClient
+    .from("weekly_reviews")
+    .delete()
+    .eq("id", reviewId)
+    .eq("user_id", currentUser.id);
+  if (error) console.warn("Could not delete review from Supabase:", error);
+}
+
+async function upsertAccountToSupabase(userId, account) {
+  if (!supabaseClient) return;
+  const { error } = await supabaseClient.from("accounts").upsert({
+    id: account.id,
+    user_id: userId,
+    name: account.name,
+    created_at: account.createdAt,
+    updated_at: new Date().toISOString()
+  }, { onConflict: "id" });
+  if (error) throw error;
+}
+
+async function deleteRowFromSupabase(table, id) {
+  if (!supabaseClient || !currentUser) return;
+  const { error } = await supabaseClient.from(table).delete().eq("id", id).eq("user_id", currentUser.id);
+  if (error) console.warn(`Could not delete from ${table}:`, error);
+}
+
+async function clearAccountFromSupabase(userId, accountId) {
+  if (!supabaseClient) return;
+  await Promise.all([
+    supabaseClient.from("trades").delete().eq("user_id", userId).eq("account_id", accountId),
+    supabaseClient.from("cash_transactions").delete().eq("user_id", userId).eq("account_id", accountId),
+    supabaseClient.from("skipped_trades").delete().eq("user_id", userId).eq("account_id", accountId),
+    supabaseClient.from("weekly_reviews").delete().eq("user_id", userId).eq("account_id", accountId),
+    supabaseClient.from("journal_meta").delete().eq("user_id", userId).eq("account_id", accountId)
+  ]);
+}
+
+function clearStaleLocalDataIfOwnerMismatch(userId) {
+  try {
+    const raw = localStorage.getItem(ACCOUNTS_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.ownerUid && parsed.ownerUid !== userId) {
+      // Different user's data is in localStorage â€” wipe it
+      localStorage.removeItem(ACCOUNTS_KEY);
+      localStorage.removeItem(KEY);
+      localStorage.removeItem(SKIPPED_KEY);
+      accounts = [defaultAccount()];
+      accountData = {};
+      activeAccountId = DEFAULT_ACCOUNT_ID;
+      state = emptyJournalState(userId);
+      console.warn("Cleared stale local data from previous user session.");
+    }
+  } catch (error) {
+    console.warn("Could not check local data ownership", error);
+  }
+}
+
+function initSupabaseAuth() {
+  if (!initSupabase()) {
     updateSyncStatus("offline");
     showLoginScreen();
     return;
   }
-  if (!window.firebaseAuth || !window.onAuthStateChanged) return;
-  window.onAuthStateChanged(window.firebaseAuth, async (user) => {
-    currentUser = user || null;
+  supabaseReady = true;
+
+  supabaseClient.auth.onAuthStateChange(async (event, session) => {
+    const user = session?.user || null;
+    currentUser = user;
     updateUserRow(user);
+
     if (!user) {
-      firestoreLoadComplete = false;
+      authLoadToken += 1;
       showLoginScreen();
       updateSyncStatus("offline");
       return;
     }
+
+    clearStaleLocalDataIfOwnerMismatch(user.id);
+
+    if (event !== "INITIAL_SESSION" && event !== "SIGNED_IN") {
+      return;
+    }
+
     hideLoginScreen();
     loadState();
-    state.ownerUid = user.uid;
+    state.ownerUid = user.id;
     renderCurrentAccount();
-    initRealtimeSync();
-    await loadFromFirestore(user.uid);
-    firestoreLoadComplete = true;
+    updateSyncStatus("syncing");
+    await loadFromSupabase(user.id);
+    updateSyncStatus("synced");
+  });
+
+  supabaseClient.auth.getSession().then(({ data: { session } }) => {
+    if (!session) {
+      showLoginScreen();
+      updateSyncStatus("offline");
+    }
   });
 }
 
 function switchTab(name, button) {
+  destroyAllCharts();
+  clearTimeout(analysisTimer);
+  analysisTimer = null;
   document.querySelectorAll(".nav-btn, .bottom-nav-btn").forEach((btn) => btn.classList.toggle("active", btn.dataset.tab === name));
   document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.remove("active"));
   document.getElementById(`tab-${name}`)?.classList.add("active");
@@ -3304,9 +4513,332 @@ function switchTab(name, button) {
   if (name === "analysis") renderAnalysisWithDelay();
   if (name === "pnl") renderPnl();
   if (name === "weekly") renderWeeklyReviews();
+  if (name === "mentor") renderAiMentor();
   if (name === "manage") renderManage();
   closeMobileMenu();
   refreshIcons();
+}
+
+function renderAiMentor() {
+  const keyInput = document.getElementById("mentor-api-key");
+  const modelInput = document.getElementById("mentor-model");
+  const keyStatus = document.getElementById("mentor-key-status");
+  const scope = document.getElementById("mentor-scope");
+  const savedKey = sessionStorage.getItem(MENTOR_KEY) || "";
+  if (keyInput && !keyInput.value) keyInput.value = savedKey;
+  if (modelInput) modelInput.value = DEFAULT_MENTOR_MODEL;
+  if (keyStatus) keyStatus.textContent = savedKey ? "saved for this session" : "not saved";
+  if (scope) scope.textContent = `${activeAccount().name} - ${state.trades.length} trades, ${state.skippedTrades.length} missed`;
+  refreshIcons();
+}
+
+function saveMentorSettings() {
+  const key = document.getElementById("mentor-api-key")?.value.trim() || "";
+  if (key) sessionStorage.setItem(MENTOR_KEY, key);
+  sessionStorage.setItem(MENTOR_MODEL_KEY, DEFAULT_MENTOR_MODEL);
+  renderAiMentor();
+  toast(key ? "AI Mentor key saved for this session only." : "Add API key to analyze.");
+}
+
+function clearMentorSettings() {
+  sessionStorage.removeItem(MENTOR_KEY);
+  sessionStorage.removeItem(MENTOR_MODEL_KEY);
+  const keyInput = document.getElementById("mentor-api-key");
+  const modelInput = document.getElementById("mentor-model");
+  if (keyInput) keyInput.value = "";
+  if (modelInput) modelInput.value = DEFAULT_MENTOR_MODEL;
+  renderAiMentor();
+  toast("AI Mentor key cleared.");
+}
+
+function mentorTradeSnapshot() {
+  recalcCum();
+  const closed = state.trades.filter((trade) => trade.result);
+  const p = performance();
+  const recentTrades = state.trades.slice(-60).map((trade, index) => ({
+    no: state.trades.length - Math.min(state.trades.length, 60) + index + 1,
+    date: trade.date,
+    session: trade.session,
+    side: trade.entry,
+    level: trade.level,
+    tf: trade.tf,
+    setup: trade.setup,
+    result: trade.result || "OPEN",
+    risk: trade.risk,
+    reward: trade.reward,
+    rr: calcRR(trade.risk, trade.reward),
+    pnl: trade.pnl,
+    mistake: trade.mistake,
+    hold: trade.hold,
+    marketCondition: trade.marketCondition,
+    biasAlignment: trade.biasAlignment,
+    confirmationType: trade.confirmationType,
+    slPlacement: trade.slTpPlacement,
+    tpPlacement: trade.tpPlacement,
+    patienceScore: trade.patienceScore,
+    notes: trade.reason
+  }));
+  const missedTrades = state.skippedTrades.slice(-40).map((trade, index) => ({
+    no: state.skippedTrades.length - Math.min(state.skippedTrades.length, 40) + index + 1,
+    date: trade.date,
+    session: trade.session,
+    level: trade.level,
+    tf: trade.tf,
+    direction: trade.direction,
+    skipReason: trade.skipReason,
+    confidence: trade.confidence,
+    outcome: trade.outcome,
+    pipsMissed: trade.pipsMissed,
+    notes: trade.notes
+  }));
+  return {
+    account: activeAccount().name,
+    generatedAt: new Date().toISOString(),
+    summary: {
+      totalTrades: state.trades.length,
+      closedTrades: closed.length,
+      wins: p.wins.length,
+      losses: p.losses.length,
+      breakeven: p.bes.length,
+      winRate: `${p.winRate.toFixed(1)}%`,
+      totalPnl: p.totalPnl,
+      profitFactor: +p.profitFactor.toFixed(2),
+      expectancy: +p.expectancy.toFixed(1),
+      maxDrawdown: p.maxDrawdown,
+      missedTrades: state.skippedTrades.length,
+      ...accountBalanceSummary(),
+      cashEntries: (state.cashTransactions || []).length
+    },
+    cashTransactions: (state.cashTransactions || []).slice(-20),
+    recentTrades,
+    missedTrades
+  };
+}
+
+function mentorPrompt(snapshot) {
+  return [
+    "You are a brutally honest trading mentor for an XAUUSD discretionary trader.",
+    "Analyze ONLY the provided journal JSON data. Be eye-opening, direct, practical, and specific. Do not flatter, motivate, or write generic advice.",
+    "Use Roman Urdu or simple English only. If the trader's pattern is weak, say it clearly. If data is limited, say exactly what cannot be judged yet.",
+    "",
+    "Perform a deep analysis across ALL of the following areas:",
+    "",
+    "SECTION 1 â€” BEHAVIORAL & PSYCHOLOGICAL ANALYSIS:",
+    "- Revenge Trading Detection: Look for clusters of rapid trades immediately after a LOSS (same day, 2+ trades after loss). Flag if this pattern exists with specific dates/examples.",
+    "- FOMO Detection: Identify trades where patienceScore <= 2 AND mistake field contains \"FOMO trade\" or \"Early entry\". Calculate % of total trades these represent.",
+    "- Over-Trading Detection: Find days/sessions with 3+ trades and check if those days have lower win rate than average. Report the correlation.",
+    "- Discipline Score per week: Calculate (trades with patienceScore >= 4 + trades with mistake=\"No mistake\") / total trades * 100. Give a letter grade A-F.",
+    "",
+    "SECTION 2 â€” RISK & TRADE MANAGEMENT:",
+    "- Leaving Money On Table: Check hold quality field. Count trades where hold=\"Early exit\" vs \"Held full TP\". Calculate pip difference. Report: \"You cut X trades early, potentially missing Y pips total.\"",
+    "- Holding Losers: Look for LOSS trades and note reason/notes field for patterns like \"moved SL\", \"held too long\", \"hope\".",
+    "- SL/TP Placement Analysis: Group trades by slTpPlacement field. Which placement type has highest win rate? Report with numbers.",
+    "- Risk Consistency: Calculate standard deviation of risk field across all trades. High deviation = inconsistent sizing. Flag if >50% variance.",
+    "",
+    "SECTION 3 â€” BLIND SPOTS & ENVIRONMENT:",
+    "- Market Condition: Group by marketCondition field. Which condition has highest/lowest win rate? Should trader avoid any condition?",
+    "- Day of Week: Extract weekday from trade.date. Which day is most profitable? Which day should trader avoid?",
+    "- Session Performance: Group by session field. Best and worst session with exact win rates and total P&L per session.",
+    "- Level Performance: Group by level field. Best and worst level. Minimum 3 trades to qualify for recommendation.",
+    "- TF Performance: Group by tf field. Best TF by win rate.",
+    "",
+    "SECTION 4 â€” NLP ON NOTES:",
+    "- Scan all trade.reason (notes) fields for emotional words: \"anxious\", \"fear\", \"rushed\", \"confident\", \"missed\", \"revenge\", \"hope\", \"frustrated\", \"excited\", \"doubt\".",
+    "- Correlate presence of negative words with LOSS trades. Report: \"Trades with negative emotional language: X% win rate vs trades without: Y% win rate.\"",
+    "- Extract most common setup descriptions from notes.",
+    "",
+    "SECTION 5 â€” GENERATIVE COACHING OUTPUT:",
+    "Return EXACTLY this structure with these exact ## headers (no extra sections, no missing sections):",
+    "",
+    "## TRADING REPORT CARD",
+    "Overall Grade: [A/B/C/D/F]",
+    "Explanation: [2 sentences]",
+    "",
+    "## BRUTAL TRUTH",
+    "[What is really happening, no sugarcoating, evidence-based]",
+    "",
+    "## BEHAVIORAL ALERTS",
+    "- Revenge Trading: [detected/not detected, with evidence]",
+    "- FOMO Score: [X% of trades show FOMO behavior]",
+    "- Over-trading: [detected/not detected]",
+    "- Discipline Score: [X% â€” Grade B]",
+    "",
+    "## WHAT IS WORKING",
+    "[Specific levels, sessions, confirmations that actually profit]",
+    "",
+    "## WHAT IS COSTING MONEY",
+    "[Top 3 specific mistakes with pip cost estimate]",
+    "",
+    "## BLIND SPOT REPORT",
+    "[Session to avoid, day to avoid, market condition to avoid]",
+    "",
+    "## MISSED TRADE LESSON",
+    "[Analysis of skipped trades vs actual trades]",
+    "",
+    "## NEXT 5-TRADE RULES",
+    "1. [Specific, numbered, actionable rules only]",
+    "2.",
+    "3.",
+    "4.",
+    "5.",
+    "",
+    "## STOP IMMEDIATELY",
+    "[One behavior to stop, with evidence from journal]",
+    "",
+    "## REPEAT IMMEDIATELY",
+    "[One thing working that must be repeated]",
+    "",
+    "## WEEKEND HOMEWORK",
+    "[3 specific actionable tasks for next week based on data]",
+    "",
+    "Journal data JSON:",
+    JSON.stringify(snapshot)
+  ].join("\n");
+}
+
+function formatMentorInline(text) {
+  return escapeHtml(text || "")
+    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+}
+
+function formatMentorBlock(body) {
+  const trimmed = (body || "").trim();
+  if (!trimmed) return "";
+  const blocks = trimmed.split(/\n{2,}/);
+  return blocks.map((block) => {
+    const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (!lines.length) return "";
+    const isOrdered = lines.every((line) => /^\d+\.\s/.test(line));
+    const isBulleted = lines.every((line) => /^[-*]\s/.test(line));
+    if (isOrdered) {
+      return `<ol>${lines.map((line) => `<li>${formatMentorInline(line.replace(/^\d+\.\s*/, ""))}</li>`).join("")}</ol>`;
+    }
+    if (isBulleted) {
+      return `<ul>${lines.map((line) => `<li>${formatMentorInline(line.replace(/^[-*]\s*/, ""))}</li>`).join("")}</ul>`;
+    }
+    if (lines.length > 1 && lines.some((line) => /^[-*]\s/.test(line))) {
+      const parts = [];
+      let bulletBuffer = [];
+      const flushBullets = () => {
+        if (bulletBuffer.length) {
+          parts.push(`<ul>${bulletBuffer.map((item) => `<li>${item}</li>`).join("")}</ul>`);
+          bulletBuffer = [];
+        }
+      };
+      lines.forEach((line) => {
+        if (/^[-*]\s/.test(line)) {
+          bulletBuffer.push(formatMentorInline(line.replace(/^[-*]\s*/, "")));
+        } else {
+          flushBullets();
+          parts.push(`<p>${formatMentorInline(line)}</p>`);
+        }
+      });
+      flushBullets();
+      return parts.join("");
+    }
+    return `<p>${formatMentorInline(lines.join("<br>"))}</p>`;
+  }).join("");
+}
+
+function renderMentorMarkdown(text) {
+  const raw = (text || "").trim();
+  if (!raw) return "";
+  if (!/^##\s+/m.test(raw)) {
+    return `<section class="mentor-section-card"><div class="mentor-section-body">${formatMentorBlock(raw)}</div></section>`;
+  }
+  return raw.split(/\n(?=##\s+)/).map((section) => {
+    const cleaned = section.replace(/^##\s+/, "").trim();
+    const newline = cleaned.indexOf("\n");
+    const title = (newline === -1 ? cleaned : cleaned.slice(0, newline)).trim().toUpperCase();
+    const body = newline === -1 ? "" : cleaned.slice(newline + 1);
+    const icon = MENTOR_SECTION_ICONS[title] || "ðŸ“Š";
+    return `
+      <section class="mentor-section-card">
+        <header class="mentor-section-head">
+          <span class="mentor-section-icon" aria-hidden="true">${icon}</span>
+          <h3>${escapeHtml(title)}</h3>
+        </header>
+        <div class="mentor-section-body">${formatMentorBlock(body)}</div>
+      </section>
+    `;
+  }).join("");
+}
+
+async function runAiMentorReview() {
+  if (mentorRequestInProgress) {
+    toast("Analysis already running. Please wait.");
+    return;
+  }
+  const now = Date.now();
+  if (now - lastMentorRequestTime < MENTOR_COOLDOWN_MS) {
+    const remaining = Math.ceil((MENTOR_COOLDOWN_MS - (now - lastMentorRequestTime)) / 1000);
+    toast(`Wait ${remaining}s before running another analysis.`);
+    return;
+  }
+  mentorRequestInProgress = true;
+  lastMentorRequestTime = now;
+
+  const output = document.getElementById("mentor-output");
+  const keyInput = document.getElementById("mentor-api-key");
+  const key = (keyInput?.value || sessionStorage.getItem(MENTOR_KEY) || "").trim();
+  const model = DEFAULT_MENTOR_MODEL;
+  if (!output) {
+    mentorRequestInProgress = false;
+    return;
+  }
+  if (!key) {
+    toast("Add your OpenRouter API key first.");
+    output.innerHTML = `<div class="empty-state compact-empty"><div><strong>API key required</strong><span>Paste your OpenRouter key and save it locally.</span></div></div>`;
+    mentorRequestInProgress = false;
+    return;
+  }
+  if (!state.trades.length && !state.skippedTrades.length) {
+    toast("No journal data to analyze.");
+    output.innerHTML = `<div class="empty-state compact-empty"><div><strong>No trades yet</strong><span>Log trades or missed trades first.</span></div></div>`;
+    mentorRequestInProgress = false;
+    return;
+  }
+  sessionStorage.setItem(MENTOR_KEY, key);
+  sessionStorage.setItem(MENTOR_MODEL_KEY, DEFAULT_MENTOR_MODEL);
+  renderAiMentor();
+  output.innerHTML = `<div class="mentor-loading"><span class="upload-spinner"></span><b>Analyzing journal...</b></div>`;
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${key}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": location.origin,
+        "X-OpenRouter-Title": "Gold Trading Journal"
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: "You are a strict XAUUSD trading mentor. Respond only in Roman Urdu or simple English. Be brutally honest, evidence-based, practical, and concise." },
+          { role: "user", content: mentorPrompt(mentorTradeSnapshot()) }
+        ],
+        temperature: 0.35,
+        max_tokens: 2500
+      })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data?.error?.message || `OpenRouter request failed (${response.status})`);
+    }
+    const content = data?.choices?.[0]?.message?.content || "";
+    const scope = document.getElementById("mentor-scope");
+    if (scope) scope.textContent = `model: ${data?.model || model}`;
+    const rawHtml = `<article class="mentor-review">${renderMentorMarkdown(content)}</article>`;
+    output.innerHTML = typeof DOMPurify !== "undefined"
+      ? DOMPurify.sanitize(rawHtml, { ALLOWED_TAGS: ["article", "section", "header", "h3", "div", "p", "ul", "ol", "li", "strong", "em", "b", "span", "br"], ALLOWED_ATTR: ["class", "aria-label", "aria-hidden"] })
+      : rawHtml;
+  } catch (error) {
+    console.warn("AI Mentor request failed", error);
+    output.innerHTML = `<div class="empty-state compact-empty"><div><strong>AI review failed</strong><span>${escapeHtml(error.message || "Check your key, model, or network.")}</span></div></div>`;
+    toast("AI Mentor request failed.");
+  } finally {
+    mentorRequestInProgress = false;
+  }
 }
 
 function exportRows() {
@@ -3362,13 +4894,13 @@ function skippedExportRows(trades = state.skippedTrades) {
 function exportCSV() {
   const { headers, rows } = exportRows();
   const csv = [headers, ...rows].map((row) => row.map((value) => `"${String(value ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
-  download(`data:text/csv;charset=utf-8,\uFEFF${encodeURIComponent(csv)}`, "Gold_Journal.csv");
+  downloadText(csv, "Gold_Journal.csv");
 }
 
 function exportSkippedCSV() {
   const { headers, rows } = skippedExportRows(filteredSkippedTrades().map(({ trade }) => trade));
   const csv = [headers, ...rows].map((row) => row.map((value) => `"${String(value ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
-  download(`data:text/csv;charset=utf-8,\uFEFF${encodeURIComponent(csv)}`, "Skipped_Trades.csv");
+  downloadText(csv, "Skipped_Trades.csv");
   toast("Skipped trades CSV downloaded.");
 }
 
@@ -3399,6 +4931,9 @@ function exportExcel() {
   const p = performance();
   const summary = [
     ["Metric", "Value"],
+    ["Account Balance", +accountBalanceSummary().currentBalance.toFixed(1)],
+    ["Total Deposits", +accountBalanceSummary().deposits.toFixed(1)],
+    ["Total Withdrawals", +accountBalanceSummary().withdrawals.toFixed(1)],
     ["Closed Trades", p.closed.length],
     ["Wins", p.wins.length],
     ["Losses", p.losses.length],
@@ -3412,6 +4947,19 @@ function exportExcel() {
   const wsSummary = XLSX.utils.aoa_to_sheet(summary);
   wsSummary["!cols"] = [{ wch: 22 }, { wch: 16 }];
   XLSX.utils.book_append_sheet(wb, wsSummary, "Summary");
+
+  const cashSheet = [
+    ["Date", "Type", "Amount", "Note"],
+    ...(state.cashTransactions || []).map((entry) => [
+      formatDateDisplay(entry.date),
+      entry.type,
+      +entry.amount,
+      entry.note || ""
+    ])
+  ];
+  const wsCash = XLSX.utils.aoa_to_sheet(cashSheet);
+  wsCash["!cols"] = [{ wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 42 }];
+  XLSX.utils.book_append_sheet(wb, wsCash, "Cash Flow");
 
   const comboRows = comboAnalysisRows();
   const comboSheet = [
@@ -3453,7 +5001,7 @@ function exportExcel() {
 }
 
 function preloadReportImages(report) {
-  const images = Array.from(report.querySelectorAll(".r-screenshot-card img"));
+  const images = Array.from(report.querySelectorAll(".r-card-image"));
   if (!images.length) return Promise.resolve();
   return Promise.all(images.map((img) => new Promise((resolve) => {
     if (img.complete && img.naturalWidth > 0) {
@@ -3484,11 +5032,13 @@ async function exportPDF() {
   }, 700);
 }
 
-function download(url, filename) {
+function downloadText(text, filename) {
   const a = document.createElement("a");
-  a.href = url;
   a.download = filename;
+  a.href = URL.createObjectURL(new Blob(["\uFEFF", text], { type: "text/csv;charset=utf-8" }));
+  a.rel = "noopener noreferrer";
   a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 function seedDemoTrades() {
@@ -3535,6 +5085,7 @@ if (typeof document !== "undefined") {
   updateSyncStatus("syncing");
   refreshIcons();
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !document.getElementById("cash-modal")?.hidden) closeCashModal();
     if (event.key === "Escape" && !document.getElementById("trade-modal")?.hidden) closeTradeModal();
     if (event.key === "Escape" && !document.getElementById("view-trade-modal")?.hidden) closeViewTradeModal();
     if (event.key === "Escape" && !document.getElementById("skipped-modal")?.hidden) closeSkippedModal();
@@ -3547,6 +5098,9 @@ if (typeof document !== "undefined") {
   });
   document.getElementById("skipped-modal")?.addEventListener("click", (event) => {
     if (event.target.id === "skipped-modal") closeSkippedModal();
+  });
+  document.getElementById("cash-modal")?.addEventListener("click", (event) => {
+    if (event.target.id === "cash-modal") closeCashModal();
   });
   document.getElementById("modal-screenshot-input")?.addEventListener("change", (event) => {
     handleScreenshotFile(event.target.files?.[0]);
@@ -3572,6 +5126,7 @@ if (typeof document !== "undefined") {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch((error) => console.warn("Service worker registration failed", error));
   }
-  window.addEventListener("firebase-sdk-ready", initFirebaseAuth);
-  if (window.initializeFirebaseServices) initFirebaseAuth();
+  initSupabaseAuth();
 }
+
+
