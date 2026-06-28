@@ -18,22 +18,38 @@
       const status = document.querySelector("p");
       const config = window.SUPABASE_CONFIG;
       if (!config || !config.url || !config.anonKey) {
-        status.textContent = "Config error. Copy .env.example to .env and run: node scripts/generate-config.js";
+        status.textContent = "Config error. Set SUPABASE_URL and SUPABASE_ANON_KEY.";
         return;
       }
-      const code = new URLSearchParams(window.location.search).get("code");
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get("code");
+      const authError = params.get("error_description") || params.get("error");
+      if (authError) {
+        status.textContent = "Sign-in failed: " + decodeURIComponent(authError.replace(/\+/g, " "));
+        return;
+      }
       if (!code) {
         status.textContent = "Sign-in failed: missing authorization code.";
         return;
       }
       const client = window.supabase.createClient(config.url, config.anonKey, {
-        auth: { detectSessionInUrl: true, persistSession: true, flowType: "pkce" }
+        auth: {
+          detectSessionInUrl: true,
+          persistSession: true,
+          autoRefreshToken: true,
+          flowType: "pkce",
+          storage: {
+            getItem: (key) => sessionStorage.getItem(key),
+            setItem: (key, value) => sessionStorage.setItem(key, value),
+            removeItem: (key) => sessionStorage.removeItem(key)
+          }
+        }
       });
       const { error } = await client.auth.exchangeCodeForSession(code);
       if (error) {
         status.textContent = "Sign-in failed: " + error.message;
       } else {
-        window.location.replace("../../");
+        window.location.replace("/");
       }
     })();
   </script>

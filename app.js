@@ -13,7 +13,12 @@ const SUPABASE_AUTH_OPTIONS = {
     detectSessionInUrl: true,
     persistSession: true,
     autoRefreshToken: true,
-    flowType: "pkce"
+    flowType: "pkce",
+    storage: {
+      getItem: (key) => sessionStorage.getItem(key),
+      setItem: (key, value) => sessionStorage.setItem(key, value),
+      removeItem: (key) => sessionStorage.removeItem(key)
+    }
   }
 };
 
@@ -42,12 +47,12 @@ function initSupabase() {
 
 const MAX_SCREENSHOT_SIZE = 5 * 1024 * 1024;
 
-const KEY = "xau_journal_v6";
-const LEGACY_KEY = "xau_journal_v5";
-const SKIPPED_KEY = "skippedTrades";
-const ACCOUNTS_KEY = "xau_journal_accounts_v1";
-const MENTOR_KEY = "xau_journal_openrouter_key";
-const MENTOR_MODEL_KEY = "xau_journal_openrouter_model";
+const LEGACY_JOURNAL_KEYS = [
+  "xau_journal_v6",
+  "xau_journal_v5",
+  "skippedTrades",
+  "xau_journal_accounts_v1"
+];
 const DEFAULT_ACCOUNT_ID = "main";
 const DEFAULT_MENTOR_MODEL = "openrouter/auto";
 
@@ -117,6 +122,7 @@ let viewTradeIndex = null;
 let analysisTimer = null;
 let currentUser = null;
 let screenshotUploadToken = 0;
+let mentorSessionKey = "";
 
 let mentorRequestInProgress = false;
 let lastMentorRequestTime = 0;
@@ -237,102 +243,44 @@ function mergeOptions(baseOptions = {}, incomingOptions = {}) {
   return normalizeOptions(merged);
 }
 
-function loadState() {
-  const accountStore = loadAccountStore();
-  if (accountStore) {
-    accounts = accountStore.accounts;
-    accountData = accountStore.data;
-    activeAccountId = accountStore.activeAccountId;
-    ensureAccountState();
-    return;
-  }
-
-  const savedSkippedTrades = loadSkippedTradesFromLocal();
-  const raw = localStorage.getItem(KEY) || localStorage.getItem(LEGACY_KEY);
-  accounts = [defaultAccount()];
-  accountData = {};
-  activeAccountId = DEFAULT_ACCOUNT_ID;
-  if (!raw) {
-    state = emptyJournalState();
-    state.skippedTrades = savedSkippedTrades;
-    accountData[activeAccountId] = clone(state);
-    persistLocalState();
-    return;
-  }
+function purgeLegacyJournalStorage() {
   try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.trades)) {
-      state = emptyJournalState();
-      state.skippedTrades = savedSkippedTrades;
-      accountData[activeAccountId] = clone(state);
-      persistLocalState();
-      return;
-    }
-    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.id) {
-      state = emptyJournalState(currentUser.id);
-      accountData[activeAccountId] = clone(state);
-      persistLocalState();
-      return;
-    }
-    state = normalizeJournalState({
-      ...parsed,
-      skippedTrades: savedSkippedTrades.length ? savedSkippedTrades : parsed.skippedTrades
+    LEGACY_JOURNAL_KEYS.forEach((key) => localStorage.removeItem(key));
+    Object.keys(localStorage).forEach((key) => {
+      if (!key.startsWith("sb-")) return;
+      const value = localStorage.getItem(key);
+      if (value) sessionStorage.setItem(key, value);
+      localStorage.removeItem(key);
     });
-    accountData[activeAccountId] = clone(state);
-    persistLocalState();
   } catch (error) {
-    console.warn("Could not load journal state", error);
+    console.warn("Could not purge legacy browser storage", error);
   }
 }
 
-function loadAccountStore() {
-  const raw = localStorage.getItem(ACCOUNTS_KEY);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.accounts) || !parsed.data) return null;
-    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.id) return null;
-    const normalizedAccounts = parsed.accounts.map(normalizeAccount).filter((account) => account.id);
-    const nextAccounts = normalizedAccounts.length ? normalizedAccounts : [defaultAccount()];
-    const nextData = {};
-    nextAccounts.forEach((account) => {
-      nextData[account.id] = normalizeJournalState(parsed.data[account.id] || {});
-    });
-    const selected = nextAccounts.some((account) => account.id === parsed.activeAccountId) ? parsed.activeAccountId : nextAccounts[0].id;
-    return { accounts: nextAccounts, data: nextData, activeAccountId: selected };
-  } catch (error) {
-    console.warn("Could not load account store", error);
-    return null;
-  }
-}
-
-function loadSkippedTradesFromLocal() {
-  const raw = localStorage.getItem(SKIPPED_KEY);
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.map(normalizeSkippedTrade) : [];
-  } catch (error) {
-    console.warn("Could not load skipped trades", error);
-    return [];
-  }
-}
-
-function persistLocalState() {
+function syncMemoryState() {
   if (currentUser) state.ownerUid = currentUser.id;
   state = normalizeJournalState(state);
   if (!accounts.length) accounts = [defaultAccount()];
   if (!accounts.some((account) => account.id === activeAccountId)) activeAccountId = accounts[0].id;
   accountData[activeAccountId] = clone(state);
-  const store = {
-    ownerUid: currentUser?.id || state.ownerUid || "",
-    activeAccountId,
-    accounts,
-    data: accountData
-  };
-  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(store));
-  localStorage.setItem(KEY, JSON.stringify(state));
-  localStorage.setItem(SKIPPED_KEY, JSON.stringify(state.skippedTrades));
+}
+
+function resetJournalState(ownerUid = "") {
+  accounts = [defaultAccount()];
+  accountData = {};
+  activeAccountId = DEFAULT_ACCOUNT_ID;
+  state = emptyJournalState(ownerUid);
+  accountData[activeAccountId] = clone(state);
+}
+
+function clearSessionAuthStorage() {
+  try {
+    Object.keys(sessionStorage).forEach((key) => {
+      if (key.startsWith("sb-")) sessionStorage.removeItem(key);
+    });
+  } catch (error) {
+    console.warn("Could not clear auth session storage", error);
+  }
 }
 
 function normalizeOptions(options) {
@@ -434,26 +382,23 @@ function normalizeWeeklyReview(review) {
 }
 
 async function save() {
-  // Guard: never save if no active account
   if (!activeAccountId || !accounts.some((a) => a.id === activeAccountId)) {
     console.warn("save() aborted: no valid active account.");
     return;
   }
-  try {
-    persistLocalState();
-    renderAccountSelector();
-  } catch (error) {
-    console.warn("Could not save local state", error);
+  syncMemoryState();
+  renderAccountSelector();
+  if (!currentUser || !supabaseReady) {
+    toast("Sign in to save your journal.");
     updateSyncStatus("offline");
+    return;
   }
-  if (currentUser && supabaseReady) {
-    try {
-      await saveToSupabase();
-    } catch (error) {
-      console.warn("Could not sync to Supabase", error);
-      updateSyncStatus("offline");
-      toast("Sync failed. Data saved locally.");
-    }
+  try {
+    await saveToSupabase();
+  } catch (error) {
+    console.warn("Could not sync to Supabase", error);
+    updateSyncStatus("offline");
+    toast("Sync failed. Check your connection and try again.");
   }
 }
 
@@ -765,7 +710,7 @@ async function addAccount() {
   state = emptyJournalState(currentUser?.id || "");
   accountData[activeAccountId] = clone(state);
   try {
-    persistLocalState();
+    syncMemoryState();
     if (currentUser && supabaseReady) await save();
   } catch (error) {
     console.warn("Could not save account", error);
@@ -782,7 +727,7 @@ async function renameAccount() {
   account.name = name;
   account.updatedAt = new Date().toISOString();
   try {
-    persistLocalState();
+    syncMemoryState();
     if (currentUser && supabaseReady) await save();
     renderCurrentAccount();
     toast("Account renamed.");
@@ -812,7 +757,7 @@ async function switchAccount(accountId) {
     await save();
     activeAccountId = accountId;
     state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState());
-    persistLocalState();
+    syncMemoryState();
     renderCurrentAccount();
     toast(`${nextAccount.name} loaded.`);
   } catch (error) {
@@ -3933,11 +3878,7 @@ async function clearAllTrades() {
     return;
   }
   state.trades = [];
-  try {
-    persistLocalState();
-  } catch (error) {
-    console.warn("Could not clear local trade cache", error);
-  }
+  syncMemoryState();
   renderTrades();
   if (document.getElementById("tab-analysis")?.classList.contains("active")) renderAnalysis();
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
@@ -3950,17 +3891,17 @@ async function clearAllTrades() {
         .eq("user_id", currentUser.id)
         .eq("account_id", activeAccountId);
       updateSyncStatus("synced");
-      toast("Trades cleared from device and Supabase.");
+      toast("Trades cleared from Supabase.");
       return;
     } catch (error) {
       console.warn("Could not clear Supabase trades", error);
       updateSyncStatus("offline");
-      toast("Local trades cleared. Supabase clear failed.");
+      toast("Could not clear trades from Supabase.");
       return;
     }
   }
 
-  toast("Selected account local trades cleared.");
+  toast("Sign in to clear trades.");
 }
 
 function openMobileMenu() {
@@ -3986,7 +3927,55 @@ function hideLoginScreen() {
 }
 
 function authRedirectUrl() {
-  return window.location.origin + "/auth/callback/";
+  return `${window.location.origin}/auth/callback`;
+}
+
+function cleanAuthQueryFromUrl() {
+  const url = new URL(window.location.href);
+  ["code", "state", "error", "error_description"].forEach((param) => url.searchParams.delete(param));
+  const search = url.searchParams.toString();
+  const next = `${url.pathname}${search ? `?${search}` : ""}${url.hash}`;
+  window.history.replaceState({}, document.title, next || "/");
+}
+
+async function completeOAuthReturn() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get("code");
+  const authError = params.get("error_description") || params.get("error");
+  if (authError) {
+    cleanAuthQueryFromUrl();
+    setAuthStatus(decodeURIComponent(authError.replace(/\+/g, " ")), "error");
+    return false;
+  }
+  if (!code) return false;
+  if (!supabaseClient && !initSupabase()) return false;
+  cleanAuthQueryFromUrl();
+  try {
+    const { error } = await supabaseClient.auth.exchangeCodeForSession(code);
+    if (error) {
+      setAuthStatus(supabaseAuthMessage(error), "error");
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error("OAuth callback failed", error);
+    setAuthStatus("Google sign-in failed.", "error");
+    return false;
+  }
+}
+
+async function removeLegacyServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((key) => caches.delete(key)));
+    }
+  } catch (error) {
+    console.warn("Could not remove legacy service worker", error);
+  }
 }
 
 function setAuthStatus(message = "", type = "") {
@@ -4245,19 +4234,10 @@ async function signOutUser() {
   } catch (error) {
     console.warn("Error during Supabase signout", error);
   }
-  // Clear all local states
-  try {
-    localStorage.removeItem(ACCOUNTS_KEY);
-    localStorage.removeItem(KEY);
-    localStorage.removeItem(SKIPPED_KEY);
-  } catch (err) {
-    console.warn("Could not clear local storage during signout", err);
-  }
-  accounts = [defaultAccount()];
-  accountData = {};
-  activeAccountId = DEFAULT_ACCOUNT_ID;
+  clearSessionAuthStorage();
+  mentorSessionKey = "";
   currentUser = null;
-  state = emptyJournalState("");
+  resetJournalState();
   renderCurrentAccount();
   showLoginScreen();
   updateSyncStatus("offline");
@@ -4334,7 +4314,7 @@ function updateSyncStatus(status) {
   const label = wrap.querySelector(".sync-label");
   if (!dot || !label) return;
   dot.className = `sync-dot ${status}`;
-  label.textContent = status === "synced" ? "Synced" : status === "syncing" ? "Syncing..." : "Offline - local only";
+  label.textContent = status === "synced" ? "Synced to Supabase" : status === "syncing" ? "Syncing..." : "Sign in required";
 }
 
 // =============================================
@@ -4357,27 +4337,17 @@ async function loadFromSupabase(userId) {
     if (loadToken !== authLoadToken) return false;
 
     if (!cloudAccounts || cloudAccounts.length === 0) {
-      if (!accounts.length) accounts = [defaultAccount()];
-      if (!accounts.some((a) => a.id === activeAccountId)) activeAccountId = accounts[0].id;
-
+      accounts = [defaultAccount()];
+      activeAccountId = accounts[0].id;
+      accountData = {};
       for (const account of accounts) {
+        accountData[account.id] = emptyJournalState(userId);
         await upsertAccountToSupabase(userId, account);
       }
       if (loadToken !== authLoadToken) return false;
 
-      accounts.forEach((account) => {
-        if (!accountData[account.id]) {
-          accountData[account.id] = emptyJournalState(userId);
-        } else {
-          accountData[account.id] = normalizeJournalState({
-            ...accountData[account.id],
-            ownerUid: userId
-          });
-        }
-      });
-
-      state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState(userId));
-      persistLocalState();
+      state = normalizeJournalState(accountData[activeAccountId]);
+      syncMemoryState();
       renderCurrentAccount();
       await saveToSupabase({ quiet: true });
       if (loadToken !== authLoadToken) return false;
@@ -4404,7 +4374,7 @@ async function loadFromSupabase(userId) {
     }
 
     state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState(userId));
-    persistLocalState();
+    syncMemoryState();
     renderCurrentAccount();
     updateSyncStatus("synced");
     return true;
@@ -4412,7 +4382,7 @@ async function loadFromSupabase(userId) {
     console.warn("Could not load from Supabase", error);
     if (loadToken === authLoadToken) {
       updateSyncStatus("offline");
-      toast("Sync failed. Working offline with local data.");
+      toast("Could not load journal from Supabase.");
     }
     return false;
   }
@@ -4566,11 +4536,7 @@ async function saveToSupabase(options = {}) {
   state.ownerUid = userId;
   if (!accounts.length) accounts = [defaultAccount()];
 
-  try {
-    persistLocalState();
-  } catch (error) {
-    console.warn("Could not refresh local cache", error);
-  }
+  syncMemoryState();
 
   try {
     await Promise.all(accounts.map(async (account) => {
@@ -4614,7 +4580,7 @@ async function saveToSupabase(options = {}) {
   } catch (error) {
     console.warn("Could not save to Supabase", error);
     updateSyncStatus("offline");
-    if (!quiet) toast("Cloud sync failed. Data is saved locally.");
+    if (!quiet) toast("Cloud sync failed. Try again.");
   }
 }
 
@@ -4687,27 +4653,6 @@ async function clearAccountFromSupabase(userId, accountId) {
   ]);
 }
 
-function clearStaleLocalDataIfOwnerMismatch(userId) {
-  try {
-    const raw = localStorage.getItem(ACCOUNTS_KEY);
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
-    if (parsed && parsed.ownerUid && parsed.ownerUid !== userId) {
-      // Different user's data is in localStorage â€” wipe it
-      localStorage.removeItem(ACCOUNTS_KEY);
-      localStorage.removeItem(KEY);
-      localStorage.removeItem(SKIPPED_KEY);
-      accounts = [defaultAccount()];
-      accountData = {};
-      activeAccountId = DEFAULT_ACCOUNT_ID;
-      state = emptyJournalState(userId);
-      console.warn("Cleared stale local data from previous user session.");
-    }
-  } catch (error) {
-    console.warn("Could not check local data ownership", error);
-  }
-}
-
 function initSupabaseAuth() {
   if (!initSupabase()) {
     updateSyncStatus("offline");
@@ -4725,12 +4670,12 @@ function initSupabaseAuth() {
     if (!user) {
       authLoadToken += 1;
       setAuthBusy(false);
+      resetJournalState();
+      renderCurrentAccount();
       showLoginScreen();
       updateSyncStatus("offline");
       return;
     }
-
-    clearStaleLocalDataIfOwnerMismatch(user.id);
 
     if (event !== "INITIAL_SESSION" && event !== "SIGNED_IN") {
       return;
@@ -4738,12 +4683,14 @@ function initSupabaseAuth() {
 
     hideLoginScreen();
     setAuthBusy(false);
-    loadState();
-    state.ownerUid = user.id;
-    renderCurrentAccount();
+    resetJournalState(user.id);
     updateSyncStatus("syncing");
     await loadFromSupabase(user.id);
     updateSyncStatus("synced");
+  });
+
+  completeOAuthReturn().catch((error) => {
+    console.warn("OAuth return handling failed", error);
   });
 
   supabaseClient.auth.getSession().then(({ data: { session } }) => {
@@ -4776,25 +4723,23 @@ function renderAiMentor() {
   const modelInput = document.getElementById("mentor-model");
   const keyStatus = document.getElementById("mentor-key-status");
   const scope = document.getElementById("mentor-scope");
-  const savedKey = sessionStorage.getItem(MENTOR_KEY) || "";
+  const savedKey = mentorSessionKey || "";
   if (keyInput && !keyInput.value) keyInput.value = savedKey;
   if (modelInput) modelInput.value = DEFAULT_MENTOR_MODEL;
-  if (keyStatus) keyStatus.textContent = savedKey ? "saved for this session" : "not saved";
+  if (keyStatus) keyStatus.textContent = savedKey ? "ready for this tab" : "not saved";
   if (scope) scope.textContent = `${activeAccount().name} - ${state.trades.length} trades, ${state.skippedTrades.length} missed`;
   refreshIcons();
 }
 
 function saveMentorSettings() {
   const key = document.getElementById("mentor-api-key")?.value.trim() || "";
-  if (key) sessionStorage.setItem(MENTOR_KEY, key);
-  sessionStorage.setItem(MENTOR_MODEL_KEY, DEFAULT_MENTOR_MODEL);
+  mentorSessionKey = key;
   renderAiMentor();
-  toast(key ? "AI Mentor key saved for this session only." : "Add API key to analyze.");
+  toast(key ? "AI Mentor key ready for this tab only." : "Add API key to analyze.");
 }
 
 function clearMentorSettings() {
-  sessionStorage.removeItem(MENTOR_KEY);
-  sessionStorage.removeItem(MENTOR_MODEL_KEY);
+  mentorSessionKey = "";
   const keyInput = document.getElementById("mentor-api-key");
   const modelInput = document.getElementById("mentor-model");
   if (keyInput) keyInput.value = "";
@@ -5032,7 +4977,7 @@ async function runAiMentorReview() {
 
   const output = document.getElementById("mentor-output");
   const keyInput = document.getElementById("mentor-api-key");
-  const key = (keyInput?.value || sessionStorage.getItem(MENTOR_KEY) || "").trim();
+  const key = (keyInput?.value || mentorSessionKey || "").trim();
   const model = DEFAULT_MENTOR_MODEL;
   if (!output) {
     mentorRequestInProgress = false;
@@ -5040,7 +4985,7 @@ async function runAiMentorReview() {
   }
   if (!key) {
     toast("Add your OpenRouter API key first.");
-    output.innerHTML = `<div class="empty-state compact-empty"><div><strong>API key required</strong><span>Paste your OpenRouter key and save it locally.</span></div></div>`;
+    output.innerHTML = `<div class="empty-state compact-empty"><div><strong>API key required</strong><span>Paste your OpenRouter key for this tab.</span></div></div>`;
     mentorRequestInProgress = false;
     return;
   }
@@ -5050,8 +4995,7 @@ async function runAiMentorReview() {
     mentorRequestInProgress = false;
     return;
   }
-  sessionStorage.setItem(MENTOR_KEY, key);
-  sessionStorage.setItem(MENTOR_MODEL_KEY, DEFAULT_MENTOR_MODEL);
+  mentorSessionKey = key;
   renderAiMentor();
   output.innerHTML = `<div class="mentor-loading"><span class="upload-spinner"></span><b>Analyzing journal...</b></div>`;
   try {
@@ -5331,14 +5275,16 @@ function seedDemoTrades() {
 
 if (typeof document !== "undefined") {
   exposeAuthApi();
-  loadState();
+  purgeLegacyJournalStorage();
+  resetJournalState();
   applyReportPreset();
   renderCurrentAccount();
   showLoginScreen();
-  updateSyncStatus("syncing");
+  updateSyncStatus("offline");
   setAuthMode("signin");
   wireAuthUi();
   refreshIcons();
+  removeLegacyServiceWorker();
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !document.getElementById("cash-modal")?.hidden) closeCashModal();
     if (event.key === "Escape" && !document.getElementById("trade-modal")?.hidden) closeTradeModal();
@@ -5377,9 +5323,6 @@ if (typeof document !== "undefined") {
     screenshotDropzone.addEventListener("drop", (event) => {
       handleScreenshotFile(event.dataTransfer?.files?.[0]);
     });
-  }
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("sw.js").catch((error) => console.warn("Service worker registration failed", error));
   }
   initSupabaseAuth();
 }

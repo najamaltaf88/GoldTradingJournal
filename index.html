@@ -17,7 +17,7 @@
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260628-auth-fix-v25">
+  <link rel="stylesheet" href="styles.css?v=20260628-supabase-only-v26">
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <script src="env-config.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
@@ -92,7 +92,7 @@
       </div>
       <div class="sync-status" id="sync-status">
         <span class="sync-dot syncing"></span>
-        <span class="sync-label">Connecting...</span>
+        <span class="sync-label">Sign in required</span>
       </div>
       <div class="account-switcher">
         <label for="account-select">Account</label>
@@ -390,10 +390,10 @@
               <input id="mentor-model" type="text" value="openrouter/auto" readonly>
             </label>
             <div class="mentor-actions">
-              <button class="soft-btn" type="button" onclick="saveMentorSettings()"><i data-lucide="save"></i><span>Save Locally</span></button>
+              <button class="soft-btn" type="button" onclick="saveMentorSettings()"><i data-lucide="save"></i><span>Use Key</span></button>
               <button class="danger-soft-btn" type="button" onclick="clearMentorSettings()"><i data-lucide="trash-2"></i><span>Clear Key</span></button>
             </div>
-            <p class="mentor-note">The key stays in this browser only. OpenRouter auto-selects the model for each review.</p>
+            <p class="mentor-note">The key stays in this tab memory only. Journal data is stored in Supabase, not your browser.</p>
           </section>
           <section class="panel panel-pad mentor-output-panel">
             <div class="panel-title"><span>Mentor Review</span><span class="section-pill" id="mentor-scope">current account</span></div>
@@ -706,6 +706,6 @@
   </nav>
   <div class="toast" id="toast"></div>
   <div id="print-report" class="print-report"></div>
-  <script src="app.js?v=20260628-auth-fix-v25"></script>
+  <script src="app.js?v=20260628-supabase-only-v26"></script>
 </body>
 </html>
