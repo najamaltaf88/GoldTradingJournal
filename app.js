@@ -15,9 +15,9 @@ const SUPABASE_AUTH_OPTIONS = {
     autoRefreshToken: true,
     flowType: "pkce",
     storage: {
-      getItem: (key) => sessionStorage.getItem(key),
-      setItem: (key, value) => sessionStorage.setItem(key, value),
-      removeItem: (key) => sessionStorage.removeItem(key)
+      getItem: (key) => localStorage.getItem(key),
+      setItem: (key, value) => localStorage.setItem(key, value),
+      removeItem: (key) => localStorage.removeItem(key)
     }
   }
 };
@@ -246,12 +246,7 @@ function mergeOptions(baseOptions = {}, incomingOptions = {}) {
 function purgeLegacyJournalStorage() {
   try {
     LEGACY_JOURNAL_KEYS.forEach((key) => localStorage.removeItem(key));
-    Object.keys(localStorage).forEach((key) => {
-      if (!key.startsWith("sb-")) return;
-      const value = localStorage.getItem(key);
-      if (value) sessionStorage.setItem(key, value);
-      localStorage.removeItem(key);
-    });
+    // Note: sb- (Supabase auth) keys are intentionally kept in localStorage for session persistence
   } catch (error) {
     console.warn("Could not purge legacy browser storage", error);
   }
@@ -275,11 +270,16 @@ function resetJournalState(ownerUid = "") {
 
 function clearSessionAuthStorage() {
   try {
+    // Clear Supabase auth tokens from localStorage on explicit logout
+    Object.keys(localStorage).forEach((key) => {
+      if (key.startsWith("sb-")) localStorage.removeItem(key);
+    });
+    // Also clear from sessionStorage for any legacy tokens
     Object.keys(sessionStorage).forEach((key) => {
       if (key.startsWith("sb-")) sessionStorage.removeItem(key);
     });
   } catch (error) {
-    console.warn("Could not clear auth session storage", error);
+    console.warn("Could not clear auth storage", error);
   }
 }
 
@@ -381,6 +381,53 @@ function normalizeWeeklyReview(review) {
   };
 }
 
+function openJournalDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open("GoldJournalOffline", 1);
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains("backups")) {
+        db.createObjectStore("backups", { keyPath: "key" });
+      }
+    };
+    request.onsuccess = (event) => resolve(event.target.result);
+    request.onerror = (event) => reject(event.target.error);
+  });
+}
+
+async function saveToIndexedDB(userId, accountId, data) {
+  try {
+    const db = await openJournalDB();
+    const tx = db.transaction("backups", "readwrite");
+    const store = tx.objectStore("backups");
+    const key = `${userId || "anonymous"}_${accountId}`;
+    store.put({ key, data: clone(data), updatedAt: new Date().toISOString() });
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn("Failed to save to IndexedDB", err);
+  }
+}
+
+async function loadFromIndexedDB(userId, accountId) {
+  try {
+    const db = await openJournalDB();
+    const tx = db.transaction("backups", "readonly");
+    const store = tx.objectStore("backups");
+    const key = `${userId || "anonymous"}_${accountId}`;
+    const request = store.get(key);
+    return new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result?.data || null);
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.warn("Failed to load from IndexedDB", err);
+    return null;
+  }
+}
+
 async function save() {
   if (!activeAccountId || !accounts.some((a) => a.id === activeAccountId)) {
     console.warn("save() aborted: no valid active account.");
@@ -388,8 +435,13 @@ async function save() {
   }
   syncMemoryState();
   renderAccountSelector();
+
+  // Save to offline local backup
+  await saveToIndexedDB(currentUser?.id, activeAccountId, state);
+  await saveToIndexedDB(currentUser?.id, "accounts_list", accounts);
+
   if (!currentUser || !supabaseReady) {
-    toast("Sign in to save your journal.");
+    toast("Saved locally (offline mode).");
     updateSyncStatus("offline");
     return;
   }
@@ -398,7 +450,7 @@ async function save() {
   } catch (error) {
     console.warn("Could not sync to Supabase", error);
     updateSyncStatus("offline");
-    toast("Sync failed. Check your connection and try again.");
+    toast("Sync failed. Saved locally (offline backup).");
   }
 }
 
@@ -671,7 +723,7 @@ function renderSummary() {
   const sub = document.getElementById("log-sub");
   if (sub) {
     const cashCount = (state.cashTransactions || []).length;
-    sub.textContent = `${state.trades.length} trades, ${cashCount} cash entries, ${p.closed.length} closed, ${p.winRate.toFixed(0)}% win rate Â· Balance ${signed(balance.currentBalance)} $.`;
+    sub.textContent = `${state.trades.length} trades, ${cashCount} cash entries, ${p.closed.length} closed, ${p.winRate.toFixed(0)}% win rate · Balance ${signed(balance.currentBalance)} $.`;
   }
 }
 
@@ -945,20 +997,20 @@ function renderCashRow(event, displayIndex) {
   tr.appendChild(displayCell("Date", formatDateDisplay(cash.date) || "-", "date-display"));
   tr.appendChild(htmlCell("Session", valuePill(cash.type === "deposit" ? "DEPOSIT" : "WITHDRAW", cash.type === "deposit" ? "result" : "result")));
   tr.appendChild(htmlCell("Side", `<span class="table-pill pill-cash pill-${cash.type}">${cash.type === "deposit" ? "Deposit" : "Withdraw"}</span>`));
-  tr.appendChild(displayCell("Level", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("TF", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Setup", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Mistake", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Hold", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Market", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("Bias", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("Confirm", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("SL", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("TP", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("Patience", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Risk", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Reward", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("RR", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("Level", "—", "muted-cell"));
+  tr.appendChild(displayCell("TF", "—", "muted-cell"));
+  tr.appendChild(displayCell("Setup", "—", "muted-cell"));
+  tr.appendChild(displayCell("Mistake", "—", "muted-cell"));
+  tr.appendChild(displayCell("Hold", "—", "muted-cell"));
+  tr.appendChild(displayCell("Market", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("Bias", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("Confirm", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("SL", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("TP", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("Patience", "—", "muted-cell"));
+  tr.appendChild(displayCell("Risk", "—", "muted-cell"));
+  tr.appendChild(displayCell("Reward", "—", "muted-cell"));
+  tr.appendChild(displayCell("RR", "—", "muted-cell"));
   tr.appendChild(htmlCell("Result", valuePill(cash.type === "deposit" ? "DEPOSIT" : "WITHDRAW", "result")));
   tr.appendChild(htmlCell("P&L", pnlHtml(cash.type === "deposit" ? amount : -amount)));
   tr.appendChild(htmlCell("Balance", pnlHtml(event.balanceAfter)));
@@ -993,7 +1045,7 @@ function openCashModal(type = "deposit", index = null) {
   const title = document.getElementById("cash-modal-title");
   const saveBtn = document.getElementById("cash-save-btn");
   const entry = Number.isInteger(index) ? state.cashTransactions[index] : null;
-  if (title) title.textContent = entry ? `EDIT_${cashModalType.toUpperCase()}` : cashModalType === "deposit" ? "DEPOSIT" : "WITHDRAW";
+  if (title) title.textContent = entry ? (cashModalType === "deposit" ? "Edit Deposit" : "Edit Withdrawal") : (cashModalType === "deposit" ? "Add Deposit" : "Add Withdrawal");
   if (saveBtn) saveBtn.textContent = entry ? "Save Changes" : cashModalType === "deposit" ? "Save Deposit" : "Save Withdrawal";
   document.getElementById("cash-date").value = entry?.date || todayISO();
   document.getElementById("cash-amount").value = entry?.amount || "";
@@ -1403,7 +1455,7 @@ function openTradeModal(index = null, draft = null) {
 
   const trade = draft || (modalEditingIndex === null ? newTradeTemplate() : state.trades[modalEditingIndex]);
   const title = document.getElementById("trade-modal-title");
-  if (title) title.textContent = modalEditingIndex === null ? "NEW_TRADE" : `EDIT_TRADE #${modalEditingIndex + 1}`;
+  if (title) title.textContent = modalEditingIndex === null ? "New Trade" : `Edit Trade #${modalEditingIndex + 1}`;
   setModalValue("modal-date", trade.date || todayISO());
   setModalValue("modal-session", trade.session);
   setModalValue("modal-entry", trade.entry);
@@ -1522,10 +1574,9 @@ function saveTradeFromModal() {
 }
 
 function deleteTrade(index) {
-  if (!currentUser) { toast("Sign in required."); return; }
   const trade = state.trades[index];
   if (!trade) return;
-  if (!confirm(`Delete trade #${index + 1} (${trade.date || "no date"} Â· ${trade.result || "open"})? This cannot be undone.`)) return;
+  if (!confirm(`Delete trade #${index + 1} (${trade.date || "no date"} · ${trade.result || "open"})? This cannot be undone.`)) return;
   const tradeId = trade.id;
   state.trades.splice(index, 1);
   save();
@@ -1584,9 +1635,9 @@ function renderViewTradeModal() {
   const body = document.getElementById("view-trade-body");
   const title = document.getElementById("view-trade-title");
   if (!trade || !body) return;
-  if (title) title.textContent = `VIEW_TRADE #${viewTradeIndex + 1}`;
+  if (title) title.textContent = `Trade #${viewTradeIndex + 1}`;
   const pnl = calcPnl(trade.risk, trade.reward, trade.result);
-  const pnlText = pnl === "" ? "- pips" : `${signed(pnl)} pips`;
+  const pnlText = pnl === "" ? "- $" : `${signed(pnl)} $`;
   const info = [
     ["Session", escapeHtml(trade.session || "-")],
     ["Level", escapeHtml(trade.level || "-")],
@@ -1599,8 +1650,8 @@ function renderViewTradeModal() {
     ["TP Placement", escapeHtml(trade.tpPlacement || "-")],
     ["Mistake Type", escapeHtml(trade.mistake || "-")],
     ["Hold Quality", escapeHtml(trade.hold || "-")],
-    ["Risk (pips)", escapeHtml(trade.risk || "-")],
-    ["Reward (pips)", escapeHtml(trade.reward || "-")],
+    ["Risk ($)", escapeHtml(trade.risk || "-")],
+    ["Reward ($)", escapeHtml(trade.reward || "-")],
     ["Patience Score", readonlyStars(trade.patienceScore)]
   ];
   const screenshotUrl = safeHttpUrl(trade.screenshotUrl);
@@ -1664,7 +1715,7 @@ function openSkippedModal(index = null) {
 
   const trade = skippedEditingIndex === null ? skippedTradeTemplate() : state.skippedTrades[skippedEditingIndex];
   const title = document.getElementById("skipped-modal-title");
-  if (title) title.textContent = skippedEditingIndex === null ? "LOG_SKIPPED_TRADE" : `EDIT_SKIPPED_TRADE #${skippedEditingIndex + 1}`;
+  if (title) title.textContent = skippedEditingIndex === null ? "Log Skipped Trade" : `Edit Skipped Trade #${skippedEditingIndex + 1}`;
   setModalValue("skipped-date", trade.date || todayISO());
   setModalValue("skipped-session", trade.session);
   setModalValue("skipped-level", trade.level);
@@ -1727,10 +1778,9 @@ function saveSkippedTradeFromModal() {
 }
 
 function deleteSkippedTrade(index) {
-  if (!currentUser) { toast("Sign in required."); return; }
   const trade = state.skippedTrades[index];
   if (!trade) return;
-  if (!confirm(`Delete skipped trade (${trade.date || "no date"} Â· ${trade.level || "no level"})? This cannot be undone.`)) return;
+  if (!confirm(`Delete skipped trade (${trade.date || "no date"} · ${trade.level || "no level"})? This cannot be undone.`)) return;
   const tradeId = trade.id;
   state.skippedTrades.splice(index, 1);
   save();
@@ -1779,9 +1829,19 @@ function filteredSkippedTrades() {
     .map((trade, index) => ({ trade, index }))
     .filter(({ trade }) => {
       if (reason && trade.skipReason !== reason) return false;
-      if (outcome === "tp" && !isSkippedWin(trade.outcome)) return false;
-      if (outcome === "sl" && trade.outcome !== "SL Would Have Hit") return false;
-      if (outcome === "no-reaction" && trade.outcome !== "No Reaction") return false;
+      if (outcome) {
+        const norm = String(trade.outcome || "").trim().toLowerCase();
+        if (outcome === "tp") {
+          const isWin = norm.includes("tp hit") || norm.includes("tp");
+          if (!isWin) return false;
+        } else if (outcome === "sl") {
+          const isLoss = norm.includes("sl") || norm.includes("loss");
+          if (!isLoss) return false;
+        } else if (outcome === "no-reaction") {
+          const isNoReact = norm.includes("no reaction") || norm.includes("noreaction");
+          if (!isNoReact) return false;
+        }
+      }
       return true;
     })
     .reverse();
@@ -2453,7 +2513,7 @@ function renderAnalysisCharts() {
                   const idx = items[0]?.dataIndex ?? 0;
                   const tradeNo = equity.labels[idx] || "";
                   const date = equity.dates[idx] || "";
-                  return date ? `${tradeNo} Â· ${date}` : tradeNo;
+                  return date ? `${tradeNo} · ${date}` : tradeNo;
                 },
                 label(item) {
                   return `Cumulative P&L: ${signed(item.parsed.y)} $`;
@@ -2583,7 +2643,7 @@ function renderAnalysisCharts() {
               title(items) {
                 const idx = items[0]?.dataIndex ?? 0;
                 const date = rolling.dates[idx] || "";
-                return date ? `${rolling.labels[idx]} Â· ${date}` : rolling.labels[idx];
+                return date ? `${rolling.labels[idx]} · ${date}` : rolling.labels[idx];
               }
             }
           }
@@ -3005,7 +3065,7 @@ function dayStatusLine(day) {
   if (day.losses) parts.push(`${day.losses} Loss`);
   if (day.bes) parts.push(`${day.bes} BE`);
   if (day.open) parts.push(`${day.open} Open`);
-  return parts.join(" Â· ");
+  return parts.join(" · ");
 }
 
 function monthTradeRows(year, month) {
@@ -3148,7 +3208,7 @@ function pnlBars(title, rows, icon) {
     const wr = row.trades ? row.wins / row.trades * 100 : 0;
     return `
       <div class="pnl-bar-row">
-        <div><b>${escapeHtml(row.key)}</b><span>${row.trades} trades Â· ${wr.toFixed(0)}% WR</span></div>
+        <div><b>${escapeHtml(row.key)}</b><span>${row.trades} trades · ${wr.toFixed(0)}% WR</span></div>
         <div class="pnl-bar-track"><i class="${moneyClass(row.pnl)}" style="width:${width}%"></i></div>
         <strong class="${moneyClass(row.pnl)}">${signed(row.pnl)} $</strong>
       </div>
@@ -3186,7 +3246,7 @@ function pnlSelectedTrades(selected) {
     return `
       <button class="pnl-trade-row" onclick="openViewTradeModal(${tradeNo - 1})">
         <span>#${tradeNo}</span>
-        <b>${escapeHtml(trade.entry || "-")} Â· ${escapeHtml(trade.level || "-")}</b>
+        <b>${escapeHtml(trade.entry || "-")} · ${escapeHtml(trade.level || "-")}</b>
         <em class="${moneyClass(trade.pnl)}">${signed(trade.pnl)} $</em>
       </button>
     `;
@@ -3228,8 +3288,8 @@ function renderPnl() {
 
         <div class="pnl-cal-stats">
           ${pnlCalendarStat("Monthly P&amp;L", `<span class="${monthTone}">${signed(stats.totalPnl)} $</span>`, "", monthTone)}
-          ${pnlCalendarStat("Trading Days", `${stats.tradingDays}d`, `${stats.profitable} green Â· ${stats.losing} red`)}
-          ${pnlCalendarStat("Trades", `${stats.totalTrades} total`, `${stats.closedWins}W Â· ${stats.closedLosses}L${stats.closedBes ? ` Â· ${stats.closedBes}BE` : ""}`)}
+          ${pnlCalendarStat("Trading Days", `${stats.tradingDays}d`, `${stats.profitable} green · ${stats.losing} red`)}
+          ${pnlCalendarStat("Trades", `${stats.totalTrades} total`, `${stats.closedWins}W · ${stats.closedLosses}L${stats.closedBes ? ` · ${stats.closedBes}BE` : ""}`)}
           ${pnlCalendarStat("Best Day", stats.best ? `<span class="pos">${signed(stats.best.pnl)} $</span>` : "-", stats.best ? formatDateDisplay(stats.best.date) : "No data")}
           ${pnlCalendarStat("Worst Day", stats.worst ? `<span class="neg">${signed(stats.worst.pnl)} $</span>` : "-", stats.worst ? formatDateDisplay(stats.worst.date) : "No data")}
           ${pnlCalendarStat("Most Active Day", stats.mostActive ? `${stats.mostActive.trades} trades` : "-", stats.mostActive ? formatDateDisplay(stats.mostActive.date) : "No data")}
@@ -3254,7 +3314,7 @@ function renderPnl() {
               </div>
               <div class="pnl-cal-selected-meta">
                 <strong class="${moneyClass(selected?.pnl || 0)}">${selected ? signed(selected.pnl) : "$0.00"} $</strong>
-                <small>${selected ? `${selected.trades} trade${selected.trades === 1 ? "" : "s"} Â· ${escapeHtml(dayStatusLine(selected))}` : "No trades"}</small>
+                <small>${selected ? `${selected.trades} trade${selected.trades === 1 ? "" : "s"} · ${escapeHtml(dayStatusLine(selected))}` : "No trades"}</small>
               </div>
               <button class="icon-btn" onclick="clearPnlSelection()" title="Clear selection" aria-label="Clear selection"><i data-lucide="x"></i></button>
             </div>
@@ -3367,8 +3427,8 @@ function pnlWeekCell(weekDays, stats) {
     <div class="pnl-cal-week ${tone}">
       <span class="pnl-cal-week-range">${escapeHtml(weekRangeLabel(weekDays))}</span>
       <strong class="pnl-cal-week-pnl">${signed(summary.pnl)} $</strong>
-      <small>${summary.activeDays} day${summary.activeDays === 1 ? "" : "s"} Â· ${summary.trades} trade${summary.trades === 1 ? "" : "s"}</small>
-      <em>${summary.wins} Win Â· ${summary.losses} Loss${summary.bes ? ` Â· ${summary.bes} BE` : ""} Â· ${summary.winRate}%</em>
+      <small>${summary.activeDays} day${summary.activeDays === 1 ? "" : "s"} · ${summary.trades} trade${summary.trades === 1 ? "" : "s"}</small>
+      <em>${summary.wins} Win · ${summary.losses} Loss${summary.bes ? ` · ${summary.bes} BE` : ""} · ${summary.winRate}%</em>
     </div>
   `;
 }
@@ -3773,11 +3833,20 @@ function renderWeeklyReviews() {
 }
 
 function saveWeeklyReview() {
+  const learned = document.getElementById("review-learned")?.value.trim() || "";
+  const pattern = document.getElementById("review-pattern")?.value.trim() || "";
+  const improve = document.getElementById("review-improve")?.value.trim() || "";
+
+  if (!learned && !pattern && !improve) {
+    toast("Please fill in at least one detail to save.");
+    return;
+  }
+
   const review = normalizeWeeklyReview({
     weekOf: document.getElementById("review-week")?.value || todayISO(),
-    learned: document.getElementById("review-learned")?.value.trim() || "",
-    pattern: document.getElementById("review-pattern")?.value.trim() || "",
-    improve: document.getElementById("review-improve")?.value.trim() || "",
+    learned,
+    pattern,
+    improve,
     createdAt: new Date().toISOString()
   });
   state.weeklyReviews.push(review);
@@ -3786,16 +3855,18 @@ function saveWeeklyReview() {
     const el = document.getElementById(id);
     if (el) el.value = "";
   });
+  const weekEl = document.getElementById("review-week");
+  if (weekEl) weekEl.value = todayISO();
   renderWeeklyReviews();
   toast("Weekly review saved.");
 }
 
 function deleteWeeklyReview(id) {
-  if (!currentUser) { toast("Sign in required."); return; }
+  if (!confirm("Delete this weekly review? This cannot be undone.")) return;
   state.weeklyReviews = state.weeklyReviews.filter((review) => review.id !== id);
   save();
   renderWeeklyReviews();
-  if (id) deleteReviewFromSupabase(id);
+  if (id && currentUser) deleteReviewFromSupabase(id);
   toast("Weekly review deleted.");
 }
 
@@ -4379,9 +4450,26 @@ async function loadFromSupabase(userId) {
     updateSyncStatus("synced");
     return true;
   } catch (error) {
-    console.warn("Could not load from Supabase", error);
+    console.warn("Could not load from Supabase, checking local backup...", error);
     if (loadToken === authLoadToken) {
       updateSyncStatus("offline");
+
+      // Load active state from IndexedDB backup
+      const backupState = await loadFromIndexedDB(userId, activeAccountId);
+      const backupAccounts = await loadFromIndexedDB(userId, "accounts_list");
+
+      if (backupState) {
+        if (backupAccounts) {
+          accounts = backupAccounts;
+        }
+        state = normalizeJournalState(backupState);
+        accountData[activeAccountId] = clone(state);
+        syncMemoryState();
+        renderCurrentAccount();
+        toast("Offline mode: Loaded from local backup.");
+        return true;
+      }
+
       toast("Could not load journal from Supabase.");
     }
     return false;
@@ -4657,6 +4745,7 @@ function initSupabaseAuth() {
   if (!initSupabase()) {
     updateSyncStatus("offline");
     showLoginScreen();
+    hideSplashScreen();
     return;
   }
   supabaseReady = true;
@@ -4674,6 +4763,7 @@ function initSupabaseAuth() {
       renderCurrentAccount();
       showLoginScreen();
       updateSyncStatus("offline");
+      hideSplashScreen();
       return;
     }
 
@@ -4687,6 +4777,7 @@ function initSupabaseAuth() {
     updateSyncStatus("syncing");
     await loadFromSupabase(user.id);
     updateSyncStatus("synced");
+    hideSplashScreen();
   });
 
   completeOAuthReturn().catch((error) => {
@@ -4697,6 +4788,7 @@ function initSupabaseAuth() {
     if (!session) {
       showLoginScreen();
       updateSyncStatus("offline");
+      hideSplashScreen();
     }
   });
 }
@@ -4820,31 +4912,31 @@ function mentorPrompt(snapshot) {
     "",
     "Perform a deep analysis across ALL of the following areas:",
     "",
-    "SECTION 1 â€” BEHAVIORAL & PSYCHOLOGICAL ANALYSIS:",
+    "SECTION 1 — BEHAVIORAL & PSYCHOLOGICAL ANALYSIS:",
     "- Revenge Trading Detection: Look for clusters of rapid trades immediately after a LOSS (same day, 2+ trades after loss). Flag if this pattern exists with specific dates/examples.",
     "- FOMO Detection: Identify trades where patienceScore <= 2 AND mistake field contains \"FOMO trade\" or \"Early entry\". Calculate % of total trades these represent.",
     "- Over-Trading Detection: Find days/sessions with 3+ trades and check if those days have lower win rate than average. Report the correlation.",
     "- Discipline Score per week: Calculate (trades with patienceScore >= 4 + trades with mistake=\"No mistake\") / total trades * 100. Give a letter grade A-F.",
     "",
-    "SECTION 2 â€” RISK & TRADE MANAGEMENT:",
+    "SECTION 2 — RISK & TRADE MANAGEMENT:",
     "- Leaving Money On Table: Check hold quality field. Count trades where hold=\"Early exit\" vs \"Held full TP\". Calculate pip difference. Report: \"You cut X trades early, potentially missing Y pips total.\"",
     "- Holding Losers: Look for LOSS trades and note reason/notes field for patterns like \"moved SL\", \"held too long\", \"hope\".",
     "- SL/TP Placement Analysis: Group trades by slTpPlacement field. Which placement type has highest win rate? Report with numbers.",
     "- Risk Consistency: Calculate standard deviation of risk field across all trades. High deviation = inconsistent sizing. Flag if >50% variance.",
     "",
-    "SECTION 3 â€” BLIND SPOTS & ENVIRONMENT:",
+    "SECTION 3 — BLIND SPOTS & ENVIRONMENT:",
     "- Market Condition: Group by marketCondition field. Which condition has highest/lowest win rate? Should trader avoid any condition?",
     "- Day of Week: Extract weekday from trade.date. Which day is most profitable? Which day should trader avoid?",
     "- Session Performance: Group by session field. Best and worst session with exact win rates and total P&L per session.",
     "- Level Performance: Group by level field. Best and worst level. Minimum 3 trades to qualify for recommendation.",
     "- TF Performance: Group by tf field. Best TF by win rate.",
     "",
-    "SECTION 4 â€” NLP ON NOTES:",
+    "SECTION 4 — NLP ON NOTES:",
     "- Scan all trade.reason (notes) fields for emotional words: \"anxious\", \"fear\", \"rushed\", \"confident\", \"missed\", \"revenge\", \"hope\", \"frustrated\", \"excited\", \"doubt\".",
     "- Correlate presence of negative words with LOSS trades. Report: \"Trades with negative emotional language: X% win rate vs trades without: Y% win rate.\"",
     "- Extract most common setup descriptions from notes.",
     "",
-    "SECTION 5 â€” GENERATIVE COACHING OUTPUT:",
+    "SECTION 5 — GENERATIVE COACHING OUTPUT:",
     "Return EXACTLY this structure with these exact ## headers (no extra sections, no missing sections):",
     "",
     "## TRADING REPORT CARD",
@@ -4858,7 +4950,7 @@ function mentorPrompt(snapshot) {
     "- Revenge Trading: [detected/not detected, with evidence]",
     "- FOMO Score: [X% of trades show FOMO behavior]",
     "- Over-trading: [detected/not detected]",
-    "- Discipline Score: [X% â€” Grade B]",
+    "- Discipline Score: [X% — Grade B]",
     "",
     "## WHAT IS WORKING",
     "[Specific levels, sessions, confirmations that actually profit]",
@@ -5325,4 +5417,15 @@ if (typeof document !== "undefined") {
     });
   }
   initSupabaseAuth();
+  setTimeout(hideSplashScreen, 3500);
 }
+
+function hideSplashScreen() {
+  const splash = document.getElementById("splash-screen");
+  if (!splash || splash.classList.contains("hiding") || splash.classList.contains("hidden-done")) return;
+  splash.classList.add("hiding");
+  setTimeout(() => {
+    splash.classList.add("hidden-done");
+  }, 450);
+}
+

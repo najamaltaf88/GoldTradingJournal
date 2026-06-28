@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Gold Trading Journal - XAUUSD</title>
+  <meta name="description" content="Professional XAUUSD Gold Trading Journal — track trades, missed setups, weekly reviews, and account performance in one secure workspace.">
   <meta name="theme-color" content="#10141a">
   <meta name="referrer" content="no-referrer">
   <meta name="application-name" content="Gold Journal">
@@ -17,12 +18,30 @@
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260628-supabase-only-v26">
+  <link rel="stylesheet" href="styles.css?v=20260628-supabase-only-v27">
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <script src="env-config.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
 </head>
 <body>
+  <!-- Splash Screen -->
+  <div id="splash-screen" class="splash-screen" aria-live="polite" aria-label="Loading Gold Trading Journal">
+    <div class="splash-inner">
+      <div class="splash-logo">
+        <div class="splash-mark">AU</div>
+        <div class="splash-glow"></div>
+      </div>
+      <div class="splash-text">
+        <h1 class="splash-title">Gold Journal</h1>
+        <p class="splash-sub">XAUUSD Trade Desk</p>
+      </div>
+      <div class="splash-bar">
+        <div class="splash-bar-fill"></div>
+      </div>
+      <p class="splash-hint">Loading your journal...</p>
+    </div>
+  </div>
+  <!-- Login Screen -->
   <div id="login-screen" hidden>
     <section class="auth-shell" aria-label="Authentication">
       <div class="auth-brand">
@@ -706,6 +725,6 @@
   </nav>
   <div class="toast" id="toast"></div>
   <div id="print-report" class="print-report"></div>
-  <script src="app.js?v=20260628-supabase-only-v26"></script>
+  <script src="app.js?v=20260628-supabase-only-v27"></script>
 </body>
 </html>
