@@ -42,7 +42,7 @@ The anon key is safe in client-side output. Row Level Security protects data. Ne
 
 - **Supabase only** for journal data (trades, accounts, reviews, options, screenshots).
 - **No localStorage** for journal data — old cached keys are cleared on startup.
-- **sessionStorage** holds the Supabase auth session for the current browser tab only (clears when the tab closes).
+- **localStorage** holds the Supabase auth session so it can persist across browser restarts on the same origin.
 - **In-memory only** for the OpenRouter mentor API key (never written to disk).
 
 ## Google sign-in redirect URLs

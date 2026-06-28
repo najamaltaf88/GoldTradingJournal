@@ -88,13 +88,13 @@
       </div>
     </section>
   </div>
-  <div class="mobile-topbar">
+  <div class="mobile-topbar" hidden>
     <button class="icon-btn" onclick="openMobileMenu()" aria-label="Open menu"><i data-lucide="menu"></i></button>
     <span>Gold Journal</span>
     <button class="icon-btn" onclick="addTrade()" aria-label="New trade"><i data-lucide="plus"></i></button>
   </div>
   <div class="sidebar-backdrop" onclick="closeMobileMenu()"></div>
-  <div class="app">
+  <div class="app" hidden>
     <aside class="sidebar" id="app-sidebar">
       <div class="brand">
         <div class="brand-mark">AU</div>
@@ -159,6 +159,11 @@
         <button class="ghost-btn" onclick="exportExcel()"><i data-lucide="file-spreadsheet"></i><span>Excel</span></button>
         <button class="ghost-btn" onclick="exportCSV()"><i data-lucide="file-down"></i><span>CSV</span></button>
         <button class="ghost-btn" onclick="exportPDF()"><i data-lucide="printer"></i><span>PDF</span></button>
+        <button class="ghost-btn" onclick="toggleDiagnosticsPanel()"><i data-lucide="activity"></i><span>Diagnostics</span></button>
+      </div>
+      <div id="diagnostics-panel" class="diagnostics-panel" hidden>
+        <div class="panel-title"><span>Developer Diagnostics</span></div>
+        <div id="diagnostics-content" class="diagnostics-content"></div>
       </div>
     </aside>
 

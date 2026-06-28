@@ -117,6 +117,16 @@
 
       try {
         // CRITICAL: Use localStorage (same as main app) so session persists
+        try {
+          Object.keys(localStorage).forEach((key) => {
+            if (key.startsWith('sb-') || key === 'supabase.auth.token') {
+              localStorage.removeItem(key);
+            }
+          });
+        } catch (storageError) {
+          console.warn('Could not clear stale Supabase auth storage on callback page', storageError);
+        }
+
         const client = window.supabase.createClient(config.url, config.anonKey, {
           auth: {
             detectSessionInUrl: true,

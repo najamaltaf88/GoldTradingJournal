@@ -142,6 +142,39 @@ button {
   display: none;
 }
 
+.diagnostics-panel {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: rgba(6, 9, 13, 0.9);
+}
+
+.diagnostics-content {
+  display: grid;
+  gap: 8px;
+}
+
+.diag-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.diag-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 11px;
+}
+
+.diag-card strong {
+  color: var(--gold);
+}
+
 /* =============================================
    SPLASH SCREEN
    ============================================= */

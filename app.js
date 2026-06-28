@@ -7,6 +7,118 @@ let authProviders = { email: true, google: true };
 let authMode = "signin";
 let authBusy = false;
 let authPasswordVisible = false;
+let authInitStarted = false;
+let authStateBusy = false;
+let diagnosticsState = {
+  auth: {},
+  storage: {},
+  cache: {},
+  ai: {},
+  performance: {},
+  events: []
+};
+
+function safeStorageGet(storage, key, fallback = "") {
+  try {
+    const value = storage?.getItem?.(key);
+    return value ?? fallback;
+  } catch (error) {
+    console.warn("Storage read failed", error);
+    return fallback;
+  }
+}
+
+function safeStorageSet(storage, key, value) {
+  try {
+    storage?.setItem?.(key, value);
+    return true;
+  } catch (error) {
+    console.warn("Storage write failed", error);
+    return false;
+  }
+}
+
+function safeStorageRemove(storage, key) {
+  try {
+    storage?.removeItem?.(key);
+    return true;
+  } catch (error) {
+    console.warn("Storage remove failed", error);
+    return false;
+  }
+}
+
+function safeStorageClearMatching(storage, predicate) {
+  try {
+    const keys = Object.keys(storage || {});
+    keys.filter((key) => predicate(key)).forEach((key) => storage.removeItem(key));
+    return true;
+  } catch (error) {
+    console.warn("Storage clear failed", error);
+    return false;
+  }
+}
+
+function recordDiagnostic(kind, message, detail = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    kind,
+    message,
+    detail
+  };
+  diagnosticsState.events.push(entry);
+  if (diagnosticsState.events.length > 80) diagnosticsState.events = diagnosticsState.events.slice(-80);
+  if (typeof console !== "undefined") {
+    const logger = kind === "error" ? console.error : console.info;
+    logger(`[${kind}] ${message}`, detail);
+  }
+  updateDiagnosticsPanel();
+}
+
+function updateDiagnosticsPanel() {
+  const panel = document.getElementById("diagnostics-panel");
+  const content = document.getElementById("diagnostics-content");
+  if (!panel || !content) return;
+  const memoryUsage = typeof performance !== "undefined" && performance.memory ? `${Math.round(performance.memory.usedJSHeapSize / 1048576)}MB / ${Math.round(performance.memory.jsHeapSizeLimit / 1048576)}MB` : "n/a";
+  const authState = currentUser ? `signed in (${currentUser.email || currentUser.id || "user"})` : "signed out";
+  const dbState = supabaseReady ? "Supabase ready" : "offline";
+  const storageState = typeof indexedDB !== "undefined" ? "IndexedDB available" : "unavailable";
+  const cacheState = "serviceWorker" in navigator ? (navigator.serviceWorker.controller ? "active" : "ready") : "disabled";
+  const aiState = diagnosticsState.ai?.status || "idle";
+  const backgroundTasks = `${diagnosticsState.events.length} events`;
+  content.innerHTML = `
+    <div class="diag-grid">
+      <div class="diag-card"><strong>Auth</strong><span>${escapeHtml(authState)}</span></div>
+      <div class="diag-card"><strong>Database</strong><span>${escapeHtml(dbState)}</span></div>
+      <div class="diag-card"><strong>Storage</strong><span>${escapeHtml(storageState)}</span></div>
+      <div class="diag-card"><strong>Cache</strong><span>${escapeHtml(cacheState)}</span></div>
+      <div class="diag-card"><strong>AI</strong><span>${escapeHtml(aiState)}</span></div>
+      <div class="diag-card"><strong>Memory</strong><span>${escapeHtml(memoryUsage)}</span></div>
+      <div class="diag-card"><strong>Background</strong><span>${escapeHtml(backgroundTasks)}</span></div>
+      <div class="diag-card"><strong>Last Event</strong><span>${escapeHtml(diagnosticsState.events.at(-1)?.message || "none")}</span></div>
+    </div>
+  `;
+}
+
+function toggleDiagnosticsPanel() {
+  const panel = document.getElementById("diagnostics-panel");
+  if (!panel) return;
+  panel.hidden = !panel.hidden;
+  updateDiagnosticsPanel();
+}
+
+function installGlobalErrorHandlers() {
+  window.addEventListener("error", (event) => {
+    const message = event.error?.message || event.message || "Unhandled runtime error";
+    recordDiagnostic("error", message, { filename: event.filename, lineno: event.lineno, colno: event.colno });
+    if (typeof toast === "function") toast("A runtime error occurred. Check diagnostics for details.");
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason?.message || String(event.reason || "Unhandled promise rejection");
+    recordDiagnostic("error", reason, { stack: event.reason?.stack || "" });
+    if (typeof toast === "function") toast("A background operation failed. Check diagnostics for details.");
+  });
+}
 
 const SUPABASE_AUTH_OPTIONS = {
   auth: {
@@ -15,9 +127,9 @@ const SUPABASE_AUTH_OPTIONS = {
     autoRefreshToken: true,
     flowType: "pkce",
     storage: {
-      getItem: (key) => localStorage.getItem(key),
-      setItem: (key, value) => localStorage.setItem(key, value),
-      removeItem: (key) => localStorage.removeItem(key)
+      getItem: (key) => safeStorageGet(localStorage, key),
+      setItem: (key, value) => safeStorageSet(localStorage, key, value),
+      removeItem: (key) => safeStorageRemove(localStorage, key)
     }
   }
 };
@@ -245,7 +357,7 @@ function mergeOptions(baseOptions = {}, incomingOptions = {}) {
 
 function purgeLegacyJournalStorage() {
   try {
-    LEGACY_JOURNAL_KEYS.forEach((key) => localStorage.removeItem(key));
+    LEGACY_JOURNAL_KEYS.forEach((key) => safeStorageRemove(localStorage, key));
     // Note: sb- (Supabase auth) keys are intentionally kept in localStorage for session persistence
   } catch (error) {
     console.warn("Could not purge legacy browser storage", error);
@@ -271,18 +383,8 @@ function resetJournalState(ownerUid = "") {
 
 function clearSessionAuthStorage() {
   try {
-    // Clear Supabase auth tokens from localStorage on explicit logout
-    Object.keys(localStorage).forEach((key) => {
-      if (key.startsWith("sb-") || key === "supabase.auth.token" || key.startsWith("gj_session_")) {
-        localStorage.removeItem(key);
-      }
-    });
-    // Also clear from sessionStorage for any legacy tokens
-    Object.keys(sessionStorage).forEach((key) => {
-      if (key.startsWith("sb-") || key === "supabase.auth.token" || key.startsWith("gj_")) {
-        sessionStorage.removeItem(key);
-      }
-    });
+    safeStorageClearMatching(localStorage, (key) => key.startsWith("sb-") || key === "supabase.auth.token" || key.startsWith("gj_session_"));
+    safeStorageClearMatching(sessionStorage, (key) => key.startsWith("sb-") || key === "supabase.auth.token" || key.startsWith("gj_"));
   } catch (error) {
     console.warn("Could not clear auth storage", error);
   }
@@ -388,7 +490,7 @@ function normalizeWeeklyReview(review) {
 
 function openJournalDB() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("GoldJournalOffline", 1);
+    const request = indexedDB.open("GoldJournalOffline", 2);
     request.onupgradeneeded = (event) => {
       const db = event.target.result;
       if (!db.objectStoreNames.contains("backups")) {
@@ -400,19 +502,49 @@ function openJournalDB() {
   });
 }
 
+function buildBackupChecksum(payload) {
+  const text = typeof payload === "string" ? payload : JSON.stringify(payload || {});
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash << 5) - hash + text.charCodeAt(i);
+    hash |= 0;
+  }
+  return String(hash);
+}
+
+function isBackupEntryValid(entry) {
+  return entry && typeof entry === "object" && entry.data && typeof entry.updatedAt === "string" && typeof entry.checksum === "string";
+}
+
 async function saveToIndexedDB(userId, accountId, data) {
   try {
     const db = await openJournalDB();
     const tx = db.transaction("backups", "readwrite");
     const store = tx.objectStore("backups");
     const key = `${userId || "anonymous"}_${accountId}`;
-    store.put({ key, data: clone(data), updatedAt: new Date().toISOString() });
+    const snapshot = {
+      key,
+      data: clone(data),
+      updatedAt: new Date().toISOString(),
+      checksum: buildBackupChecksum(data),
+      version: 2
+    };
+    const existingRequest = store.get(key);
     return new Promise((resolve, reject) => {
+      existingRequest.onsuccess = () => {
+        const existing = existingRequest.result || {};
+        const history = Array.isArray(existing.history) ? existing.history.filter(isBackupEntryValid) : [];
+        history.unshift(snapshot);
+        history.splice(5);
+        store.put({ key, history, latest: snapshot, updatedAt: snapshot.updatedAt });
+      };
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      existingRequest.onerror = () => reject(existingRequest.error);
     });
   } catch (err) {
     console.warn("Failed to save to IndexedDB", err);
+    recordDiagnostic("error", "Local backup save failed", { accountId, error: String(err?.message || err) });
   }
 }
 
@@ -423,9 +555,16 @@ async function loadFromIndexedDB(userId, accountId) {
     const store = tx.objectStore("backups");
     const key = `${userId || "anonymous"}_${accountId}`;
     const request = store.get(key);
-    return new Promise((resolve, reject) => {
-      request.onsuccess = () => resolve(request.result?.data || null);
-      request.onerror = () => reject(request.error);
+    return new Promise((resolve) => {
+      request.onsuccess = () => {
+        const result = request.result;
+        const latest = result?.latest;
+        const history = Array.isArray(result?.history) ? result.history : [];
+        const candidates = [latest, ...history].filter(isBackupEntryValid);
+        const validCandidate = candidates.find((entry) => entry.checksum === buildBackupChecksum(entry.data));
+        resolve(validCandidate?.data || result?.data || null);
+      };
+      request.onerror = () => resolve(null);
     });
   } catch (err) {
     console.warn("Failed to load from IndexedDB", err);
@@ -4025,17 +4164,31 @@ async function completeOAuthReturn() {
   }
   if (!code) return false;
   if (!supabaseClient && !initSupabase()) return false;
+
+  try {
+    Object.keys(localStorage).forEach((key) => {
+      if (key.startsWith("sb-") || key === "supabase.auth.token") {
+        localStorage.removeItem(key);
+      }
+    });
+  } catch (storageError) {
+    console.warn("Could not clear stale Supabase auth storage before OAuth exchange", storageError);
+  }
+
   cleanAuthQueryFromUrl();
   try {
     const { error } = await supabaseClient.auth.exchangeCodeForSession(code);
     if (error) {
-      setAuthStatus(supabaseAuthMessage(error), "error");
+      const message = supabaseAuthMessage(error);
+      setAuthStatus(message, "error");
+      showLoginScreen();
       return false;
     }
     return true;
   } catch (error) {
     console.error("OAuth callback failed", error);
-    setAuthStatus("Google sign-in failed.", "error");
+    setAuthStatus("Google sign-in failed. Please try signing in again.", "error");
+    showLoginScreen();
     return false;
   }
 }
@@ -4177,6 +4330,7 @@ function exposeAuthApi() {
   window.signInWithEmail = signInWithEmail;
   window.signUpWithEmail = signUpWithEmail;
   window.signOutUser = signOutUser;
+  window.toggleDiagnosticsPanel = toggleDiagnosticsPanel;
 }
 
 async function syncAuthProviderAvailability() {
@@ -4805,60 +4959,86 @@ async function clearAccountFromSupabase(userId, accountId) {
   ]);
 }
 
-function initSupabaseAuth() {
-  if (!initSupabase()) {
-    updateSyncStatus("offline");
-    showLoginScreen();
-    hideSplashScreen();
-    return;
-  }
-  supabaseReady = true;
-  syncAuthProviderAvailability();
-
-  supabaseClient.auth.onAuthStateChange(async (event, session) => {
+async function handleAuthStateChange(event, session) {
+  if (authStateBusy) return;
+  authStateBusy = true;
+  try {
     const user = session?.user || null;
     currentUser = user;
     updateUserRow(user);
 
-    if (!user) {
+    if (event === "INITIAL_SESSION" || event === "SIGNED_IN") {
+      if (!user) {
+        authLoadToken += 1;
+        setAuthBusy(false);
+        resetJournalState();
+        renderCurrentAccount();
+        showLoginScreen();
+        updateSyncStatus("offline");
+        recordDiagnostic("auth", "No active session restored", { event });
+      } else {
+        hideLoginScreen();
+        setAuthBusy(false);
+        resetJournalState(user.id);
+        updateSyncStatus("syncing");
+        recordDiagnostic("auth", "Restoring journal for signed-in user", { userId: user.id, event });
+        await loadFromSupabase(user.id);
+        updateSyncStatus("synced");
+      }
+      hideSplashScreen();
+      return;
+    }
+
+    if (event === "SIGNED_OUT") {
       authLoadToken += 1;
       setAuthBusy(false);
+      clearSessionAuthStorage();
       resetJournalState();
       renderCurrentAccount();
       showLoginScreen();
       updateSyncStatus("offline");
-      hideSplashScreen();
+      recordDiagnostic("auth", "User signed out", { event });
       return;
     }
 
     if (event === "TOKEN_REFRESHED") {
       updateSyncStatus("synced");
-      return;
+      recordDiagnostic("auth", "Session refreshed", { event });
     }
+  } catch (error) {
+    console.warn("Auth state change failed", error);
+    recordDiagnostic("error", "Auth state change failed", { error: String(error?.message || error), event });
+    setAuthStatus("Authentication recovery failed. Please sign in again.", "error");
+  } finally {
+    authStateBusy = false;
+  }
+}
 
-    if (event !== "INITIAL_SESSION" && event !== "SIGNED_IN") {
-      return;
-    }
-
-    hideLoginScreen();
-    setAuthBusy(false);
-    resetJournalState(user.id);
-    updateSyncStatus("syncing");
-    await loadFromSupabase(user.id);
-    updateSyncStatus("synced");
+function initSupabaseAuth() {
+  if (authInitStarted) return;
+  authInitStarted = true;
+  if (!initSupabase()) {
+    updateSyncStatus("offline");
+    showLoginScreen();
     hideSplashScreen();
+    recordDiagnostic("error", "Supabase client initialisation failed");
+    return;
+  }
+  supabaseReady = true;
+  recordDiagnostic("auth", "Supabase client initialised", { url: supabaseConfig?.url });
+  syncAuthProviderAvailability().catch((error) => {
+    console.warn("Could not sync auth provider availability", error);
+  });
+
+  supabaseClient.auth.onAuthStateChange((event, session) => {
+    void handleAuthStateChange(event, session);
   });
 
   completeOAuthReturn().catch((error) => {
     console.warn("OAuth return handling failed", error);
-  });
-
-  supabaseClient.auth.getSession().then(({ data: { session } }) => {
-    if (!session) {
-      showLoginScreen();
-      updateSyncStatus("offline");
-      hideSplashScreen();
-    }
+    showLoginScreen();
+    hideSplashScreen();
+    setAuthStatus("Sign-in failed. Please try again.", "error");
   });
 }
 
@@ -5122,6 +5302,67 @@ function renderMentorMarkdown(text) {
   }).join("");
 }
 
+function buildLocalMentorFallback(snapshot) {
+  const summary = snapshot?.summary || {};
+  const recentTrades = snapshot?.recentTrades || [];
+  const missedTrades = snapshot?.missedTrades || [];
+  const strongTrades = recentTrades.filter((trade) => trade.result === "WIN").length;
+  const weakTrades = recentTrades.filter((trade) => trade.result === "LOSS").length;
+  const commonMistakes = recentTrades.reduce((acc, trade) => {
+    if (trade.mistake) acc[trade.mistake] = (acc[trade.mistake] || 0) + 1;
+    return acc;
+  }, {});
+  const topMistake = Object.entries(commonMistakes).sort((a, b) => b[1] - a[1])[0];
+  const body = [
+    "## LOCAL FALLBACK REVIEW",
+    "Overall Grade: C",
+    `Explanation: The live AI model was unavailable, so this fallback review is based on your recorded journal patterns and risk discipline.`,
+    "",
+    "## BRUTAL TRUTH",
+    `You have ${summary.totalTrades || 0} logged trades with a ${summary.winRate || "0%"} win rate and ${summary.missedTrades || 0} missed trades. The data is limited, but the pattern suggests you are still relying on emotion and inconsistent execution.`,
+    "",
+    "## BEHAVIORAL ALERTS",
+    `- Revenge Trading: ${weakTrades > 0 ? "Possible pattern detected; check trades immediately following losses." : "Not enough evidence."}`,
+    `- FOMO Score: ${recentTrades.filter((trade) => Number(trade.patienceScore) <= 2).length} trades show low patience or rushed entries.`,
+    `- Over-trading: ${recentTrades.filter((trade) => trade.session && trade.session.includes("London")).length > 0 ? "Possible over-trading during busy sessions." : "Not enough evidence."}`,
+    `- Discipline Score: ${Math.round(((strongTrades + recentTrades.filter((trade) => trade.mistake === "No mistake").length) / Math.max(1, recentTrades.length)) * 100)}% — Grade C`,
+    "",
+    "## WHAT IS WORKING",
+    `Your strongest area appears to be ${recentTrades[0]?.session || "session consistency"} when entries are clean and the setup is simple.`,
+    "",
+    "## WHAT IS COSTING MONEY",
+    `${topMistake ? `${topMistake[0]} appears ${topMistake[1]} time(s).` : "Review your notes for repeated mistakes and tighten the execution plan."}`,
+    "",
+    "## BLIND SPOT REPORT",
+    `Skipped trades: ${missedTrades.length}. Treat missed setups as feedback, not as proof that the market was always wrong.`,
+    "",
+    "## MISSED TRADE LESSON",
+    "The missed-trade list is your best data source for discipline. Review the missed entries before taking more risk.",
+    "",
+    "## NEXT 5-TRADE RULES",
+    "1. Only take a trade when the setup matches your plan exactly.",
+    "2. Do not enter immediately after a loss.",
+    "3. Respect your risk size even when the trade feels obvious.",
+    "4. Review your missed trades before trading again.",
+    "5. Keep notes objective and avoid emotional language.",
+    "",
+    "## STOP IMMEDIATELY",
+    "Stop treating every setup as a must-trade. Your poor-quality entries are costing execution quality.",
+    "",
+    "## REPEAT IMMEDIATELY",
+    "Repeat the clean setups that produce consistent wins and keep your notes clear.",
+    "",
+    "## WEEKEND HOMEWORK",
+    "1. Review the last 10 trades for repeated mistakes.",
+    "2. Compare missed trades to executed trades and find your biggest leak.",
+    "3. Write one rule for managing your next session before trading."
+  ].join("\n");
+  const rawHtml = `<article class="mentor-review">${renderMentorMarkdown(body)}</article>`;
+  return typeof DOMPurify !== "undefined"
+    ? DOMPurify.sanitize(rawHtml, { ALLOWED_TAGS: ["article", "section", "header", "h3", "div", "p", "ul", "ol", "li", "strong", "em", "b", "span", "br"], ALLOWED_ATTR: ["class", "aria-label", "aria-hidden"] })
+    : rawHtml;
+}
+
 async function runAiMentorReview() {
   if (mentorRequestInProgress) {
     toast("Analysis already running. Please wait.");
@@ -5159,6 +5400,8 @@ async function runAiMentorReview() {
   mentorSessionKey = key;
   renderAiMentor();
   output.innerHTML = `<div class="mentor-loading"><span class="upload-spinner"></span><b>Analyzing journal...</b></div>`;
+  diagnosticsState.ai = { status: "requesting" };
+  updateDiagnosticsPanel();
   try {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -5189,12 +5432,16 @@ async function runAiMentorReview() {
     output.innerHTML = typeof DOMPurify !== "undefined"
       ? DOMPurify.sanitize(rawHtml, { ALLOWED_TAGS: ["article", "section", "header", "h3", "div", "p", "ul", "ol", "li", "strong", "em", "b", "span", "br"], ALLOWED_ATTR: ["class", "aria-label", "aria-hidden"] })
       : rawHtml;
+    diagnosticsState.ai = { status: "ready", lastModel: data?.model || model };
   } catch (error) {
     console.warn("AI Mentor request failed", error);
-    output.innerHTML = `<div class="empty-state compact-empty"><div><strong>AI review failed</strong><span>${escapeHtml(error.message || "Check your key, model, or network.")}</span></div></div>`;
-    toast("AI Mentor request failed.");
+    const fallbackHtml = buildLocalMentorFallback(mentorTradeSnapshot());
+    output.innerHTML = fallbackHtml;
+    diagnosticsState.ai = { status: "fallback", error: error.message || "network error" };
+    toast("AI Mentor request failed. Showing local fallback analysis.");
   } finally {
     mentorRequestInProgress = false;
+    updateDiagnosticsPanel();
   }
 }
 
@@ -5488,8 +5735,7 @@ if (typeof document !== "undefined") {
       handleScreenshotFile(event.dataTransfer?.files?.[0]);
     });
   }
-  initSupabaseAuth();
-  setTimeout(hideSplashScreen, 3500);
+  void initSupabaseAuth();
 }
 
 function hideSplashScreen() {

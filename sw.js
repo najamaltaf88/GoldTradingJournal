@@ -5,7 +5,6 @@ const APP_FILES = [
   "./app.js?v=20260628-supabase-only-v27",
   "./manifest.json",
   "./icon.svg",
-  "./env-config.js",
   "./auth/callback/index.html"
 ];
 
