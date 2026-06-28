@@ -3337,7 +3337,7 @@ body.show-optional-columns .optional-col {
   position: fixed;
   right: 20px;
   bottom: 20px;
-  z-index: 30;
+  z-index: 110;
   min-width: 220px;
   padding: 10px 14px;
   border: 1px solid var(--line);

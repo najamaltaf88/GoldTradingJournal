@@ -17,7 +17,7 @@
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260627-supabase-v24">
+  <link rel="stylesheet" href="styles.css?v=20260628-auth-fix-v25">
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <script src="env-config.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
@@ -42,16 +42,16 @@
           <span class="auth-badge">Supabase</span>
         </div>
         <div class="auth-mode" role="tablist" aria-label="Authentication mode">
-          <button id="auth-mode-signin" class="active" type="button" role="tab" aria-selected="true" onclick="setAuthMode('signin')">Sign in</button>
-          <button id="auth-mode-signup" type="button" role="tab" aria-selected="false" onclick="setAuthMode('signup')">Create account</button>
+          <button id="auth-mode-signin" class="active" type="button" role="tab" aria-selected="true">Sign in</button>
+          <button id="auth-mode-signup" type="button" role="tab" aria-selected="false">Create account</button>
         </div>
-        <button id="google-login-btn" class="google-btn" type="button" onclick="signInWithGoogle()">
+        <button id="google-login-btn" class="google-btn" type="button">
           <span>G</span>
           <b>Continue with Google</b>
         </button>
         <small id="google-provider-note" class="provider-note"></small>
         <div class="auth-divider"><span>or</span></div>
-        <form id="auth-form" class="email-login-form" novalidate onsubmit="submitAuthForm(event)">
+        <form id="auth-form" class="email-login-form" novalidate>
           <label>
             <span>Email</span>
             <input id="login-email" type="email" autocomplete="email" placeholder="you@example.com" required>
@@ -60,7 +60,7 @@
             <span>Password</span>
             <div class="password-field">
               <input id="login-password" type="password" autocomplete="current-password" minlength="6" placeholder="Minimum 6 characters" required>
-              <button id="password-toggle" type="button" onclick="toggleAuthPassword()" aria-label="Show password"><i data-lucide="eye"></i></button>
+              <button id="password-toggle" type="button" aria-label="Show password"><i data-lucide="eye"></i></button>
             </div>
           </label>
           <button id="auth-submit-btn" type="submit">Sign in with Email</button>
@@ -706,6 +706,6 @@
   </nav>
   <div class="toast" id="toast"></div>
   <div id="print-report" class="print-report"></div>
-  <script src="app.js?v=20260627-supabase-v24"></script>
+  <script src="app.js?v=20260628-auth-fix-v25"></script>
 </body>
 </html>

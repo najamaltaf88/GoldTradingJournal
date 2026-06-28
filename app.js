@@ -21,11 +21,23 @@ function initSupabase() {
   const config = window.SUPABASE_CONFIG;
   if (!config || !config.url || !config.anonKey) {
     console.warn("Supabase config missing. Copy .env.example to .env, then run: node scripts/generate-config.js");
+    setAuthStatus("Supabase config missing. Set SUPABASE_URL and SUPABASE_ANON_KEY in Netlify.", "error");
     return false;
   }
-  supabaseConfig = config;
-  supabaseClient = window.supabase.createClient(config.url, config.anonKey, SUPABASE_AUTH_OPTIONS);
-  return true;
+  if (!window.supabase?.createClient) {
+    console.warn("Supabase JS library failed to load.");
+    setAuthStatus("Could not load Supabase. Check your connection or disable ad blockers.", "error");
+    return false;
+  }
+  try {
+    supabaseConfig = config;
+    supabaseClient = window.supabase.createClient(config.url, config.anonKey, SUPABASE_AUTH_OPTIONS);
+    return true;
+  } catch (error) {
+    console.error("Supabase init failed", error);
+    setAuthStatus("Could not connect to Supabase.", "error");
+    return false;
+  }
 }
 
 const MAX_SCREENSHOT_SIZE = 5 * 1024 * 1024;
@@ -4065,6 +4077,24 @@ function submitAuthForm(event) {
   }
 }
 
+function wireAuthUi() {
+  document.getElementById("auth-mode-signin")?.addEventListener("click", () => setAuthMode("signin"));
+  document.getElementById("auth-mode-signup")?.addEventListener("click", () => setAuthMode("signup"));
+  document.getElementById("google-login-btn")?.addEventListener("click", () => signInWithGoogle());
+  document.getElementById("password-toggle")?.addEventListener("click", () => toggleAuthPassword());
+  document.getElementById("auth-form")?.addEventListener("submit", (event) => submitAuthForm(event));
+}
+
+function exposeAuthApi() {
+  window.setAuthMode = setAuthMode;
+  window.toggleAuthPassword = toggleAuthPassword;
+  window.submitAuthForm = submitAuthForm;
+  window.signInWithGoogle = signInWithGoogle;
+  window.signInWithEmail = signInWithEmail;
+  window.signUpWithEmail = signUpWithEmail;
+  window.signOutUser = signOutUser;
+}
+
 async function syncAuthProviderAvailability() {
   if (!supabaseConfig?.url || !supabaseConfig?.anonKey) return;
   try {
@@ -5300,12 +5330,14 @@ function seedDemoTrades() {
 }
 
 if (typeof document !== "undefined") {
+  exposeAuthApi();
   loadState();
   applyReportPreset();
   renderCurrentAccount();
   showLoginScreen();
   updateSyncStatus("syncing");
   setAuthMode("signin");
+  wireAuthUi();
   refreshIcons();
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !document.getElementById("cash-modal")?.hidden) closeCashModal();

@@ -1,8 +1,8 @@
-const CACHE_NAME = "gold-journal-v24";
+const CACHE_NAME = "gold-journal-v25";
 const APP_FILES = [
   "./",
-  "./styles.css?v=20260627-supabase-v24",
-  "./app.js?v=20260627-supabase-v24",
+  "./styles.css?v=20260628-auth-fix-v25",
+  "./app.js?v=20260628-auth-fix-v25",
   "./manifest.json",
   "./icon.svg",
   "./env-config.js",
