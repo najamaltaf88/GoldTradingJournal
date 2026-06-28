@@ -116,17 +116,6 @@
       }
 
       try {
-        // CRITICAL: Use localStorage (same as main app) so session persists
-        try {
-          Object.keys(localStorage).forEach((key) => {
-            if (key.startsWith('sb-') || key === 'supabase.auth.token') {
-              localStorage.removeItem(key);
-            }
-          });
-        } catch (storageError) {
-          console.warn('Could not clear stale Supabase auth storage on callback page', storageError);
-        }
-
         const client = window.supabase.createClient(config.url, config.anonKey, {
           auth: {
             detectSessionInUrl: true,
@@ -142,14 +131,19 @@
         });
 
         const { error } = await client.auth.exchangeCodeForSession(code);
-
         if (error) {
           showError('Sign-in failed: ' + error.message);
-        } else {
-          msg.textContent = 'Signed in successfully! Redirecting...';
-          // Small delay so user sees success state
-          setTimeout(() => window.location.replace('/'), 800);
+          return;
         }
+
+        const { data: sessionData, error: sessionError } = await client.auth.getSession();
+        if (sessionError || !sessionData?.session) {
+          showError('Sign-in failed: Session was not persisted after OAuth exchange.');
+          return;
+        }
+
+        msg.textContent = 'Signed in successfully! Redirecting...';
+        setTimeout(() => window.location.replace('/'), 800);
       } catch (err) {
         console.error('Callback error', err);
         showError('An unexpected error occurred. Please try signing in again.');

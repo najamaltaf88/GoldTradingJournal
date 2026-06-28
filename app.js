@@ -4165,16 +4165,6 @@ async function completeOAuthReturn() {
   if (!code) return false;
   if (!supabaseClient && !initSupabase()) return false;
 
-  try {
-    Object.keys(localStorage).forEach((key) => {
-      if (key.startsWith("sb-") || key === "supabase.auth.token") {
-        localStorage.removeItem(key);
-      }
-    });
-  } catch (storageError) {
-    console.warn("Could not clear stale Supabase auth storage before OAuth exchange", storageError);
-  }
-
   cleanAuthQueryFromUrl();
   try {
     const { error } = await supabaseClient.auth.exchangeCodeForSession(code);
@@ -4184,6 +4174,12 @@ async function completeOAuthReturn() {
       showLoginScreen();
       return false;
     }
+
+    const { data: sessionData, error: sessionError } = await supabaseClient.auth.getSession();
+    if (sessionError || !sessionData?.session) {
+      throw new Error("Session was not persisted after OAuth exchange");
+    }
+
     return true;
   } catch (error) {
     console.error("OAuth callback failed", error);
@@ -4992,7 +4988,6 @@ async function handleAuthStateChange(event, session) {
     if (event === "SIGNED_OUT") {
       authLoadToken += 1;
       setAuthBusy(false);
-      clearSessionAuthStorage();
       resetJournalState();
       renderCurrentAccount();
       showLoginScreen();
@@ -5014,7 +5009,7 @@ async function handleAuthStateChange(event, session) {
   }
 }
 
-function initSupabaseAuth() {
+async function initSupabaseAuth() {
   if (authInitStarted) return;
   authInitStarted = true;
   if (!initSupabase()) {
@@ -5034,12 +5029,29 @@ function initSupabaseAuth() {
     void handleAuthStateChange(event, session);
   });
 
-  completeOAuthReturn().catch((error) => {
+  const { data: initialSessionData, error: initialSessionError } = await supabaseClient.auth.getSession();
+  if (initialSessionError) {
+    recordDiagnostic("auth", "Initial session read failed", { error: String(initialSessionError.message || initialSessionError) });
+  }
+
+  const callbackHandled = await completeOAuthReturn().catch((error) => {
     console.warn("OAuth return handling failed", error);
-    showLoginScreen();
-    hideSplashScreen();
     setAuthStatus("Sign-in failed. Please try again.", "error");
+    return false;
   });
+
+  if (initialSessionData?.session) {
+    recordDiagnostic("auth", "Initial session restored on startup", { userId: initialSessionData.session.user?.id });
+    return;
+  }
+
+  if (callbackHandled) {
+    return;
+  }
+
+  showLoginScreen();
+  hideSplashScreen();
+  recordDiagnostic("auth", "No active session available on startup");
 }
 
 function switchTab(name, button) {
