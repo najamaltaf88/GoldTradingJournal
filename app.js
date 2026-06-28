@@ -266,17 +266,22 @@ function resetJournalState(ownerUid = "") {
   activeAccountId = DEFAULT_ACCOUNT_ID;
   state = emptyJournalState(ownerUid);
   accountData[activeAccountId] = clone(state);
+  mentorSessionKey = "";
 }
 
 function clearSessionAuthStorage() {
   try {
     // Clear Supabase auth tokens from localStorage on explicit logout
     Object.keys(localStorage).forEach((key) => {
-      if (key.startsWith("sb-")) localStorage.removeItem(key);
+      if (key.startsWith("sb-") || key === "supabase.auth.token" || key.startsWith("gj_session_")) {
+        localStorage.removeItem(key);
+      }
     });
     // Also clear from sessionStorage for any legacy tokens
     Object.keys(sessionStorage).forEach((key) => {
-      if (key.startsWith("sb-")) sessionStorage.removeItem(key);
+      if (key.startsWith("sb-") || key === "supabase.auth.token" || key.startsWith("gj_")) {
+        sessionStorage.removeItem(key);
+      }
     });
   } catch (error) {
     console.warn("Could not clear auth storage", error);
@@ -4035,17 +4040,22 @@ async function completeOAuthReturn() {
   }
 }
 
-async function removeLegacyServiceWorker() {
+async function migrateOldCaches() {
   if (!("serviceWorker" in navigator)) return;
   try {
+    const key = "gj_cache_migrated_v27";
+    if (localStorage.getItem(key)) return; // Already migrated, don't run again
+
     const registrations = await navigator.serviceWorker.getRegistrations();
     await Promise.all(registrations.map((registration) => registration.unregister()));
     if ("caches" in window) {
       const keys = await caches.keys();
       await Promise.all(keys.map((key) => caches.delete(key)));
     }
+    localStorage.setItem(key, "true");
+    console.log("One-time Service Worker cache migration completed.");
   } catch (error) {
-    console.warn("Could not remove legacy service worker", error);
+    console.warn("Could not migrate legacy service worker caches", error);
   }
 }
 
@@ -4089,7 +4099,10 @@ function setAuthMode(mode = "signin") {
 
   if (title) title.textContent = isSignup ? "Create account" : "Sign in";
   if (submit) submit.textContent = isSignup ? "Create account" : "Sign in with Email";
-  if (password) password.autocomplete = isSignup ? "new-password" : "current-password";
+  if (password) {
+    password.autocomplete = isSignup ? "new-password" : "current-password";
+    password.placeholder = isSignup ? "Minimum 8 characters recommended" : "Minimum 6 characters";
+  }
   if (signInTab) {
     signInTab.classList.toggle("active", !isSignup);
     signInTab.setAttribute("aria-selected", String(!isSignup));
@@ -4121,10 +4134,21 @@ function authFormValues() {
 }
 
 function validateAuthForm(email, password) {
-  if (!email) return "Enter your email address.";
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return "Enter a valid email address.";
+  const cleanEmail = String(email || "").trim().toLowerCase();
+  if (!cleanEmail) return "Enter your email address.";
+  if (/\s/.test(cleanEmail)) return "Email cannot contain spaces.";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) return "Enter a valid email address.";
   if (!password) return "Enter your password.";
   if (password.length < 6) return "Password must be at least 6 characters.";
+  
+  if (authMode === "signup") {
+    if (password.startsWith(" ") || password.endsWith(" ")) {
+      return "Password cannot start or end with spaces.";
+    }
+    if (password.length < 8) {
+      return "Password should be at least 8 characters for better security.";
+    }
+  }
   return "";
 }
 
@@ -4221,13 +4245,18 @@ async function signInWithEmail(event) {
     toast(message);
     return;
   }
-  const { email, password } = authFormValues();
+  
+  const rawForm = authFormValues();
+  const email = String(rawForm.email || "").trim().toLowerCase();
+  const password = rawForm.password;
+  
   const validationError = validateAuthForm(email, password);
   if (validationError) {
     setAuthStatus(validationError, "error");
     toast(validationError);
     return;
   }
+  
   setAuthBusy(true);
   setAuthStatus("Signing in...");
   try {
@@ -4258,13 +4287,18 @@ async function signUpWithEmail(event) {
     toast(message);
     return;
   }
-  const { email, password } = authFormValues();
+  
+  const rawForm = authFormValues();
+  const email = String(rawForm.email || "").trim().toLowerCase();
+  const password = rawForm.password;
+  
   const validationError = validateAuthForm(email, password);
   if (validationError) {
     setAuthStatus(validationError, "error");
     toast(validationError);
     return;
   }
+  
   setAuthBusy(true);
   setAuthStatus("Creating account...");
   try {
@@ -4352,11 +4386,32 @@ function updateProfileCard(user = currentUser) {
 }
 
 function supabaseAuthMessage(error) {
-  const msg = error?.message || "";
+  const msg = String(error?.message || "");
+  const code = String(error?.code || "");
+  
   if (msg.includes("Invalid login credentials")) return "Email or password is incorrect.";
   if (msg.includes("User already registered")) return "This email is already registered. Sign in instead.";
   if (msg.includes("Password should be")) return "Password must be at least 6 characters.";
   if (msg.includes("Email not confirmed")) return "Please confirm your email first.";
+  
+  // Rate limits
+  if (msg.includes("Email rate limit exceeded") || code === "over_email_send_rate_limit") {
+    return "Too many verification emails sent. Please wait a few minutes and try again.";
+  }
+  if (msg.includes("too many requests") || code === "too_many_requests") {
+    return "Too many requests. Please slow down and try again in a few minutes.";
+  }
+  
+  // Registration disabled
+  if (msg.includes("Signups not allowed") || msg.includes("Signup is disabled")) {
+    return "New registrations are currently disabled by the administrator.";
+  }
+  
+  // Invalid formats
+  if (msg.includes("Invalid email") || msg.includes("invalid format")) {
+    return "Please enter a valid email address.";
+  }
+  
   return "Authentication failed: " + msg;
 }
 
@@ -4385,7 +4440,16 @@ function updateSyncStatus(status) {
   const label = wrap.querySelector(".sync-label");
   if (!dot || !label) return;
   dot.className = `sync-dot ${status}`;
-  label.textContent = status === "synced" ? "Synced to Supabase" : status === "syncing" ? "Syncing..." : "Sign in required";
+  
+  if (status === "synced") {
+    label.textContent = "Synced to Supabase";
+  } else if (status === "syncing") {
+    label.textContent = "Syncing...";
+  } else if (status === "error") {
+    label.textContent = "Sync error";
+  } else {
+    label.textContent = "Not signed in";
+  }
 }
 
 // =============================================
@@ -4764,6 +4828,11 @@ function initSupabaseAuth() {
       showLoginScreen();
       updateSyncStatus("offline");
       hideSplashScreen();
+      return;
+    }
+
+    if (event === "TOKEN_REFRESHED") {
+      updateSyncStatus("synced");
       return;
     }
 
@@ -5368,15 +5437,18 @@ function seedDemoTrades() {
 if (typeof document !== "undefined") {
   exposeAuthApi();
   purgeLegacyJournalStorage();
+  migrateOldCaches();
   resetJournalState();
   applyReportPreset();
   renderCurrentAccount();
-  showLoginScreen();
-  updateSyncStatus("offline");
   setAuthMode("signin");
   wireAuthUi();
   refreshIcons();
-  removeLegacyServiceWorker();
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js?v=20260628-supabase-only-v27")
+      .catch((err) => console.warn("Service worker registration failed:", err));
+  }
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !document.getElementById("cash-modal")?.hidden) closeCashModal();
     if (event.key === "Escape" && !document.getElementById("trade-modal")?.hidden) closeTradeModal();
