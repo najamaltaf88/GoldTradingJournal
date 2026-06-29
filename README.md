@@ -38,6 +38,30 @@ On **Netlify**, set the same variables under Site settings → Environment varia
 
 The anon key is safe in client-side output. Row Level Security protects data. Never put the `service_role` key in `.env` for this app.
 
+## Storage model
+
+- **Supabase only** for journal data (trades, accounts, reviews, options, screenshots).
+- **No localStorage** for journal data — old cached keys are cleared on startup.
+- **localStorage** holds the Supabase auth session so it can persist across browser restarts on the same origin.
+- **In-memory only** for the OpenRouter mentor API key (never written to disk).
+
+## Google sign-in redirect URLs
+
+Add **all** of these in Supabase → Authentication → URL Configuration → Redirect URLs:
+
+```
+https://goldtradingjournal.netlify.app/auth/callback
+https://goldtradingjournal.netlify.app/
+http://localhost:3000/auth/callback
+http://localhost:3000/
+http://127.0.0.1:8000/auth/callback
+http://127.0.0.1:8000/
+```
+
+Set **Site URL** to your production URL (`https://goldtradingjournal.netlify.app`) or local dev URL (`http://localhost:3000`).
+
+If Google redirects to `/?code=...` instead of `/auth/callback`, the app now handles that automatically.
+
 ## Run locally
 
 ```powershell
@@ -48,14 +72,14 @@ npm start
 
 `npm start` generates `env-config.js` then serves on `http://127.0.0.1:8000`.
 
-For Google sign-in locally, add `http://127.0.0.1:8000/auth/callback` to Supabase Auth redirect URLs.
+For port 3000 (e.g. `npx serve -p 3000`), use the localhost:3000 redirect URLs above.
 
 ## Supabase setup
 
 1. Create a project at [supabase.com](https://supabase.com).
 2. Run `supabase/schema.sql` in **SQL Editor**.
 3. Enable **Google** under Authentication → Providers.
-4. Add redirect URL: `https://YOUR-SITE.netlify.app/auth/callback` (and local URL for dev).
+4. Add redirect URLs (see **Google sign-in redirect URLs** below).
 5. Create a public **screenshots** storage bucket (5MB limit).
 6. Copy **Project URL** and **anon public** key into `.env`.
 
@@ -67,7 +91,7 @@ For Google sign-in locally, add `http://127.0.0.1:8000/auth/callback` to Supabas
 - `auth/callback/index.html` — Google OAuth redirect
 - `supabase/schema.sql` — database schema
 - `netlify.toml` — Netlify build (runs config generator)
-- `manifest.json` / `sw.js` — PWA
+- `manifest.json` — PWA manifest (no offline journal cache)
 
 ## Deploy to Netlify
 
@@ -82,8 +106,9 @@ Uploads go to Supabase Storage (`screenshots` bucket). Sign-in required.
 
 ## Storage model
 
-- **Supabase** is the source of truth after login.
-- **localStorage** is an offline write buffer only.
+- **Supabase** is the only store for journal data after sign-in.
+- **sessionStorage** keeps the auth session for the current tab only.
+- Service worker caching for the app shell has been removed to avoid stale data conflicts.
 
 ## Export
 

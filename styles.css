@@ -142,6 +142,207 @@ button {
   display: none;
 }
 
+.diagnostics-panel {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: rgba(6, 9, 13, 0.9);
+}
+
+.diagnostics-content {
+  display: grid;
+  gap: 8px;
+}
+
+.diag-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.diag-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 11px;
+}
+
+.diag-card strong {
+  color: var(--gold);
+}
+
+/* =============================================
+   SPLASH SCREEN
+   ============================================= */
+
+@keyframes splashLogoIn {
+  from { opacity: 0; transform: scale(0.7) translateY(20px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+@keyframes splashTextIn {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes splashBarFill {
+  from { width: 0%; }
+  to   { width: 100%; }
+}
+
+@keyframes splashGlow {
+  0%, 100% { opacity: 0.4; transform: scale(1); }
+  50%       { opacity: 0.9; transform: scale(1.18); }
+}
+
+@keyframes splashShimmer {
+  0%   { background-position: -200% center; }
+  100% { background-position: 200% center; }
+}
+
+@keyframes splashFadeOut {
+  from { opacity: 1; }
+  to   { opacity: 0; pointer-events: none; }
+}
+
+.splash-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(ellipse at 50% 40%, rgba(223, 171, 55, 0.12) 0%, transparent 60%),
+    radial-gradient(ellipse at 80% 80%, rgba(20, 184, 166, 0.07) 0%, transparent 50%),
+    var(--bg);
+  transition: opacity 0.45s ease;
+}
+
+.splash-screen.hiding {
+  animation: splashFadeOut 0.45s ease forwards;
+}
+
+.splash-screen.hidden-done {
+  display: none;
+}
+
+.splash-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  text-align: center;
+}
+
+.splash-logo {
+  position: relative;
+  width: 88px;
+  height: 88px;
+  animation: splashLogoIn 0.55s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+.splash-mark {
+  position: relative;
+  z-index: 2;
+  width: 88px;
+  height: 88px;
+  border-radius: 26px;
+  background: linear-gradient(135deg, #f0bd55 0%, #dfab37 40%, #c8920f 100%);
+  box-shadow:
+    0 0 0 1px rgba(223, 171, 55, 0.25),
+    0 8px 32px rgba(223, 171, 55, 0.3),
+    0 24px 60px rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font);
+  font-size: 28px;
+  font-weight: 800;
+  color: #0b0a08;
+  letter-spacing: -1px;
+  background-size: 200% auto;
+  animation:
+    splashLogoIn 0.55s cubic-bezier(0.34, 1.56, 0.64, 1) both,
+    splashShimmer 2.5s linear 0.6s infinite;
+  background-image: linear-gradient(
+    110deg,
+    #c8920f 0%,
+    #dfab37 25%,
+    #fcd882 45%,
+    #ffec99 50%,
+    #fcd882 55%,
+    #dfab37 75%,
+    #c8920f 100%
+  );
+}
+
+.splash-glow {
+  position: absolute;
+  inset: -18px;
+  border-radius: 44px;
+  background: radial-gradient(circle, rgba(223, 171, 55, 0.35) 0%, transparent 70%);
+  animation: splashGlow 2s ease-in-out infinite;
+  z-index: 1;
+}
+
+.splash-text {
+  animation: splashTextIn 0.5s ease 0.3s both;
+}
+
+.splash-title {
+  margin: 0 0 4px;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  color: var(--text);
+  line-height: 1.1;
+}
+
+.splash-sub {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--gold);
+  opacity: 0.8;
+}
+
+.splash-bar {
+  width: 180px;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 99px;
+  overflow: hidden;
+  animation: splashTextIn 0.5s ease 0.5s both;
+}
+
+.splash-bar-fill {
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, #dfab37, #fcd882, #dfab37);
+  background-size: 200% auto;
+  animation:
+    splashBarFill 2.5s cubic-bezier(0.4, 0, 0.2, 1) 0.6s both,
+    splashShimmer 1.5s linear 0.6s infinite;
+}
+
+.splash-hint {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--quiet);
+  animation: splashTextIn 0.5s ease 0.7s both;
+}
+
+/* =============================================
+   LOGIN SCREEN
+   ============================================= */
+
 #login-screen {
   position: fixed;
   inset: 0;
@@ -3337,7 +3538,7 @@ body.show-optional-columns .optional-col {
   position: fixed;
   right: 20px;
   bottom: 20px;
-  z-index: 30;
+  z-index: 110;
   min-width: 220px;
   padding: 10px 14px;
   border: 1px solid var(--line);

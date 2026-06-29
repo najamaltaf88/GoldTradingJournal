@@ -7,13 +7,130 @@ let authProviders = { email: true, google: true };
 let authMode = "signin";
 let authBusy = false;
 let authPasswordVisible = false;
+let authInitStarted = false;
+let authStateBusy = false;
+let diagnosticsState = {
+  auth: {},
+  storage: {},
+  cache: {},
+  ai: {},
+  performance: {},
+  events: []
+};
+
+function safeStorageGet(storage, key, fallback = "") {
+  try {
+    const value = storage?.getItem?.(key);
+    return value ?? fallback;
+  } catch (error) {
+    console.warn("Storage read failed", error);
+    return fallback;
+  }
+}
+
+function safeStorageSet(storage, key, value) {
+  try {
+    storage?.setItem?.(key, value);
+    return true;
+  } catch (error) {
+    console.warn("Storage write failed", error);
+    return false;
+  }
+}
+
+function safeStorageRemove(storage, key) {
+  try {
+    storage?.removeItem?.(key);
+    return true;
+  } catch (error) {
+    console.warn("Storage remove failed", error);
+    return false;
+  }
+}
+
+function safeStorageClearMatching(storage, predicate) {
+  try {
+    const keys = Object.keys(storage || {});
+    keys.filter((key) => predicate(key)).forEach((key) => storage.removeItem(key));
+    return true;
+  } catch (error) {
+    console.warn("Storage clear failed", error);
+    return false;
+  }
+}
+
+function recordDiagnostic(kind, message, detail = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    kind,
+    message,
+    detail
+  };
+  diagnosticsState.events.push(entry);
+  if (diagnosticsState.events.length > 80) diagnosticsState.events = diagnosticsState.events.slice(-80);
+  if (typeof console !== "undefined") {
+    const logger = kind === "error" ? console.error : console.info;
+    logger(`[${kind}] ${message}`, detail);
+  }
+  updateDiagnosticsPanel();
+}
+
+function updateDiagnosticsPanel() {
+  const panel = document.getElementById("diagnostics-panel");
+  const content = document.getElementById("diagnostics-content");
+  if (!panel || !content) return;
+  const memoryUsage = typeof performance !== "undefined" && performance.memory ? `${Math.round(performance.memory.usedJSHeapSize / 1048576)}MB / ${Math.round(performance.memory.jsHeapSizeLimit / 1048576)}MB` : "n/a";
+  const authState = currentUser ? `signed in (${currentUser.email || currentUser.id || "user"})` : "signed out";
+  const dbState = supabaseReady ? "Supabase ready" : "offline";
+  const storageState = typeof indexedDB !== "undefined" ? "IndexedDB available" : "unavailable";
+  const cacheState = "serviceWorker" in navigator ? (navigator.serviceWorker.controller ? "active" : "ready") : "disabled";
+  const aiState = diagnosticsState.ai?.status || "idle";
+  const backgroundTasks = `${diagnosticsState.events.length} events`;
+  content.innerHTML = `
+    <div class="diag-grid">
+      <div class="diag-card"><strong>Auth</strong><span>${escapeHtml(authState)}</span></div>
+      <div class="diag-card"><strong>Database</strong><span>${escapeHtml(dbState)}</span></div>
+      <div class="diag-card"><strong>Storage</strong><span>${escapeHtml(storageState)}</span></div>
+      <div class="diag-card"><strong>Cache</strong><span>${escapeHtml(cacheState)}</span></div>
+      <div class="diag-card"><strong>AI</strong><span>${escapeHtml(aiState)}</span></div>
+      <div class="diag-card"><strong>Memory</strong><span>${escapeHtml(memoryUsage)}</span></div>
+      <div class="diag-card"><strong>Background</strong><span>${escapeHtml(backgroundTasks)}</span></div>
+      <div class="diag-card"><strong>Last Event</strong><span>${escapeHtml(diagnosticsState.events.at(-1)?.message || "none")}</span></div>
+    </div>
+  `;
+}
+
+function toggleDiagnosticsPanel() {
+  const panel = document.getElementById("diagnostics-panel");
+  if (!panel) return;
+  panel.hidden = !panel.hidden;
+  updateDiagnosticsPanel();
+}
+
+function installGlobalErrorHandlers() {
+  window.addEventListener("error", (event) => {
+    const message = event.error?.message || event.message || "Unhandled runtime error";
+    recordDiagnostic("error", message, { filename: event.filename, lineno: event.lineno, colno: event.colno });
+    if (typeof toast === "function") toast("A runtime error occurred. Check diagnostics for details.");
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason?.message || String(event.reason || "Unhandled promise rejection");
+    recordDiagnostic("error", reason, { stack: event.reason?.stack || "" });
+    if (typeof toast === "function") toast("A background operation failed. Check diagnostics for details.");
+  });
+}
 
 const SUPABASE_AUTH_OPTIONS = {
   auth: {
-    detectSessionInUrl: false,
+    detectSessionInUrl: true,
     persistSession: true,
     autoRefreshToken: true,
-    flowType: "pkce"
+    flowType: "pkce",
+    storage: {
+      getItem: (key) => safeStorageGet(localStorage, key, null),
+      setItem: (key, value) => safeStorageSet(localStorage, key, value),
+      removeItem: (key) => safeStorageRemove(localStorage, key)
+    }
   }
 };
 
@@ -21,21 +138,33 @@ function initSupabase() {
   const config = window.SUPABASE_CONFIG;
   if (!config || !config.url || !config.anonKey) {
     console.warn("Supabase config missing. Copy .env.example to .env, then run: node scripts/generate-config.js");
+    setAuthStatus("Supabase config missing. Set SUPABASE_URL and SUPABASE_ANON_KEY in Netlify.", "error");
     return false;
   }
-  supabaseConfig = config;
-  supabaseClient = window.supabase.createClient(config.url, config.anonKey, SUPABASE_AUTH_OPTIONS);
-  return true;
+  if (!window.supabase?.createClient) {
+    console.warn("Supabase JS library failed to load.");
+    setAuthStatus("Could not load Supabase. Check your connection or disable ad blockers.", "error");
+    return false;
+  }
+  try {
+    supabaseConfig = config;
+    supabaseClient = window.supabase.createClient(config.url, config.anonKey, SUPABASE_AUTH_OPTIONS);
+    return true;
+  } catch (error) {
+    console.error("Supabase init failed", error);
+    setAuthStatus("Could not connect to Supabase.", "error");
+    return false;
+  }
 }
 
 const MAX_SCREENSHOT_SIZE = 5 * 1024 * 1024;
 
-const KEY = "xau_journal_v6";
-const LEGACY_KEY = "xau_journal_v5";
-const SKIPPED_KEY = "skippedTrades";
-const ACCOUNTS_KEY = "xau_journal_accounts_v1";
-const MENTOR_KEY = "xau_journal_openrouter_key";
-const MENTOR_MODEL_KEY = "xau_journal_openrouter_model";
+const LEGACY_JOURNAL_KEYS = [
+  "xau_journal_v6",
+  "xau_journal_v5",
+  "skippedTrades",
+  "xau_journal_accounts_v1"
+];
 const DEFAULT_ACCOUNT_ID = "main";
 const DEFAULT_MENTOR_MODEL = "openrouter/auto";
 
@@ -105,6 +234,7 @@ let viewTradeIndex = null;
 let analysisTimer = null;
 let currentUser = null;
 let screenshotUploadToken = 0;
+let mentorSessionKey = "";
 
 let mentorRequestInProgress = false;
 let lastMentorRequestTime = 0;
@@ -225,102 +355,39 @@ function mergeOptions(baseOptions = {}, incomingOptions = {}) {
   return normalizeOptions(merged);
 }
 
-function loadState() {
-  const accountStore = loadAccountStore();
-  if (accountStore) {
-    accounts = accountStore.accounts;
-    accountData = accountStore.data;
-    activeAccountId = accountStore.activeAccountId;
-    ensureAccountState();
-    return;
-  }
-
-  const savedSkippedTrades = loadSkippedTradesFromLocal();
-  const raw = localStorage.getItem(KEY) || localStorage.getItem(LEGACY_KEY);
-  accounts = [defaultAccount()];
-  accountData = {};
-  activeAccountId = DEFAULT_ACCOUNT_ID;
-  if (!raw) {
-    state = emptyJournalState();
-    state.skippedTrades = savedSkippedTrades;
-    accountData[activeAccountId] = clone(state);
-    persistLocalState();
-    return;
-  }
+function purgeLegacyJournalStorage() {
   try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.trades)) {
-      state = emptyJournalState();
-      state.skippedTrades = savedSkippedTrades;
-      accountData[activeAccountId] = clone(state);
-      persistLocalState();
-      return;
-    }
-    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.id) {
-      state = emptyJournalState(currentUser.id);
-      accountData[activeAccountId] = clone(state);
-      persistLocalState();
-      return;
-    }
-    state = normalizeJournalState({
-      ...parsed,
-      skippedTrades: savedSkippedTrades.length ? savedSkippedTrades : parsed.skippedTrades
-    });
-    accountData[activeAccountId] = clone(state);
-    persistLocalState();
+    LEGACY_JOURNAL_KEYS.forEach((key) => safeStorageRemove(localStorage, key));
+    // Note: sb- (Supabase auth) keys are intentionally kept in localStorage for session persistence
   } catch (error) {
-    console.warn("Could not load journal state", error);
+    console.warn("Could not purge legacy browser storage", error);
   }
 }
 
-function loadAccountStore() {
-  const raw = localStorage.getItem(ACCOUNTS_KEY);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.accounts) || !parsed.data) return null;
-    if (currentUser && parsed.ownerUid && parsed.ownerUid !== currentUser.id) return null;
-    const normalizedAccounts = parsed.accounts.map(normalizeAccount).filter((account) => account.id);
-    const nextAccounts = normalizedAccounts.length ? normalizedAccounts : [defaultAccount()];
-    const nextData = {};
-    nextAccounts.forEach((account) => {
-      nextData[account.id] = normalizeJournalState(parsed.data[account.id] || {});
-    });
-    const selected = nextAccounts.some((account) => account.id === parsed.activeAccountId) ? parsed.activeAccountId : nextAccounts[0].id;
-    return { accounts: nextAccounts, data: nextData, activeAccountId: selected };
-  } catch (error) {
-    console.warn("Could not load account store", error);
-    return null;
-  }
-}
-
-function loadSkippedTradesFromLocal() {
-  const raw = localStorage.getItem(SKIPPED_KEY);
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.map(normalizeSkippedTrade) : [];
-  } catch (error) {
-    console.warn("Could not load skipped trades", error);
-    return [];
-  }
-}
-
-function persistLocalState() {
+function syncMemoryState() {
   if (currentUser) state.ownerUid = currentUser.id;
   state = normalizeJournalState(state);
   if (!accounts.length) accounts = [defaultAccount()];
   if (!accounts.some((account) => account.id === activeAccountId)) activeAccountId = accounts[0].id;
   accountData[activeAccountId] = clone(state);
-  const store = {
-    ownerUid: currentUser?.id || state.ownerUid || "",
-    activeAccountId,
-    accounts,
-    data: accountData
-  };
-  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(store));
-  localStorage.setItem(KEY, JSON.stringify(state));
-  localStorage.setItem(SKIPPED_KEY, JSON.stringify(state.skippedTrades));
+}
+
+function resetJournalState(ownerUid = "") {
+  accounts = [defaultAccount()];
+  accountData = {};
+  activeAccountId = DEFAULT_ACCOUNT_ID;
+  state = emptyJournalState(ownerUid);
+  accountData[activeAccountId] = clone(state);
+  mentorSessionKey = "";
+}
+
+function clearSessionAuthStorage() {
+  try {
+    safeStorageClearMatching(localStorage, (key) => key.startsWith("sb-") || key === "supabase.auth.token" || key.startsWith("gj_session_"));
+    safeStorageClearMatching(sessionStorage, (key) => key.startsWith("sb-") || key === "supabase.auth.token" || key.startsWith("gj_"));
+  } catch (error) {
+    console.warn("Could not clear auth storage", error);
+  }
 }
 
 function normalizeOptions(options) {
@@ -421,27 +488,113 @@ function normalizeWeeklyReview(review) {
   };
 }
 
+function openJournalDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open("GoldJournalOffline", 2);
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains("backups")) {
+        db.createObjectStore("backups", { keyPath: "key" });
+      }
+    };
+    request.onsuccess = (event) => resolve(event.target.result);
+    request.onerror = (event) => reject(event.target.error);
+  });
+}
+
+function buildBackupChecksum(payload) {
+  const text = typeof payload === "string" ? payload : JSON.stringify(payload || {});
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash << 5) - hash + text.charCodeAt(i);
+    hash |= 0;
+  }
+  return String(hash);
+}
+
+function isBackupEntryValid(entry) {
+  return entry && typeof entry === "object" && entry.data && typeof entry.updatedAt === "string" && typeof entry.checksum === "string";
+}
+
+async function saveToIndexedDB(userId, accountId, data) {
+  try {
+    const db = await openJournalDB();
+    const tx = db.transaction("backups", "readwrite");
+    const store = tx.objectStore("backups");
+    const key = `${userId || "anonymous"}_${accountId}`;
+    const snapshot = {
+      key,
+      data: clone(data),
+      updatedAt: new Date().toISOString(),
+      checksum: buildBackupChecksum(data),
+      version: 2
+    };
+    const existingRequest = store.get(key);
+    return new Promise((resolve, reject) => {
+      existingRequest.onsuccess = () => {
+        const existing = existingRequest.result || {};
+        const history = Array.isArray(existing.history) ? existing.history.filter(isBackupEntryValid) : [];
+        history.unshift(snapshot);
+        history.splice(5);
+        store.put({ key, history, latest: snapshot, updatedAt: snapshot.updatedAt });
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      existingRequest.onerror = () => reject(existingRequest.error);
+    });
+  } catch (err) {
+    console.warn("Failed to save to IndexedDB", err);
+    recordDiagnostic("error", "Local backup save failed", { accountId, error: String(err?.message || err) });
+  }
+}
+
+async function loadFromIndexedDB(userId, accountId) {
+  try {
+    const db = await openJournalDB();
+    const tx = db.transaction("backups", "readonly");
+    const store = tx.objectStore("backups");
+    const key = `${userId || "anonymous"}_${accountId}`;
+    const request = store.get(key);
+    return new Promise((resolve) => {
+      request.onsuccess = () => {
+        const result = request.result;
+        const latest = result?.latest;
+        const history = Array.isArray(result?.history) ? result.history : [];
+        const candidates = [latest, ...history].filter(isBackupEntryValid);
+        const validCandidate = candidates.find((entry) => entry.checksum === buildBackupChecksum(entry.data));
+        resolve(validCandidate?.data || result?.data || null);
+      };
+      request.onerror = () => resolve(null);
+    });
+  } catch (err) {
+    console.warn("Failed to load from IndexedDB", err);
+    return null;
+  }
+}
+
 async function save() {
-  // Guard: never save if no active account
   if (!activeAccountId || !accounts.some((a) => a.id === activeAccountId)) {
     console.warn("save() aborted: no valid active account.");
     return;
   }
-  try {
-    persistLocalState();
-    renderAccountSelector();
-  } catch (error) {
-    console.warn("Could not save local state", error);
+  syncMemoryState();
+  renderAccountSelector();
+
+  // Save to offline local backup
+  await saveToIndexedDB(currentUser?.id, activeAccountId, state);
+  await saveToIndexedDB(currentUser?.id, "accounts_list", accounts);
+
+  if (!currentUser || !supabaseReady) {
+    toast("Saved locally (offline mode).");
     updateSyncStatus("offline");
+    return;
   }
-  if (currentUser && supabaseReady) {
-    try {
-      await saveToSupabase();
-    } catch (error) {
-      console.warn("Could not sync to Supabase", error);
-      updateSyncStatus("offline");
-      toast("Sync failed. Data saved locally.");
-    }
+  try {
+    await saveToSupabase();
+  } catch (error) {
+    console.warn("Could not sync to Supabase", error);
+    updateSyncStatus("offline");
+    toast("Sync failed. Saved locally (offline backup).");
   }
 }
 
@@ -524,16 +677,27 @@ function round1(value) {
 }
 
 function recalcCum() {
+  const sorted = state.trades.slice().sort((a, b) => {
+    const dateCmp = String(a.date || "").localeCompare(String(b.date || ""));
+    if (dateCmp !== 0) return dateCmp;
+    return String(a.id || "").localeCompare(String(b.id || ""));
+  });
   let cum = 0;
-  state.trades.forEach((trade) => {
+  const byId = new Map();
+  sorted.forEach((trade) => {
     const pnl = calcPnl(trade.risk, trade.reward, trade.result);
-    trade.pnl = pnl;
     if (pnl === "") {
-      trade.cum = "";
+      byId.set(trade.id, { pnl: "", cum: "" });
       return;
     }
     cum = round1(cum + parseFloat(pnl || 0));
-    trade.cum = cum;
+    byId.set(trade.id, { pnl, cum });
+  });
+  state.trades.forEach((trade) => {
+    const row = byId.get(trade.id);
+    if (!row) return;
+    trade.pnl = row.pnl;
+    trade.cum = row.cum;
   });
 }
 
@@ -714,7 +878,7 @@ function renderSummary() {
   const sub = document.getElementById("log-sub");
   if (sub) {
     const cashCount = (state.cashTransactions || []).length;
-    sub.textContent = `${state.trades.length} trades, ${cashCount} cash entries, ${p.closed.length} closed, ${p.winRate.toFixed(0)}% win rate Â· Balance ${signed(balance.currentBalance)} $.`;
+    sub.textContent = `${state.trades.length} trades, ${cashCount} cash entries, ${p.closed.length} closed, ${p.winRate.toFixed(0)}% win rate · Balance ${signed(balance.currentBalance)} $.`;
   }
 }
 
@@ -753,7 +917,7 @@ async function addAccount() {
   state = emptyJournalState(currentUser?.id || "");
   accountData[activeAccountId] = clone(state);
   try {
-    persistLocalState();
+    syncMemoryState();
     if (currentUser && supabaseReady) await save();
   } catch (error) {
     console.warn("Could not save account", error);
@@ -770,7 +934,7 @@ async function renameAccount() {
   account.name = name;
   account.updatedAt = new Date().toISOString();
   try {
-    persistLocalState();
+    syncMemoryState();
     if (currentUser && supabaseReady) await save();
     renderCurrentAccount();
     toast("Account renamed.");
@@ -800,7 +964,7 @@ async function switchAccount(accountId) {
     await save();
     activeAccountId = accountId;
     state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState());
-    persistLocalState();
+    syncMemoryState();
     renderCurrentAccount();
     toast(`${nextAccount.name} loaded.`);
   } catch (error) {
@@ -988,20 +1152,20 @@ function renderCashRow(event, displayIndex) {
   tr.appendChild(displayCell("Date", formatDateDisplay(cash.date) || "-", "date-display"));
   tr.appendChild(htmlCell("Session", valuePill(cash.type === "deposit" ? "DEPOSIT" : "WITHDRAW", cash.type === "deposit" ? "result" : "result")));
   tr.appendChild(htmlCell("Side", `<span class="table-pill pill-cash pill-${cash.type}">${cash.type === "deposit" ? "Deposit" : "Withdraw"}</span>`));
-  tr.appendChild(displayCell("Level", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("TF", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Setup", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Mistake", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Hold", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Market", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("Bias", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("Confirm", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("SL", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("TP", "â€”", "muted-cell optional-col"));
-  tr.appendChild(displayCell("Patience", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Risk", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("Reward", "â€”", "muted-cell"));
-  tr.appendChild(displayCell("RR", "â€”", "muted-cell"));
+  tr.appendChild(displayCell("Level", "—", "muted-cell"));
+  tr.appendChild(displayCell("TF", "—", "muted-cell"));
+  tr.appendChild(displayCell("Setup", "—", "muted-cell"));
+  tr.appendChild(displayCell("Mistake", "—", "muted-cell"));
+  tr.appendChild(displayCell("Hold", "—", "muted-cell"));
+  tr.appendChild(displayCell("Market", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("Bias", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("Confirm", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("SL", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("TP", "—", "muted-cell optional-col"));
+  tr.appendChild(displayCell("Patience", "—", "muted-cell"));
+  tr.appendChild(displayCell("Risk", "—", "muted-cell"));
+  tr.appendChild(displayCell("Reward", "—", "muted-cell"));
+  tr.appendChild(displayCell("RR", "—", "muted-cell"));
   tr.appendChild(htmlCell("Result", valuePill(cash.type === "deposit" ? "DEPOSIT" : "WITHDRAW", "result")));
   tr.appendChild(htmlCell("P&L", pnlHtml(cash.type === "deposit" ? amount : -amount)));
   tr.appendChild(htmlCell("Balance", pnlHtml(event.balanceAfter)));
@@ -1036,7 +1200,7 @@ function openCashModal(type = "deposit", index = null) {
   const title = document.getElementById("cash-modal-title");
   const saveBtn = document.getElementById("cash-save-btn");
   const entry = Number.isInteger(index) ? state.cashTransactions[index] : null;
-  if (title) title.textContent = entry ? `EDIT_${cashModalType.toUpperCase()}` : cashModalType === "deposit" ? "DEPOSIT" : "WITHDRAW";
+  if (title) title.textContent = entry ? (cashModalType === "deposit" ? "Edit Deposit" : "Edit Withdrawal") : (cashModalType === "deposit" ? "Add Deposit" : "Add Withdrawal");
   if (saveBtn) saveBtn.textContent = entry ? "Save Changes" : cashModalType === "deposit" ? "Save Deposit" : "Save Withdrawal";
   document.getElementById("cash-date").value = entry?.date || todayISO();
   document.getElementById("cash-amount").value = entry?.amount || "";
@@ -1081,14 +1245,23 @@ function saveCashFromModal() {
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
 }
 
-function deleteCashTransaction(index) {
+async function deleteCashTransaction(index) {
   const entry = state.cashTransactions[index];
   if (!entry) return;
   const label = entry.type === "deposit" ? "deposit" : "withdrawal";
   if (!confirm(`Delete this ${label} of ${signed(entry.amount)} $?`)) return;
+  const cashId = entry.id;
   state.cashTransactions.splice(index, 1);
   save();
   renderTrades();
+  if (cashId) {
+    try {
+      await deleteCashFromSupabase(cashId);
+    } catch (err) {
+      console.warn("Could not delete cash transaction from Supabase:", err);
+      toast("Entry removed locally. Cloud delete failed — it will be removed on next sync.");
+    }
+  }
   toast(`${label.charAt(0).toUpperCase()}${label.slice(1)} deleted.`);
 }
 
@@ -1361,11 +1534,41 @@ function renderScreenshotUploader() {
 }
 
 function removeTradeScreenshot() {
+  const previousUrl = screenshotState.url || "";
   screenshotUploadToken += 1;
   resetScreenshotObjectUrl();
   setScreenshotState({ url: "", previewUrl: "", status: "idle", error: "" });
   const input = document.getElementById("modal-screenshot-input");
   if (input) input.value = "";
+  if (previousUrl) void deleteScreenshotFromStorage(previousUrl);
+}
+
+function screenshotStoragePathFromUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw || !currentUser) return "";
+  try {
+    const parsed = new URL(raw, window.location.origin);
+    const marker = "/screenshots/";
+    const idx = parsed.pathname.indexOf(marker);
+    if (idx === -1) return "";
+    const path = decodeURIComponent(parsed.pathname.slice(idx + marker.length));
+    if (!path.startsWith(`${currentUser.id}/`)) return "";
+    return path;
+  } catch (error) {
+    return "";
+  }
+}
+
+async function deleteScreenshotFromStorage(url) {
+  if (!supabaseClient || !currentUser) return;
+  const path = screenshotStoragePathFromUrl(url);
+  if (!path) return;
+  try {
+    const { error } = await supabaseClient.storage.from("screenshots").remove([path]);
+    if (error) throw error;
+  } catch (error) {
+    console.warn("Could not delete screenshot from storage", error);
+  }
 }
 
 async function handleScreenshotFile(file) {
@@ -1388,8 +1591,8 @@ async function handleScreenshotFile(file) {
   }
 
   resetScreenshotObjectUrl();
-  const uploadToken = screenshotUploadToken + 1;
-  screenshotUploadToken = uploadToken;
+  screenshotUploadToken += 1;
+  const uploadToken = screenshotUploadToken;
   const localUrl = URL.createObjectURL(file);
   setScreenshotState({ url: "", previewUrl: localUrl, objectUrl: localUrl, status: "uploading", error: "" });
 
@@ -1446,7 +1649,7 @@ function openTradeModal(index = null, draft = null) {
 
   const trade = draft || (modalEditingIndex === null ? newTradeTemplate() : state.trades[modalEditingIndex]);
   const title = document.getElementById("trade-modal-title");
-  if (title) title.textContent = modalEditingIndex === null ? "NEW_TRADE" : `EDIT_TRADE #${modalEditingIndex + 1}`;
+  if (title) title.textContent = modalEditingIndex === null ? "New Trade" : `Edit Trade #${modalEditingIndex + 1}`;
   setModalValue("modal-date", trade.date || todayISO());
   setModalValue("modal-session", trade.session);
   setModalValue("modal-entry", trade.entry);
@@ -1564,17 +1767,25 @@ function saveTradeFromModal() {
   toast(isEdit ? "Trade updated." : "Trade saved.");
 }
 
-function deleteTrade(index) {
-  if (!currentUser) { toast("Sign in required."); return; }
+async function deleteTrade(index) {
   const trade = state.trades[index];
   if (!trade) return;
-  if (!confirm(`Delete trade #${index + 1} (${trade.date || "no date"} Â· ${trade.result || "open"})? This cannot be undone.`)) return;
+  if (!confirm(`Delete trade #${index + 1} (${trade.date || "no date"} · ${trade.result || "open"})? This cannot be undone.`)) return;
   const tradeId = trade.id;
+  const screenshotUrl = trade.screenshotUrl || "";
   state.trades.splice(index, 1);
   save();
   renderTrades();
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
-  if (tradeId) deleteTradeFromSupabase(tradeId);
+  if (tradeId) {
+    try {
+      await deleteTradeFromSupabase(tradeId);
+    } catch (err) {
+      console.warn("Could not delete trade from Supabase:", err);
+      toast("Trade removed locally. Cloud delete failed — it will be removed on next sync.");
+    }
+  }
+  if (screenshotUrl) void deleteScreenshotFromStorage(screenshotUrl);
   toast("Trade deleted.");
 }
 
@@ -1613,11 +1824,12 @@ function readonlyStars(score) {
   return `<span class="star-rating-readonly" aria-label="${current} out of 5">${"&#9733;".repeat(current)}${"&#9734;".repeat(5 - current)}</span>`;
 }
 
-function viewInfoItem(label, value, delay) {
+function viewInfoItem(label, value, delay, rawHtml = false) {
+  const display = rawHtml ? (value || "-") : escapeHtml(value || "-");
   return `
     <div class="view-info-item" style="animation-delay:${delay}ms">
       <span>${escapeHtml(label)}</span>
-      <b>${value || "-"}</b>
+      <b>${display}</b>
     </div>
   `;
 }
@@ -1627,9 +1839,9 @@ function renderViewTradeModal() {
   const body = document.getElementById("view-trade-body");
   const title = document.getElementById("view-trade-title");
   if (!trade || !body) return;
-  if (title) title.textContent = `VIEW_TRADE #${viewTradeIndex + 1}`;
+  if (title) title.textContent = `Trade #${viewTradeIndex + 1}`;
   const pnl = calcPnl(trade.risk, trade.reward, trade.result);
-  const pnlText = pnl === "" ? "- pips" : `${signed(pnl)} pips`;
+  const pnlText = pnl === "" ? "- $" : `${signed(pnl)} $`;
   const info = [
     ["Session", escapeHtml(trade.session || "-")],
     ["Level", escapeHtml(trade.level || "-")],
@@ -1642,9 +1854,9 @@ function renderViewTradeModal() {
     ["TP Placement", escapeHtml(trade.tpPlacement || "-")],
     ["Mistake Type", escapeHtml(trade.mistake || "-")],
     ["Hold Quality", escapeHtml(trade.hold || "-")],
-    ["Risk (pips)", escapeHtml(trade.risk || "-")],
-    ["Reward (pips)", escapeHtml(trade.reward || "-")],
-    ["Patience Score", readonlyStars(trade.patienceScore)]
+    ["Risk ($)", escapeHtml(trade.risk || "-")],
+    ["Reward ($)", escapeHtml(trade.reward || "-")],
+    ["Patience Score", readonlyStars(trade.patienceScore), true]
   ];
   const screenshotUrl = safeHttpUrl(trade.screenshotUrl);
   const imageHtml = screenshotUrl
@@ -1672,7 +1884,7 @@ function renderViewTradeModal() {
         </div>
       </header>
       <div class="view-info-grid">
-        ${info.map(([label, value], itemIndex) => viewInfoItem(label, value, itemIndex * 20)).join("")}
+        ${info.map((row, itemIndex) => viewInfoItem(row[0], row[1], itemIndex * 20, row[2])).join("")}
       </div>
       <section class="view-notes">
         <span>Notes / Reason</span>
@@ -1707,7 +1919,7 @@ function openSkippedModal(index = null) {
 
   const trade = skippedEditingIndex === null ? skippedTradeTemplate() : state.skippedTrades[skippedEditingIndex];
   const title = document.getElementById("skipped-modal-title");
-  if (title) title.textContent = skippedEditingIndex === null ? "LOG_SKIPPED_TRADE" : `EDIT_SKIPPED_TRADE #${skippedEditingIndex + 1}`;
+  if (title) title.textContent = skippedEditingIndex === null ? "Log Skipped Trade" : `Edit Skipped Trade #${skippedEditingIndex + 1}`;
   setModalValue("skipped-date", trade.date || todayISO());
   setModalValue("skipped-session", trade.session);
   setModalValue("skipped-level", trade.level);
@@ -1769,16 +1981,22 @@ function saveSkippedTradeFromModal() {
   toast(isEdit ? "Skipped trade updated." : "Skipped trade saved.");
 }
 
-function deleteSkippedTrade(index) {
-  if (!currentUser) { toast("Sign in required."); return; }
+async function deleteSkippedTrade(index) {
   const trade = state.skippedTrades[index];
   if (!trade) return;
-  if (!confirm(`Delete skipped trade (${trade.date || "no date"} Â· ${trade.level || "no level"})? This cannot be undone.`)) return;
+  if (!confirm(`Delete skipped trade (${trade.date || "no date"} · ${trade.level || "no level"})? This cannot be undone.`)) return;
   const tradeId = trade.id;
   state.skippedTrades.splice(index, 1);
   save();
   renderSkippedTrades();
-  if (tradeId) deleteSkippedFromSupabase(tradeId);
+  if (tradeId) {
+    try {
+      await deleteSkippedFromSupabase(tradeId);
+    } catch (err) {
+      console.warn("Could not delete skipped trade from Supabase:", err);
+      toast("Skipped trade removed locally. Cloud delete failed — it will be removed on next sync.");
+    }
+  }
   toast("Skipped trade deleted.");
 }
 
@@ -1822,9 +2040,19 @@ function filteredSkippedTrades() {
     .map((trade, index) => ({ trade, index }))
     .filter(({ trade }) => {
       if (reason && trade.skipReason !== reason) return false;
-      if (outcome === "tp" && !isSkippedWin(trade.outcome)) return false;
-      if (outcome === "sl" && trade.outcome !== "SL Would Have Hit") return false;
-      if (outcome === "no-reaction" && trade.outcome !== "No Reaction") return false;
+      if (outcome) {
+        const norm = String(trade.outcome || "").trim().toLowerCase();
+        if (outcome === "tp") {
+          const isWin = norm.includes("tp hit") || norm.includes("tp");
+          if (!isWin) return false;
+        } else if (outcome === "sl") {
+          const isLoss = norm.includes("sl") || norm.includes("loss");
+          if (!isLoss) return false;
+        } else if (outcome === "no-reaction") {
+          const isNoReact = norm.includes("no reaction") || norm.includes("noreaction");
+          if (!isNoReact) return false;
+        }
+      }
       return true;
     })
     .reverse();
@@ -2496,7 +2724,7 @@ function renderAnalysisCharts() {
                   const idx = items[0]?.dataIndex ?? 0;
                   const tradeNo = equity.labels[idx] || "";
                   const date = equity.dates[idx] || "";
-                  return date ? `${tradeNo} Â· ${date}` : tradeNo;
+                  return date ? `${tradeNo} · ${date}` : tradeNo;
                 },
                 label(item) {
                   return `Cumulative P&L: ${signed(item.parsed.y)} $`;
@@ -2626,7 +2854,7 @@ function renderAnalysisCharts() {
               title(items) {
                 const idx = items[0]?.dataIndex ?? 0;
                 const date = rolling.dates[idx] || "";
-                return date ? `${rolling.labels[idx]} Â· ${date}` : rolling.labels[idx];
+                return date ? `${rolling.labels[idx]} · ${date}` : rolling.labels[idx];
               }
             }
           }
@@ -3048,7 +3276,7 @@ function dayStatusLine(day) {
   if (day.losses) parts.push(`${day.losses} Loss`);
   if (day.bes) parts.push(`${day.bes} BE`);
   if (day.open) parts.push(`${day.open} Open`);
-  return parts.join(" Â· ");
+  return parts.join(" · ");
 }
 
 function monthTradeRows(year, month) {
@@ -3191,7 +3419,7 @@ function pnlBars(title, rows, icon) {
     const wr = row.trades ? row.wins / row.trades * 100 : 0;
     return `
       <div class="pnl-bar-row">
-        <div><b>${escapeHtml(row.key)}</b><span>${row.trades} trades Â· ${wr.toFixed(0)}% WR</span></div>
+        <div><b>${escapeHtml(row.key)}</b><span>${row.trades} trades · ${wr.toFixed(0)}% WR</span></div>
         <div class="pnl-bar-track"><i class="${moneyClass(row.pnl)}" style="width:${width}%"></i></div>
         <strong class="${moneyClass(row.pnl)}">${signed(row.pnl)} $</strong>
       </div>
@@ -3229,7 +3457,7 @@ function pnlSelectedTrades(selected) {
     return `
       <button class="pnl-trade-row" onclick="openViewTradeModal(${tradeNo - 1})">
         <span>#${tradeNo}</span>
-        <b>${escapeHtml(trade.entry || "-")} Â· ${escapeHtml(trade.level || "-")}</b>
+        <b>${escapeHtml(trade.entry || "-")} · ${escapeHtml(trade.level || "-")}</b>
         <em class="${moneyClass(trade.pnl)}">${signed(trade.pnl)} $</em>
       </button>
     `;
@@ -3271,8 +3499,8 @@ function renderPnl() {
 
         <div class="pnl-cal-stats">
           ${pnlCalendarStat("Monthly P&amp;L", `<span class="${monthTone}">${signed(stats.totalPnl)} $</span>`, "", monthTone)}
-          ${pnlCalendarStat("Trading Days", `${stats.tradingDays}d`, `${stats.profitable} green Â· ${stats.losing} red`)}
-          ${pnlCalendarStat("Trades", `${stats.totalTrades} total`, `${stats.closedWins}W Â· ${stats.closedLosses}L${stats.closedBes ? ` Â· ${stats.closedBes}BE` : ""}`)}
+          ${pnlCalendarStat("Trading Days", `${stats.tradingDays}d`, `${stats.profitable} green · ${stats.losing} red`)}
+          ${pnlCalendarStat("Trades", `${stats.totalTrades} total`, `${stats.closedWins}W · ${stats.closedLosses}L${stats.closedBes ? ` · ${stats.closedBes}BE` : ""}`)}
           ${pnlCalendarStat("Best Day", stats.best ? `<span class="pos">${signed(stats.best.pnl)} $</span>` : "-", stats.best ? formatDateDisplay(stats.best.date) : "No data")}
           ${pnlCalendarStat("Worst Day", stats.worst ? `<span class="neg">${signed(stats.worst.pnl)} $</span>` : "-", stats.worst ? formatDateDisplay(stats.worst.date) : "No data")}
           ${pnlCalendarStat("Most Active Day", stats.mostActive ? `${stats.mostActive.trades} trades` : "-", stats.mostActive ? formatDateDisplay(stats.mostActive.date) : "No data")}
@@ -3297,7 +3525,7 @@ function renderPnl() {
               </div>
               <div class="pnl-cal-selected-meta">
                 <strong class="${moneyClass(selected?.pnl || 0)}">${selected ? signed(selected.pnl) : "$0.00"} $</strong>
-                <small>${selected ? `${selected.trades} trade${selected.trades === 1 ? "" : "s"} Â· ${escapeHtml(dayStatusLine(selected))}` : "No trades"}</small>
+                <small>${selected ? `${selected.trades} trade${selected.trades === 1 ? "" : "s"} · ${escapeHtml(dayStatusLine(selected))}` : "No trades"}</small>
               </div>
               <button class="icon-btn" onclick="clearPnlSelection()" title="Clear selection" aria-label="Clear selection"><i data-lucide="x"></i></button>
             </div>
@@ -3410,8 +3638,8 @@ function pnlWeekCell(weekDays, stats) {
     <div class="pnl-cal-week ${tone}">
       <span class="pnl-cal-week-range">${escapeHtml(weekRangeLabel(weekDays))}</span>
       <strong class="pnl-cal-week-pnl">${signed(summary.pnl)} $</strong>
-      <small>${summary.activeDays} day${summary.activeDays === 1 ? "" : "s"} Â· ${summary.trades} trade${summary.trades === 1 ? "" : "s"}</small>
-      <em>${summary.wins} Win Â· ${summary.losses} Loss${summary.bes ? ` Â· ${summary.bes} BE` : ""} Â· ${summary.winRate}%</em>
+      <small>${summary.activeDays} day${summary.activeDays === 1 ? "" : "s"} · ${summary.trades} trade${summary.trades === 1 ? "" : "s"}</small>
+      <em>${summary.wins} Win · ${summary.losses} Loss${summary.bes ? ` · ${summary.bes} BE` : ""} · ${summary.winRate}%</em>
     </div>
   `;
 }
@@ -3805,7 +4033,7 @@ function renderWeeklyReviews() {
   }
   list.innerHTML = reviews.map((review) => `
     <article class="weekly-card">
-      <button class="icon-btn" onclick="deleteWeeklyReview('${escapeHtml(review.id)}')" title="Delete review"><i data-lucide="trash-2"></i></button>
+      <button class="icon-btn" type="button" data-review-id="${escapeHtml(review.id)}" onclick="deleteWeeklyReview(this.dataset.reviewId)" title="Delete review"><i data-lucide="trash-2"></i></button>
       <h3>${escapeHtml(formatDateDisplay(review.weekOf) || review.weekOf)}</h3>
       <div><span>What did I learn this week?</span><p>${escapeHtml(review.learned || "-")}</p></div>
       <div><span>What pattern repeated (good or bad)?</span><p>${escapeHtml(review.pattern || "-")}</p></div>
@@ -3816,11 +4044,20 @@ function renderWeeklyReviews() {
 }
 
 function saveWeeklyReview() {
+  const learned = document.getElementById("review-learned")?.value.trim() || "";
+  const pattern = document.getElementById("review-pattern")?.value.trim() || "";
+  const improve = document.getElementById("review-improve")?.value.trim() || "";
+
+  if (!learned && !pattern && !improve) {
+    toast("Please fill in at least one detail to save.");
+    return;
+  }
+
   const review = normalizeWeeklyReview({
     weekOf: document.getElementById("review-week")?.value || todayISO(),
-    learned: document.getElementById("review-learned")?.value.trim() || "",
-    pattern: document.getElementById("review-pattern")?.value.trim() || "",
-    improve: document.getElementById("review-improve")?.value.trim() || "",
+    learned,
+    pattern,
+    improve,
     createdAt: new Date().toISOString()
   });
   state.weeklyReviews.push(review);
@@ -3829,16 +4066,26 @@ function saveWeeklyReview() {
     const el = document.getElementById(id);
     if (el) el.value = "";
   });
+  const weekEl = document.getElementById("review-week");
+  if (weekEl) weekEl.value = todayISO();
   renderWeeklyReviews();
   toast("Weekly review saved.");
 }
 
-function deleteWeeklyReview(id) {
-  if (!currentUser) { toast("Sign in required."); return; }
+async function deleteWeeklyReview(id) {
+  if (!id) return;
+  if (!confirm("Delete this weekly review? This cannot be undone.")) return;
   state.weeklyReviews = state.weeklyReviews.filter((review) => review.id !== id);
   save();
   renderWeeklyReviews();
-  if (id) deleteReviewFromSupabase(id);
+  if (currentUser) {
+    try {
+      await deleteReviewFromSupabase(id);
+    } catch (err) {
+      console.warn("Could not delete review from Supabase:", err);
+      toast("Review removed locally. Cloud delete failed — it will be removed on next sync.");
+    }
+  }
   toast("Weekly review deleted.");
 }
 
@@ -3921,11 +4168,8 @@ async function clearAllTrades() {
     return;
   }
   state.trades = [];
-  try {
-    persistLocalState();
-  } catch (error) {
-    console.warn("Could not clear local trade cache", error);
-  }
+  syncMemoryState();
+  await save();
   renderTrades();
   if (document.getElementById("tab-analysis")?.classList.contains("active")) renderAnalysis();
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
@@ -3938,17 +4182,17 @@ async function clearAllTrades() {
         .eq("user_id", currentUser.id)
         .eq("account_id", activeAccountId);
       updateSyncStatus("synced");
-      toast("Trades cleared from device and Supabase.");
+      toast("Trades cleared from Supabase.");
       return;
     } catch (error) {
       console.warn("Could not clear Supabase trades", error);
       updateSyncStatus("offline");
-      toast("Local trades cleared. Supabase clear failed.");
+      toast("Could not clear trades from Supabase.");
       return;
     }
   }
 
-  toast("Selected account local trades cleared.");
+  toast("Sign in to clear trades.");
 }
 
 function openMobileMenu() {
@@ -3974,7 +4218,70 @@ function hideLoginScreen() {
 }
 
 function authRedirectUrl() {
-  return window.location.origin + "/auth/callback";
+  return `${window.location.origin}/auth/callback`;
+}
+
+function cleanAuthQueryFromUrl() {
+  const url = new URL(window.location.href);
+  ["code", "state", "error", "error_description"].forEach((param) => url.searchParams.delete(param));
+  const search = url.searchParams.toString();
+  const next = `${url.pathname}${search ? `?${search}` : ""}${url.hash}`;
+  window.history.replaceState({}, document.title, next || "/");
+}
+
+async function completeOAuthReturn() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get("code");
+  const authError = params.get("error_description") || params.get("error");
+  if (authError) {
+    cleanAuthQueryFromUrl();
+    setAuthStatus(decodeURIComponent(authError.replace(/\+/g, " ")), "error");
+    return false;
+  }
+  if (!code) return false;
+  if (!supabaseClient && !initSupabase()) return false;
+
+  cleanAuthQueryFromUrl();
+  try {
+    const { error } = await supabaseClient.auth.exchangeCodeForSession(code);
+    if (error) {
+      const message = supabaseAuthMessage(error);
+      setAuthStatus(message, "error");
+      showLoginScreen();
+      return false;
+    }
+
+    const { data: sessionData, error: sessionError } = await supabaseClient.auth.getSession();
+    if (sessionError || !sessionData?.session) {
+      throw new Error("Session was not persisted after OAuth exchange");
+    }
+
+    return true;
+  } catch (error) {
+    console.error("OAuth callback failed", error);
+    setAuthStatus("Google sign-in failed. Please try signing in again.", "error");
+    showLoginScreen();
+    return false;
+  }
+}
+
+async function migrateOldCaches() {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const key = "gj_cache_migrated_v28";
+    if (safeStorageGet(localStorage, key)) return; // Already migrated, don't run again
+
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((key) => caches.delete(key)));
+    }
+    safeStorageSet(localStorage, key, "true");
+    console.log("One-time Service Worker cache migration completed.");
+  } catch (error) {
+    console.warn("Could not migrate legacy service worker caches", error);
+  }
 }
 
 function setAuthStatus(message = "", type = "") {
@@ -4017,7 +4324,10 @@ function setAuthMode(mode = "signin") {
 
   if (title) title.textContent = isSignup ? "Create account" : "Sign in";
   if (submit) submit.textContent = isSignup ? "Create account" : "Sign in with Email";
-  if (password) password.autocomplete = isSignup ? "new-password" : "current-password";
+  if (password) {
+    password.autocomplete = isSignup ? "new-password" : "current-password";
+    password.placeholder = isSignup ? "Minimum 8 characters recommended" : "Minimum 6 characters";
+  }
   if (signInTab) {
     signInTab.classList.toggle("active", !isSignup);
     signInTab.setAttribute("aria-selected", String(!isSignup));
@@ -4049,10 +4359,21 @@ function authFormValues() {
 }
 
 function validateAuthForm(email, password) {
-  if (!email) return "Enter your email address.";
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return "Enter a valid email address.";
+  const cleanEmail = String(email || "").trim().toLowerCase();
+  if (!cleanEmail) return "Enter your email address.";
+  if (/\s/.test(cleanEmail)) return "Email cannot contain spaces.";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) return "Enter a valid email address.";
   if (!password) return "Enter your password.";
   if (password.length < 6) return "Password must be at least 6 characters.";
+  
+  if (authMode === "signup") {
+    if (password.startsWith(" ") || password.endsWith(" ")) {
+      return "Password cannot start or end with spaces.";
+    }
+    if (password.length < 8) {
+      return "Password should be at least 8 characters for better security.";
+    }
+  }
   return "";
 }
 
@@ -4063,6 +4384,26 @@ function submitAuthForm(event) {
   } else {
     signInWithEmail(event);
   }
+}
+
+function wireAuthUi() {
+  document.getElementById("auth-mode-signin")?.addEventListener("click", () => setAuthMode("signin"));
+  document.getElementById("auth-mode-signup")?.addEventListener("click", () => setAuthMode("signup"));
+  document.getElementById("google-login-btn")?.addEventListener("click", () => signInWithGoogle());
+  document.getElementById("password-toggle")?.addEventListener("click", () => toggleAuthPassword());
+  document.getElementById("auth-form")?.addEventListener("submit", (event) => submitAuthForm(event));
+}
+
+function exposeAuthApi() {
+  window.setAuthMode = setAuthMode;
+  window.toggleAuthPassword = toggleAuthPassword;
+  window.submitAuthForm = submitAuthForm;
+  window.signInWithGoogle = signInWithGoogle;
+  window.signInWithEmail = signInWithEmail;
+  window.signUpWithEmail = signUpWithEmail;
+  window.signOutUser = signOutUser;
+  window.deleteWeeklyReview = deleteWeeklyReview;
+  window.toggleDiagnosticsPanel = toggleDiagnosticsPanel;
 }
 
 async function syncAuthProviderAvailability() {
@@ -4098,18 +4439,25 @@ async function signInWithGoogle() {
   }
   setAuthBusy(true);
   setAuthStatus("Opening Google sign-in...");
-  const { error } = await supabaseClient.auth.signInWithOAuth({
-    provider: "google",
-    options: {
-      redirectTo: authRedirectUrl(),
-      queryParams: { prompt: "select_account" }
+  try {
+    const { error } = await supabaseClient.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo: authRedirectUrl(),
+        queryParams: { prompt: "select_account" }
+      }
+    });
+    if (error) {
+      console.warn("Google sign-in failed", error);
+      const message = supabaseAuthMessage(error);
+      setAuthStatus(message, "error");
+      toast(message);
+      setAuthBusy(false);
     }
-  });
-  if (error) {
-    console.warn("Google sign-in failed", error);
-    const message = supabaseAuthMessage(error);
-    setAuthStatus(message, "error");
-    toast(message);
+  } catch (err) {
+    console.error("Google sign-in exception", err);
+    setAuthStatus("Connection failed.", "error");
+    toast("Connection failed.");
     setAuthBusy(false);
   }
 }
@@ -4124,24 +4472,36 @@ async function signInWithEmail(event) {
     toast(message);
     return;
   }
-  const { email, password } = authFormValues();
+  
+  const rawForm = authFormValues();
+  const email = String(rawForm.email || "").trim().toLowerCase();
+  const password = rawForm.password;
+  
   const validationError = validateAuthForm(email, password);
   if (validationError) {
     setAuthStatus(validationError, "error");
     toast(validationError);
     return;
   }
+  
   setAuthBusy(true);
   setAuthStatus("Signing in...");
-  const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
-  if (error) {
-    const message = supabaseAuthMessage(error);
-    setAuthStatus(message, "error");
-    toast(message);
-  } else {
-    setAuthStatus("Signed in. Loading journal...", "success");
+  try {
+    const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+    if (error) {
+      const message = supabaseAuthMessage(error);
+      setAuthStatus(message, "error");
+      toast(message);
+    } else {
+      setAuthStatus("Signed in. Loading journal...", "success");
+    }
+  } catch (err) {
+    console.error("Sign in exception", err);
+    setAuthStatus("Connection failed.", "error");
+    toast("Connection failed.");
+  } finally {
+    setAuthBusy(false);
   }
-  setAuthBusy(false);
 }
 
 async function signUpWithEmail(event) {
@@ -4154,42 +4514,66 @@ async function signUpWithEmail(event) {
     toast(message);
     return;
   }
-  const { email, password } = authFormValues();
+  
+  const rawForm = authFormValues();
+  const email = String(rawForm.email || "").trim().toLowerCase();
+  const password = rawForm.password;
+  
   const validationError = validateAuthForm(email, password);
   if (validationError) {
     setAuthStatus(validationError, "error");
     toast(validationError);
     return;
   }
+  
   setAuthBusy(true);
   setAuthStatus("Creating account...");
-  const { data, error } = await supabaseClient.auth.signUp({
-    email,
-    password,
-    options: {
-      emailRedirectTo: authRedirectUrl()
+  try {
+    const { data, error } = await supabaseClient.auth.signUp({
+      email,
+      password,
+      options: {
+        emailRedirectTo: authRedirectUrl()
+      }
+    });
+    if (error) {
+      const message = supabaseAuthMessage(error);
+      setAuthStatus(message, "error");
+      toast(message);
+    } else if (data?.session) {
+      const message = "Account created. Loading journal...";
+      setAuthStatus(message, "success");
+      toast(message);
+    } else {
+      const message = "Account created. Check your email to confirm it.";
+      setAuthStatus(message, "success");
+      toast(message);
     }
-  });
-  if (error) {
-    const message = supabaseAuthMessage(error);
-    setAuthStatus(message, "error");
-    toast(message);
-  } else if (data?.session) {
-    const message = "Account created. Loading journal...";
-    setAuthStatus(message, "success");
-    toast(message);
-  } else {
-    const message = "Account created. Check your email to confirm it.";
-    setAuthStatus(message, "success");
-    toast(message);
+  } catch (err) {
+    console.error("Sign up exception", err);
+    setAuthStatus("Connection failed.", "error");
+    toast("Connection failed.");
+  } finally {
+    setAuthBusy(false);
   }
-  setAuthBusy(false);
 }
 
 async function signOutUser() {
   if (!supabaseClient) return;
   authLoadToken += 1;
-  await supabaseClient.auth.signOut();
+  try {
+    await supabaseClient.auth.signOut();
+  } catch (error) {
+    console.warn("Error during Supabase signout", error);
+  }
+  clearSessionAuthStorage();
+  mentorSessionKey = "";
+  safeStorageRemove(sessionStorage, "gj_mentor_key");
+  currentUser = null;
+  resetJournalState();
+  renderCurrentAccount();
+  showLoginScreen();
+  updateSyncStatus("offline");
 }
 
 function updateUserRow(user) {
@@ -4230,11 +4614,32 @@ function updateProfileCard(user = currentUser) {
 }
 
 function supabaseAuthMessage(error) {
-  const msg = error?.message || "";
+  const msg = String(error?.message || "");
+  const code = String(error?.code || "");
+  
   if (msg.includes("Invalid login credentials")) return "Email or password is incorrect.";
   if (msg.includes("User already registered")) return "This email is already registered. Sign in instead.";
   if (msg.includes("Password should be")) return "Password must be at least 6 characters.";
   if (msg.includes("Email not confirmed")) return "Please confirm your email first.";
+  
+  // Rate limits
+  if (msg.includes("Email rate limit exceeded") || code === "over_email_send_rate_limit") {
+    return "Too many verification emails sent. Please wait a few minutes and try again.";
+  }
+  if (msg.includes("too many requests") || code === "too_many_requests") {
+    return "Too many requests. Please slow down and try again in a few minutes.";
+  }
+  
+  // Registration disabled
+  if (msg.includes("Signups not allowed") || msg.includes("Signup is disabled")) {
+    return "New registrations are currently disabled by the administrator.";
+  }
+  
+  // Invalid formats
+  if (msg.includes("Invalid email") || msg.includes("invalid format")) {
+    return "Please enter a valid email address.";
+  }
+  
   return "Authentication failed: " + msg;
 }
 
@@ -4263,7 +4668,16 @@ function updateSyncStatus(status) {
   const label = wrap.querySelector(".sync-label");
   if (!dot || !label) return;
   dot.className = `sync-dot ${status}`;
-  label.textContent = status === "synced" ? "Synced" : status === "syncing" ? "Syncing..." : "Offline - local only";
+  
+  if (status === "synced") {
+    label.textContent = "Synced to Supabase";
+  } else if (status === "syncing") {
+    label.textContent = "Syncing...";
+  } else if (status === "error") {
+    label.textContent = "Sync error";
+  } else {
+    label.textContent = "Not signed in";
+  }
 }
 
 // =============================================
@@ -4286,27 +4700,17 @@ async function loadFromSupabase(userId) {
     if (loadToken !== authLoadToken) return false;
 
     if (!cloudAccounts || cloudAccounts.length === 0) {
-      if (!accounts.length) accounts = [defaultAccount()];
-      if (!accounts.some((a) => a.id === activeAccountId)) activeAccountId = accounts[0].id;
-
+      accounts = [defaultAccount()];
+      activeAccountId = accounts[0].id;
+      accountData = {};
       for (const account of accounts) {
+        accountData[account.id] = emptyJournalState(userId);
         await upsertAccountToSupabase(userId, account);
       }
       if (loadToken !== authLoadToken) return false;
 
-      accounts.forEach((account) => {
-        if (!accountData[account.id]) {
-          accountData[account.id] = emptyJournalState(userId);
-        } else {
-          accountData[account.id] = normalizeJournalState({
-            ...accountData[account.id],
-            ownerUid: userId
-          });
-        }
-      });
-
-      state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState(userId));
-      persistLocalState();
+      state = normalizeJournalState(accountData[activeAccountId]);
+      syncMemoryState();
       renderCurrentAccount();
       await saveToSupabase({ quiet: true });
       if (loadToken !== authLoadToken) return false;
@@ -4327,21 +4731,44 @@ async function loadFromSupabase(userId) {
     }
 
     accountData = {};
-    for (const account of accounts) {
-      accountData[account.id] = await loadAccountDataFromSupabase(userId, account.id);
-      if (loadToken !== authLoadToken) return false;
-    }
+    const accountResults = await Promise.all(
+      accounts.map((account) =>
+        loadAccountDataFromSupabase(userId, account.id)
+          .then((data) => ({ id: account.id, data }))
+      )
+    );
+    if (loadToken !== authLoadToken) return false;
+    accountResults.forEach(({ id, data }) => {
+      accountData[id] = data;
+    });
 
     state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState(userId));
-    persistLocalState();
+    syncMemoryState();
     renderCurrentAccount();
     updateSyncStatus("synced");
     return true;
   } catch (error) {
-    console.warn("Could not load from Supabase", error);
+    console.warn("Could not load from Supabase, checking local backup...", error);
     if (loadToken === authLoadToken) {
       updateSyncStatus("offline");
-      toast("Sync failed. Working offline with local data.");
+
+      // Load active state from IndexedDB backup
+      const backupState = await loadFromIndexedDB(userId, activeAccountId);
+      const backupAccounts = await loadFromIndexedDB(userId, "accounts_list");
+
+      if (backupState) {
+        if (backupAccounts) {
+          accounts = backupAccounts;
+        }
+        state = normalizeJournalState(backupState);
+        accountData[activeAccountId] = clone(state);
+        syncMemoryState();
+        renderCurrentAccount();
+        toast("Offline mode: Loaded from local backup.");
+        return true;
+      }
+
+      toast("Could not load journal from Supabase.");
     }
     return false;
   }
@@ -4472,17 +4899,20 @@ function tradeToDbRow(userId, accountId, trade) {
   };
 }
 
-async function syncSupabaseTable(table, userId, accountId, rows, toDbRow) {
-  const keep = new Set(rows.map((row) => row.id));
+async function syncSupabaseTable(table, userId, accountId, rows, toDbRow, deletedIds = new Set()) {
   if (rows.length > 0) {
-    const { error } = await supabaseClient.from(table).upsert(rows.map((row) => toDbRow(userId, accountId, row)), { onConflict: "id" });
+    const { error } = await supabaseClient.from(table).upsert(
+      rows.map((row) => toDbRow(userId, accountId, row)),
+      { onConflict: "id" }
+    );
     if (error) throw error;
   }
-  const { data: existing, error: fetchErr } = await supabaseClient.from(table).select("id").eq("user_id", userId).eq("account_id", accountId);
-  if (fetchErr) throw fetchErr;
-  const staleIds = (existing || []).map((row) => row.id).filter((id) => !keep.has(id));
-  if (staleIds.length > 0) {
-    const { error: delErr } = await supabaseClient.from(table).delete().in("id", staleIds).eq("user_id", userId);
+  if (deletedIds.size > 0) {
+    const { error: delErr } = await supabaseClient
+      .from(table)
+      .delete()
+      .in("id", Array.from(deletedIds))
+      .eq("user_id", userId);
     if (delErr) throw delErr;
   }
 }
@@ -4495,11 +4925,7 @@ async function saveToSupabase(options = {}) {
   state.ownerUid = userId;
   if (!accounts.length) accounts = [defaultAccount()];
 
-  try {
-    persistLocalState();
-  } catch (error) {
-    console.warn("Could not refresh local cache", error);
-  }
+  syncMemoryState();
 
   try {
     await Promise.all(accounts.map(async (account) => {
@@ -4510,24 +4936,24 @@ async function saveToSupabase(options = {}) {
       const data = normalizeJournalState(accountData[accountId]);
 
       await Promise.all([
-        syncSupabaseTable("trades", userId, accountId, data.trades, tradeToDbRow),
+        syncSupabaseTable("trades", userId, accountId, data.trades, tradeToDbRow, new Set()),
         syncSupabaseTable("cash_transactions", userId, accountId, data.cashTransactions, (uid, accId, c) => ({
           id: c.id, user_id: uid, account_id: accId,
           date: c.date, type: c.type, amount: c.amount || null, note: c.note, created_at: c.createdAt
-        })),
+        }), new Set()),
         syncSupabaseTable("skipped_trades", userId, accountId, data.skippedTrades, (uid, accId, s) => ({
           id: s.id, user_id: uid, account_id: accId,
           date: s.date, session: s.session, level: s.level, tf: s.tf,
           direction: s.direction, skip_reason: s.skipReason, confidence: s.confidence,
           notes: s.notes, outcome: s.outcome, pips_missed: s.pipsMissed
-        })),
+        }), new Set()),
         syncSupabaseTable("weekly_reviews", userId, accountId, data.weeklyReviews, (uid, accId, r) => ({
           id: r.id, user_id: uid, account_id: accId,
           week_of: r.weekOf, learned: r.learned, pattern: r.pattern, improve: r.improve, created_at: r.createdAt
-        })),
+        }), new Set()),
         (async () => {
           const { error } = await supabaseClient.from("journal_meta").upsert({
-            id: accountId,
+            id: `${userId}_${accountId}`,
             user_id: userId,
             account_id: accountId,
             options: data.options,
@@ -4543,7 +4969,7 @@ async function saveToSupabase(options = {}) {
   } catch (error) {
     console.warn("Could not save to Supabase", error);
     updateSyncStatus("offline");
-    if (!quiet) toast("Cloud sync failed. Data is saved locally.");
+    if (!quiet) toast("Cloud sync failed. Try again.");
   }
 }
 
@@ -4554,7 +4980,7 @@ async function deleteTradeFromSupabase(tradeId) {
     .delete()
     .eq("id", tradeId)
     .eq("user_id", currentUser.id);
-  if (error) console.warn("Could not delete trade from Supabase:", error);
+  if (error) throw error;
 }
 
 async function deleteSkippedFromSupabase(tradeId) {
@@ -4564,7 +4990,7 @@ async function deleteSkippedFromSupabase(tradeId) {
     .delete()
     .eq("id", tradeId)
     .eq("user_id", currentUser.id);
-  if (error) console.warn("Could not delete skipped trade from Supabase:", error);
+  if (error) throw error;
 }
 
 async function deleteCashFromSupabase(cashId) {
@@ -4574,7 +5000,7 @@ async function deleteCashFromSupabase(cashId) {
     .delete()
     .eq("id", cashId)
     .eq("user_id", currentUser.id);
-  if (error) console.warn("Could not delete cash transaction from Supabase:", error);
+  if (error) throw error;
 }
 
 async function deleteReviewFromSupabase(reviewId) {
@@ -4584,7 +5010,7 @@ async function deleteReviewFromSupabase(reviewId) {
     .delete()
     .eq("id", reviewId)
     .eq("user_id", currentUser.id);
-  if (error) console.warn("Could not delete review from Supabase:", error);
+  if (error) throw error;
 }
 
 async function upsertAccountToSupabase(userId, account) {
@@ -4595,7 +5021,7 @@ async function upsertAccountToSupabase(userId, account) {
     name: account.name,
     created_at: account.createdAt,
     updated_at: new Date().toISOString()
-  }, { onConflict: "id" });
+  }, { onConflict: "user_id,id" });
   if (error) throw error;
 }
 
@@ -4616,71 +5042,198 @@ async function clearAccountFromSupabase(userId, accountId) {
   ]);
 }
 
-function clearStaleLocalDataIfOwnerMismatch(userId) {
-  try {
-    const raw = localStorage.getItem(ACCOUNTS_KEY);
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
-    if (parsed && parsed.ownerUid && parsed.ownerUid !== userId) {
-      // Different user's data is in localStorage â€” wipe it
-      localStorage.removeItem(ACCOUNTS_KEY);
-      localStorage.removeItem(KEY);
-      localStorage.removeItem(SKIPPED_KEY);
-      accounts = [defaultAccount()];
-      accountData = {};
-      activeAccountId = DEFAULT_ACCOUNT_ID;
-      state = emptyJournalState(userId);
-      console.warn("Cleared stale local data from previous user session.");
-    }
-  } catch (error) {
-    console.warn("Could not check local data ownership", error);
-  }
-}
-
-function initSupabaseAuth() {
-  if (!initSupabase()) {
-    updateSyncStatus("offline");
-    showLoginScreen();
+async function handleAuthStateChange(event, session) {
+  if (authStateBusy) {
+    setTimeout(() => handleAuthStateChange(event, session), 400);
     return;
   }
-  supabaseReady = true;
-  syncAuthProviderAvailability();
-
-  supabaseClient.auth.onAuthStateChange(async (event, session) => {
+  authStateBusy = true;
+  try {
     const user = session?.user || null;
     currentUser = user;
     updateUserRow(user);
 
-    if (!user) {
+    if (event === "INITIAL_SESSION") {
+      if (!user) {
+        const hasPersistedAuth = Object.keys(localStorage || {}).some((key) => key.startsWith("sb-") || key === "supabase.auth.token");
+        if (hasPersistedAuth && supabaseClient) {
+          try {
+            const { data: sessionData, error: sessionError } = await supabaseClient.auth.getSession();
+            if (!sessionError && sessionData?.session?.user) {
+              currentUser = sessionData.session.user;
+              updateUserRow(currentUser);
+              hideLoginScreen();
+              setAuthBusy(false);
+              resetJournalState(currentUser.id);
+              updateSyncStatus("syncing");
+              recordDiagnostic("auth", "Session recovered from persisted storage", { userId: currentUser.id });
+              try {
+                await loadFromSupabase(currentUser.id);
+                updateSyncStatus("synced");
+              } catch (err) {
+                console.warn("Loading journal failed", err);
+                recordDiagnostic("error", "Failed to load journal after persisted session recovery", { error: String(err?.message || err) });
+              }
+              hideSplashScreen();
+              authStateBusy = false;
+              return;
+            }
+            if (!sessionError && !sessionData?.session) {
+              recordDiagnostic("auth", "Persisted auth keys found but no active session", { hasPersistedAuth });
+              clearSessionAuthStorage();
+            }
+          } catch (error) {
+            console.warn("Persisted session recovery check failed", error);
+          }
+        }
+        const initStart = Date.now();
+        setTimeout(() => {
+          const elapsed = Date.now() - initStart;
+          if (!currentUser) {
+            authLoadToken += 1;
+            setAuthBusy(false);
+            resetJournalState();
+            renderCurrentAccount();
+            showLoginScreen();
+            hideSplashScreen();
+            updateSyncStatus("offline");
+            recordDiagnostic("auth", `No session after ${elapsed}ms timeout (threshold 5s)`, { event, elapsed });
+            console.warn(`[AUTH] Session restore timeout after ${elapsed}ms. User stayed logged out.`);
+          } else {
+            recordDiagnostic("auth", `Session restored after ${elapsed}ms (async arrival)`, { elapsed });
+            console.log(`[AUTH] Session restored during grace period after ${elapsed}ms`);
+          }
+        }, 5000);
+        authStateBusy = false;
+        console.log(`[AUTH] INITIAL_SESSION: no user found, waiting up to 5s for session restoration...`);
+        return;
+      }
+      hideLoginScreen();
+      setAuthBusy(false);
+      resetJournalState(user.id);
+      updateSyncStatus("syncing");
+      recordDiagnostic("auth", "Session restored via INITIAL_SESSION", { userId: user.id });
+      try {
+        await loadFromSupabase(user.id);
+        updateSyncStatus("synced");
+      } catch (err) {
+        console.warn("Loading journal failed", err);
+        recordDiagnostic("error", "Failed to load journal after INITIAL_SESSION", { error: String(err?.message || err) });
+      }
+      hideSplashScreen();
+      return;
+    }
+
+    if (event === "SIGNED_IN") {
+      if (!user) return;
+      hideLoginScreen();
+      setAuthBusy(false);
+      resetJournalState(user.id);
+      updateSyncStatus("syncing");
+      recordDiagnostic("auth", "User signed in", { userId: user.id, event });
+      try {
+        await loadFromSupabase(user.id);
+        updateSyncStatus("synced");
+      } catch (err) {
+        console.warn("Loading journal failed", err);
+        recordDiagnostic("error", "Failed to load journal after sign-in", { error: String(err?.message || err) });
+      }
+      hideSplashScreen();
+      return;
+    }
+
+    if (event === "SIGNED_OUT") {
       authLoadToken += 1;
       setAuthBusy(false);
+      resetJournalState();
+      renderCurrentAccount();
       showLoginScreen();
+      hideSplashScreen();
       updateSyncStatus("offline");
+      recordDiagnostic("auth", "User signed out", { event });
       return;
     }
 
-    clearStaleLocalDataIfOwnerMismatch(user.id);
-
-    if (event !== "INITIAL_SESSION" && event !== "SIGNED_IN") {
+    if (event === "TOKEN_REFRESHED") {
+      if (session?.user) {
+        currentUser = session.user;
+        updateUserRow(session.user);
+        const loginScreen = document.getElementById("login-screen");
+        const loginVisible = loginScreen && !loginScreen.hasAttribute("hidden");
+        if (loginVisible) {
+          hideLoginScreen();
+          setAuthBusy(false);
+          resetJournalState(session.user.id);
+          updateSyncStatus("syncing");
+          recordDiagnostic("auth", "Session restored via TOKEN_REFRESHED", { userId: session.user.id });
+          try {
+            await loadFromSupabase(session.user.id);
+            updateSyncStatus("synced");
+          } catch (err) {
+            console.warn("Loading journal failed after token refresh", err);
+            recordDiagnostic("error", "Failed to load journal after token refresh", { error: String(err?.message || err) });
+          }
+          hideSplashScreen();
+        }
+      }
+      updateSyncStatus("synced");
+      recordDiagnostic("auth", "Session refreshed", { event });
       return;
     }
 
-    hideLoginScreen();
-    setAuthBusy(false);
-    loadState();
-    state.ownerUid = user.id;
-    renderCurrentAccount();
-    updateSyncStatus("syncing");
-    await loadFromSupabase(user.id);
-    updateSyncStatus("synced");
+    if (event === "USER_UPDATED") {
+      if (session?.user) {
+        currentUser = session.user;
+        updateUserRow(session.user);
+        recordDiagnostic("auth", "User profile updated", { userId: session.user.id });
+      }
+      return;
+    }
+
+    if (event === "PASSWORD_RECOVERY") {
+      setAuthStatus("Password recovery link verified. Set a new password in Options.", "success");
+      recordDiagnostic("auth", "Password recovery session", { event });
+      return;
+    }
+  } catch (error) {
+    console.warn("Auth state change failed", error);
+    recordDiagnostic("error", "Auth state change failed", { error: String(error?.message || error), event });
+    setAuthStatus("Authentication recovery failed. Please sign in again.", "error");
+    try { hideSplashScreen(); } catch (e) {}
+  } finally {
+    authStateBusy = false;
+  }
+}
+
+async function initSupabaseAuth() {
+  if (authInitStarted) return;
+  authInitStarted = true;
+  if (!initSupabase()) {
+    updateSyncStatus("offline");
+    showLoginScreen();
+    hideSplashScreen();
+    recordDiagnostic("error", "Supabase client initialisation failed");
+    return;
+  }
+  supabaseReady = true;
+  recordDiagnostic("auth", "Supabase client initialised", { url: supabaseConfig?.url });
+  syncAuthProviderAvailability().catch((error) => {
+    console.warn("Could not sync auth provider availability", error);
   });
 
-  supabaseClient.auth.getSession().then(({ data: { session } }) => {
-    if (!session) {
-      showLoginScreen();
-      updateSyncStatus("offline");
-    }
+  supabaseClient.auth.onAuthStateChange((event, session) => {
+    void handleAuthStateChange(event, session);
   });
+
+  const callbackHandled = await completeOAuthReturn().catch((error) => {
+    console.warn("OAuth return handling failed", error);
+    setAuthStatus("Sign-in failed. Please try again.", "error");
+    return false;
+  });
+
+  if (callbackHandled) {
+    return;
+  }
 }
 
 function switchTab(name, button) {
@@ -4700,30 +5253,37 @@ function switchTab(name, button) {
   refreshIcons();
 }
 
+function saveMentorKey(key) {
+  mentorSessionKey = key;
+  safeStorageSet(sessionStorage, "gj_mentor_key", key);
+}
+
 function renderAiMentor() {
+  if (!mentorSessionKey) {
+    mentorSessionKey = safeStorageGet(sessionStorage, "gj_mentor_key", "");
+  }
   const keyInput = document.getElementById("mentor-api-key");
   const modelInput = document.getElementById("mentor-model");
   const keyStatus = document.getElementById("mentor-key-status");
   const scope = document.getElementById("mentor-scope");
-  const savedKey = sessionStorage.getItem(MENTOR_KEY) || "";
+  const savedKey = mentorSessionKey || safeStorageGet(sessionStorage, "gj_mentor_key", "");
   if (keyInput && !keyInput.value) keyInput.value = savedKey;
   if (modelInput) modelInput.value = DEFAULT_MENTOR_MODEL;
-  if (keyStatus) keyStatus.textContent = savedKey ? "saved for this session" : "not saved";
+  if (keyStatus) keyStatus.textContent = savedKey ? "ready for this tab" : "not saved";
   if (scope) scope.textContent = `${activeAccount().name} - ${state.trades.length} trades, ${state.skippedTrades.length} missed`;
   refreshIcons();
 }
 
 function saveMentorSettings() {
   const key = document.getElementById("mentor-api-key")?.value.trim() || "";
-  if (key) sessionStorage.setItem(MENTOR_KEY, key);
-  sessionStorage.setItem(MENTOR_MODEL_KEY, DEFAULT_MENTOR_MODEL);
+  saveMentorKey(key);
   renderAiMentor();
-  toast(key ? "AI Mentor key saved for this session only." : "Add API key to analyze.");
+  toast(key ? "AI Mentor key ready for this tab only." : "Add API key to analyze.");
 }
 
 function clearMentorSettings() {
-  sessionStorage.removeItem(MENTOR_KEY);
-  sessionStorage.removeItem(MENTOR_MODEL_KEY);
+  mentorSessionKey = "";
+  safeStorageRemove(sessionStorage, "gj_mentor_key");
   const keyInput = document.getElementById("mentor-api-key");
   const modelInput = document.getElementById("mentor-model");
   if (keyInput) keyInput.value = "";
@@ -4804,31 +5364,31 @@ function mentorPrompt(snapshot) {
     "",
     "Perform a deep analysis across ALL of the following areas:",
     "",
-    "SECTION 1 â€” BEHAVIORAL & PSYCHOLOGICAL ANALYSIS:",
+    "SECTION 1 — BEHAVIORAL & PSYCHOLOGICAL ANALYSIS:",
     "- Revenge Trading Detection: Look for clusters of rapid trades immediately after a LOSS (same day, 2+ trades after loss). Flag if this pattern exists with specific dates/examples.",
     "- FOMO Detection: Identify trades where patienceScore <= 2 AND mistake field contains \"FOMO trade\" or \"Early entry\". Calculate % of total trades these represent.",
     "- Over-Trading Detection: Find days/sessions with 3+ trades and check if those days have lower win rate than average. Report the correlation.",
     "- Discipline Score per week: Calculate (trades with patienceScore >= 4 + trades with mistake=\"No mistake\") / total trades * 100. Give a letter grade A-F.",
     "",
-    "SECTION 2 â€” RISK & TRADE MANAGEMENT:",
+    "SECTION 2 — RISK & TRADE MANAGEMENT:",
     "- Leaving Money On Table: Check hold quality field. Count trades where hold=\"Early exit\" vs \"Held full TP\". Calculate pip difference. Report: \"You cut X trades early, potentially missing Y pips total.\"",
     "- Holding Losers: Look for LOSS trades and note reason/notes field for patterns like \"moved SL\", \"held too long\", \"hope\".",
     "- SL/TP Placement Analysis: Group trades by slTpPlacement field. Which placement type has highest win rate? Report with numbers.",
     "- Risk Consistency: Calculate standard deviation of risk field across all trades. High deviation = inconsistent sizing. Flag if >50% variance.",
     "",
-    "SECTION 3 â€” BLIND SPOTS & ENVIRONMENT:",
+    "SECTION 3 — BLIND SPOTS & ENVIRONMENT:",
     "- Market Condition: Group by marketCondition field. Which condition has highest/lowest win rate? Should trader avoid any condition?",
     "- Day of Week: Extract weekday from trade.date. Which day is most profitable? Which day should trader avoid?",
     "- Session Performance: Group by session field. Best and worst session with exact win rates and total P&L per session.",
     "- Level Performance: Group by level field. Best and worst level. Minimum 3 trades to qualify for recommendation.",
     "- TF Performance: Group by tf field. Best TF by win rate.",
     "",
-    "SECTION 4 â€” NLP ON NOTES:",
+    "SECTION 4 — NLP ON NOTES:",
     "- Scan all trade.reason (notes) fields for emotional words: \"anxious\", \"fear\", \"rushed\", \"confident\", \"missed\", \"revenge\", \"hope\", \"frustrated\", \"excited\", \"doubt\".",
     "- Correlate presence of negative words with LOSS trades. Report: \"Trades with negative emotional language: X% win rate vs trades without: Y% win rate.\"",
     "- Extract most common setup descriptions from notes.",
     "",
-    "SECTION 5 â€” GENERATIVE COACHING OUTPUT:",
+    "SECTION 5 — GENERATIVE COACHING OUTPUT:",
     "Return EXACTLY this structure with these exact ## headers (no extra sections, no missing sections):",
     "",
     "## TRADING REPORT CARD",
@@ -4842,7 +5402,7 @@ function mentorPrompt(snapshot) {
     "- Revenge Trading: [detected/not detected, with evidence]",
     "- FOMO Score: [X% of trades show FOMO behavior]",
     "- Over-trading: [detected/not detected]",
-    "- Discipline Score: [X% â€” Grade B]",
+    "- Discipline Score: [X% — Grade B]",
     "",
     "## WHAT IS WORKING",
     "[Specific levels, sessions, confirmations that actually profit]",
@@ -4945,6 +5505,77 @@ function renderMentorMarkdown(text) {
   }).join("");
 }
 
+function safeSanitize(html) {
+  if (typeof DOMPurify !== "undefined") {
+    return DOMPurify.sanitize(html, {
+      ALLOWED_TAGS: ["article", "section", "header", "h3", "div", "p", "ul", "ol", "li", "strong", "em", "b", "span", "br"],
+      ALLOWED_ATTR: ["class", "aria-label", "aria-hidden"]
+    });
+  }
+  const div = document.createElement("div");
+  div.textContent = html;
+  return `<pre style="white-space:pre-wrap">${div.innerHTML}</pre>`;
+}
+
+function buildLocalMentorFallback(snapshot) {
+  const summary = snapshot?.summary || {};
+  const recentTrades = snapshot?.recentTrades || [];
+  const missedTrades = snapshot?.missedTrades || [];
+  const strongTrades = recentTrades.filter((trade) => trade.result === "WIN").length;
+  const weakTrades = recentTrades.filter((trade) => trade.result === "LOSS").length;
+  const commonMistakes = recentTrades.reduce((acc, trade) => {
+    if (trade.mistake) acc[trade.mistake] = (acc[trade.mistake] || 0) + 1;
+    return acc;
+  }, {});
+  const topMistake = Object.entries(commonMistakes).sort((a, b) => b[1] - a[1])[0];
+  const body = [
+    "## LOCAL FALLBACK REVIEW",
+    "Overall Grade: C",
+    `Explanation: The live AI model was unavailable, so this fallback review is based on your recorded journal patterns and risk discipline.`,
+    "",
+    "## BRUTAL TRUTH",
+    `You have ${summary.totalTrades || 0} logged trades with a ${summary.winRate || "0%"} win rate and ${summary.missedTrades || 0} missed trades. The data is limited, but the pattern suggests you are still relying on emotion and inconsistent execution.`,
+    "",
+    "## BEHAVIORAL ALERTS",
+    `- Revenge Trading: ${weakTrades > 0 ? "Possible pattern detected; check trades immediately following losses." : "Not enough evidence."}`,
+    `- FOMO Score: ${recentTrades.filter((trade) => Number(trade.patienceScore) <= 2).length} trades show low patience or rushed entries.`,
+    `- Over-trading: ${recentTrades.filter((trade) => trade.session && trade.session.includes("London")).length > 0 ? "Possible over-trading during busy sessions." : "Not enough evidence."}`,
+    `- Discipline Score: ${Math.round(((strongTrades + recentTrades.filter((trade) => trade.mistake === "No mistake").length) / Math.max(1, recentTrades.length)) * 100)}% — Grade C`,
+    "",
+    "## WHAT IS WORKING",
+    `Your strongest area appears to be ${recentTrades[0]?.session || "session consistency"} when entries are clean and the setup is simple.`,
+    "",
+    "## WHAT IS COSTING MONEY",
+    `${topMistake ? `${topMistake[0]} appears ${topMistake[1]} time(s).` : "Review your notes for repeated mistakes and tighten the execution plan."}`,
+    "",
+    "## BLIND SPOT REPORT",
+    `Skipped trades: ${missedTrades.length}. Treat missed setups as feedback, not as proof that the market was always wrong.`,
+    "",
+    "## MISSED TRADE LESSON",
+    "The missed-trade list is your best data source for discipline. Review the missed entries before taking more risk.",
+    "",
+    "## NEXT 5-TRADE RULES",
+    "1. Only take a trade when the setup matches your plan exactly.",
+    "2. Do not enter immediately after a loss.",
+    "3. Respect your risk size even when the trade feels obvious.",
+    "4. Review your missed trades before trading again.",
+    "5. Keep notes objective and avoid emotional language.",
+    "",
+    "## STOP IMMEDIATELY",
+    "Stop treating every setup as a must-trade. Your poor-quality entries are costing execution quality.",
+    "",
+    "## REPEAT IMMEDIATELY",
+    "Repeat the clean setups that produce consistent wins and keep your notes clear.",
+    "",
+    "## WEEKEND HOMEWORK",
+    "1. Review the last 10 trades for repeated mistakes.",
+    "2. Compare missed trades to executed trades and find your biggest leak.",
+    "3. Write one rule for managing your next session before trading."
+  ].join("\n");
+  const rawHtml = `<article class="mentor-review">${renderMentorMarkdown(body)}</article>`;
+  return safeSanitize(rawHtml);
+}
+
 async function runAiMentorReview() {
   if (mentorRequestInProgress) {
     toast("Analysis already running. Please wait.");
@@ -4961,7 +5592,7 @@ async function runAiMentorReview() {
 
   const output = document.getElementById("mentor-output");
   const keyInput = document.getElementById("mentor-api-key");
-  const key = (keyInput?.value || sessionStorage.getItem(MENTOR_KEY) || "").trim();
+  const key = (keyInput?.value || mentorSessionKey || "").trim();
   const model = DEFAULT_MENTOR_MODEL;
   if (!output) {
     mentorRequestInProgress = false;
@@ -4969,7 +5600,7 @@ async function runAiMentorReview() {
   }
   if (!key) {
     toast("Add your OpenRouter API key first.");
-    output.innerHTML = `<div class="empty-state compact-empty"><div><strong>API key required</strong><span>Paste your OpenRouter key and save it locally.</span></div></div>`;
+    output.innerHTML = `<div class="empty-state compact-empty"><div><strong>API key required</strong><span>Paste your OpenRouter key for this tab.</span></div></div>`;
     mentorRequestInProgress = false;
     return;
   }
@@ -4979,10 +5610,11 @@ async function runAiMentorReview() {
     mentorRequestInProgress = false;
     return;
   }
-  sessionStorage.setItem(MENTOR_KEY, key);
-  sessionStorage.setItem(MENTOR_MODEL_KEY, DEFAULT_MENTOR_MODEL);
+  saveMentorKey(key);
   renderAiMentor();
   output.innerHTML = `<div class="mentor-loading"><span class="upload-spinner"></span><b>Analyzing journal...</b></div>`;
+  diagnosticsState.ai = { status: "requesting" };
+  updateDiagnosticsPanel();
   try {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -5010,15 +5642,17 @@ async function runAiMentorReview() {
     const scope = document.getElementById("mentor-scope");
     if (scope) scope.textContent = `model: ${data?.model || model}`;
     const rawHtml = `<article class="mentor-review">${renderMentorMarkdown(content)}</article>`;
-    output.innerHTML = typeof DOMPurify !== "undefined"
-      ? DOMPurify.sanitize(rawHtml, { ALLOWED_TAGS: ["article", "section", "header", "h3", "div", "p", "ul", "ol", "li", "strong", "em", "b", "span", "br"], ALLOWED_ATTR: ["class", "aria-label", "aria-hidden"] })
-      : rawHtml;
+    output.innerHTML = safeSanitize(rawHtml);
+    diagnosticsState.ai = { status: "ready", lastModel: data?.model || model };
   } catch (error) {
     console.warn("AI Mentor request failed", error);
-    output.innerHTML = `<div class="empty-state compact-empty"><div><strong>AI review failed</strong><span>${escapeHtml(error.message || "Check your key, model, or network.")}</span></div></div>`;
-    toast("AI Mentor request failed.");
+    const fallbackHtml = safeSanitize(buildLocalMentorFallback(mentorTradeSnapshot()));
+    output.innerHTML = fallbackHtml;
+    diagnosticsState.ai = { status: "fallback", error: error.message || "network error" };
+    toast("AI Mentor request failed. Showing local fallback analysis.");
   } finally {
     mentorRequestInProgress = false;
+    updateDiagnosticsPanel();
   }
 }
 
@@ -5259,13 +5893,24 @@ function seedDemoTrades() {
 }
 
 if (typeof document !== "undefined") {
-  loadState();
+  installGlobalErrorHandlers();
+  exposeAuthApi();
+  purgeLegacyJournalStorage();
+  if (!mentorSessionKey) {
+    mentorSessionKey = safeStorageGet(sessionStorage, "gj_mentor_key", "");
+  }
+  migrateOldCaches();
+  resetJournalState();
   applyReportPreset();
   renderCurrentAccount();
-  showLoginScreen();
-  updateSyncStatus("syncing");
   setAuthMode("signin");
+  wireAuthUi();
   refreshIcons();
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js?v=20260629-supabase-v28")
+      .catch((err) => console.warn("Service worker registration failed:", err));
+  }
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !document.getElementById("cash-modal")?.hidden) closeCashModal();
     if (event.key === "Escape" && !document.getElementById("trade-modal")?.hidden) closeTradeModal();
@@ -5305,8 +5950,15 @@ if (typeof document !== "undefined") {
       handleScreenshotFile(event.dataTransfer?.files?.[0]);
     });
   }
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("sw.js").catch((error) => console.warn("Service worker registration failed", error));
-  }
-  initSupabaseAuth();
+  void initSupabaseAuth();
 }
+
+function hideSplashScreen() {
+  const splash = document.getElementById("splash-screen");
+  if (!splash || splash.classList.contains("hiding") || splash.classList.contains("hidden-done")) return;
+  splash.classList.add("hiding");
+  setTimeout(() => {
+    splash.classList.add("hidden-done");
+  }, 450);
+}
+

@@ -3,37 +3,150 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Signing in...</title>
+  <title>Signing in — Gold Journal</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <script src="/env-config.js"></script>
   <style>
-    body { background: #080a0d; color: #c9a84c; font-family: sans-serif;
-           display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #080a0d;
+      color: #e8e3d8;
+      font-family: 'Inter', system-ui, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 20px;
+      text-align: center;
+      max-width: 360px;
+      width: 100%;
+    }
+    .logo {
+      width: 64px;
+      height: 64px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #f0bd55 0%, #dfab37 50%, #c8920f 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      font-weight: 800;
+      color: #0b0a08;
+      box-shadow: 0 8px 32px rgba(223,171,55,0.28);
+    }
+    h1 { font-size: 18px; font-weight: 700; color: #f0f0ee; }
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid rgba(223,171,55,0.2);
+      border-top-color: #dfab37;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .msg { font-size: 14px; color: #9a948a; line-height: 1.5; }
+    .err { font-size: 14px; color: #ff6b6b; background: rgba(255,107,107,0.1); padding: 12px 16px; border-radius: 8px; border: 1px solid rgba(255,107,107,0.25); line-height: 1.5; }
+    .btn {
+      margin-top: 4px;
+      padding: 10px 24px;
+      border-radius: 8px;
+      background: rgba(223,171,55,0.15);
+      border: 1px solid rgba(223,171,55,0.3);
+      color: #dfab37;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      display: none;
+    }
+    .btn:hover { background: rgba(223,171,55,0.25); }
   </style>
 </head>
 <body>
-  <p>Signing you in...</p>
+  <div class="card">
+    <div class="logo">AU</div>
+    <h1>Gold Trading Journal</h1>
+    <div class="spinner" id="spinner"></div>
+    <p class="msg" id="msg">Completing sign-in, please wait...</p>
+    <a class="btn" id="back-btn" href="/">← Return to app</a>
+  </div>
   <script>
     (async () => {
-      const status = document.querySelector("p");
+      const msg = document.getElementById('msg');
+      const spinner = document.getElementById('spinner');
+      const backBtn = document.getElementById('back-btn');
+
+      function showError(text) {
+        spinner.style.display = 'none';
+        msg.className = 'err';
+        msg.textContent = text;
+        backBtn.style.display = 'inline-block';
+      }
+
+      function showSuccess(text) {
+        spinner.style.display = 'none';
+        msg.textContent = text;
+        backBtn.style.display = 'inline-block';
+      }
+
       const config = window.SUPABASE_CONFIG;
       if (!config || !config.url || !config.anonKey) {
-        status.textContent = "Config error. Copy .env.example to .env and run: node scripts/generate-config.js";
+        showError('Configuration error. Please contact support.');
         return;
       }
-      const code = new URLSearchParams(window.location.search).get("code");
+
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get('code');
+      const authError = params.get('error_description') || params.get('error');
+
+      if (authError) {
+        showError('Sign-in failed: ' + decodeURIComponent(authError.replace(/\+/g, ' ')));
+        return;
+      }
+
       if (!code) {
-        status.textContent = "Sign-in failed: missing authorization code.";
+        // No code - might already be signed in, redirect back
+        window.location.replace('/');
         return;
       }
-      const client = window.supabase.createClient(config.url, config.anonKey, {
-        auth: { detectSessionInUrl: false, persistSession: true, flowType: "pkce" }
-      });
-      const { error } = await client.auth.exchangeCodeForSession(code);
-      if (error) {
-        status.textContent = "Sign-in failed: " + error.message;
-      } else {
-        window.location.replace("/");
+
+      try {
+        const client = window.supabase.createClient(config.url, config.anonKey, {
+          auth: {
+            detectSessionInUrl: true,
+            persistSession: true,
+            autoRefreshToken: true,
+            flowType: 'pkce',
+            storage: {
+              getItem: (key) => localStorage.getItem(key),
+              setItem: (key, value) => localStorage.setItem(key, value),
+              removeItem: (key) => localStorage.removeItem(key)
+            }
+          }
+        });
+
+        const { error } = await client.auth.exchangeCodeForSession(code);
+        if (error) {
+          showError('Sign-in failed: ' + error.message);
+          return;
+        }
+
+        const { data: sessionData, error: sessionError } = await client.auth.getSession();
+        if (sessionError || !sessionData?.session) {
+          showError('Sign-in failed: Session was not persisted after OAuth exchange.');
+          return;
+        }
+
+        msg.textContent = 'Signed in successfully! Redirecting...';
+        setTimeout(() => window.location.replace('/'), 800);
+      } catch (err) {
+        console.error('Callback error', err);
+        showError('An unexpected error occurred. Please try signing in again.');
       }
     })();
   </script>
