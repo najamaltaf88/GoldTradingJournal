@@ -5055,7 +5055,9 @@ async function handleAuthStateChange(event, session) {
 
     if (event === "INITIAL_SESSION") {
       if (!user) {
+        const initStart = Date.now();
         setTimeout(() => {
+          const elapsed = Date.now() - initStart;
           if (!currentUser) {
             authLoadToken += 1;
             setAuthBusy(false);
@@ -5064,10 +5066,15 @@ async function handleAuthStateChange(event, session) {
             showLoginScreen();
             hideSplashScreen();
             updateSyncStatus("offline");
-            recordDiagnostic("auth", "No session after INITIAL_SESSION timeout", { event });
+            recordDiagnostic("auth", `No session after ${elapsed}ms timeout (threshold 5s)`, { event, elapsed });
+            console.warn(`[AUTH] Session restore timeout after ${elapsed}ms. User stayed logged out.`);
+          } else {
+            recordDiagnostic("auth", `Session restored after ${elapsed}ms (async arrival)`, { elapsed });
+            console.log(`[AUTH] Session restored during grace period after ${elapsed}ms`);
           }
-        }, 2000);
+        }, 5000);
         authStateBusy = false;
+        console.log(`[AUTH] INITIAL_SESSION: no user found, waiting up to 5s for session restoration...`);
         return;
       }
       hideLoginScreen();
