@@ -48,6 +48,20 @@ function safeStorageRemove(storage, key) {
   }
 }
 
+function getAuthStorage() {
+  return {
+    getItem(key) {
+      return safeStorageGet(localStorage, key, null);
+    },
+    setItem(key, value) {
+      return safeStorageSet(localStorage, key, value);
+    },
+    removeItem(key) {
+      return safeStorageRemove(localStorage, key);
+    }
+  };
+}
+
 function safeStorageClearMatching(storage, predicate) {
   try {
     const keys = Object.keys(storage || {});
@@ -126,15 +140,13 @@ const SUPABASE_AUTH_OPTIONS = {
     persistSession: true,
     autoRefreshToken: true,
     flowType: "pkce",
-    storage: {
-      getItem: (key) => safeStorageGet(localStorage, key, null),
-      setItem: (key, value) => safeStorageSet(localStorage, key, value),
-      removeItem: (key) => safeStorageRemove(localStorage, key)
-    }
+    storage: getAuthStorage()
   }
 };
 
 function initSupabase() {
+  if (supabaseClient) return true;
+
   const config = window.SUPABASE_CONFIG;
   if (!config || !config.url || !config.anonKey) {
     console.warn("Supabase config missing. Copy .env.example to .env, then run: node scripts/generate-config.js");
@@ -5055,7 +5067,13 @@ async function handleAuthStateChange(event, session) {
 
     if (event === "INITIAL_SESSION") {
       if (!user) {
-        const hasPersistedAuth = Object.keys(localStorage || {}).some((key) => key.startsWith("sb-") || key === "supabase.auth.token");
+        const hasPersistedAuth = [localStorage, sessionStorage].some((storage) => {
+          try {
+            return Object.keys(storage || {}).some((key) => key.startsWith("sb-") || key === "supabase.auth.token");
+          } catch (error) {
+            return false;
+          }
+        });
         if (hasPersistedAuth && supabaseClient) {
           try {
             const { data: sessionData, error: sessionError } = await supabaseClient.auth.getSession();
@@ -5079,7 +5097,7 @@ async function handleAuthStateChange(event, session) {
               return;
             }
             if (!sessionError && !sessionData?.session) {
-              recordDiagnostic("auth", "Persisted auth keys found but no active session", { hasPersistedAuth });
+              recordDiagnostic("auth", "Persisted auth keys found but no active session", { hasPersistedAuth, sessionError: sessionError?.message || null });
               clearSessionAuthStorage();
             }
           } catch (error) {
