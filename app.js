@@ -127,7 +127,7 @@ const SUPABASE_AUTH_OPTIONS = {
     autoRefreshToken: true,
     flowType: "pkce",
     storage: {
-      getItem: (key) => safeStorageGet(localStorage, key),
+      getItem: (key) => safeStorageGet(localStorage, key, null),
       setItem: (key, value) => safeStorageSet(localStorage, key, value),
       removeItem: (key) => safeStorageRemove(localStorage, key)
     }
@@ -5055,6 +5055,37 @@ async function handleAuthStateChange(event, session) {
 
     if (event === "INITIAL_SESSION") {
       if (!user) {
+        const hasPersistedAuth = Object.keys(localStorage || {}).some((key) => key.startsWith("sb-") || key === "supabase.auth.token");
+        if (hasPersistedAuth && supabaseClient) {
+          try {
+            const { data: sessionData, error: sessionError } = await supabaseClient.auth.getSession();
+            if (!sessionError && sessionData?.session?.user) {
+              currentUser = sessionData.session.user;
+              updateUserRow(currentUser);
+              hideLoginScreen();
+              setAuthBusy(false);
+              resetJournalState(currentUser.id);
+              updateSyncStatus("syncing");
+              recordDiagnostic("auth", "Session recovered from persisted storage", { userId: currentUser.id });
+              try {
+                await loadFromSupabase(currentUser.id);
+                updateSyncStatus("synced");
+              } catch (err) {
+                console.warn("Loading journal failed", err);
+                recordDiagnostic("error", "Failed to load journal after persisted session recovery", { error: String(err?.message || err) });
+              }
+              hideSplashScreen();
+              authStateBusy = false;
+              return;
+            }
+            if (!sessionError && !sessionData?.session) {
+              recordDiagnostic("auth", "Persisted auth keys found but no active session", { hasPersistedAuth });
+              clearSessionAuthStorage();
+            }
+          } catch (error) {
+            console.warn("Persisted session recovery check failed", error);
+          }
+        }
         const initStart = Date.now();
         setTimeout(() => {
           const elapsed = Date.now() - initStart;
