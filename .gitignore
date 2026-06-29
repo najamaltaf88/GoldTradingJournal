@@ -9,6 +9,7 @@ Desktop.ini
 .env
 .env.local
 env-config.js
+env-config.js.temp
 firebase-config.js
 firebase-config_example.js
 supabase-config.js

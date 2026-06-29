@@ -13,6 +13,11 @@
   status = 200
 
 [[headers]]
+  for = "/env-config.js"
+  [headers.values]
+    Cache-Control = "public, max-age=300, stale-while-revalidate=60"
+
+[[headers]]
   for = "/*"
   [headers.values]
     Cache-Control = "no-cache, no-store, must-revalidate"

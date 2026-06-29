@@ -677,16 +677,27 @@ function round1(value) {
 }
 
 function recalcCum() {
+  const sorted = state.trades.slice().sort((a, b) => {
+    const dateCmp = String(a.date || "").localeCompare(String(b.date || ""));
+    if (dateCmp !== 0) return dateCmp;
+    return String(a.id || "").localeCompare(String(b.id || ""));
+  });
   let cum = 0;
-  state.trades.forEach((trade) => {
+  const byId = new Map();
+  sorted.forEach((trade) => {
     const pnl = calcPnl(trade.risk, trade.reward, trade.result);
-    trade.pnl = pnl;
     if (pnl === "") {
-      trade.cum = "";
+      byId.set(trade.id, { pnl: "", cum: "" });
       return;
     }
     cum = round1(cum + parseFloat(pnl || 0));
-    trade.cum = cum;
+    byId.set(trade.id, { pnl, cum });
+  });
+  state.trades.forEach((trade) => {
+    const row = byId.get(trade.id);
+    if (!row) return;
+    trade.pnl = row.pnl;
+    trade.cum = row.cum;
   });
 }
 
@@ -1234,14 +1245,23 @@ function saveCashFromModal() {
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
 }
 
-function deleteCashTransaction(index) {
+async function deleteCashTransaction(index) {
   const entry = state.cashTransactions[index];
   if (!entry) return;
   const label = entry.type === "deposit" ? "deposit" : "withdrawal";
   if (!confirm(`Delete this ${label} of ${signed(entry.amount)} $?`)) return;
+  const cashId = entry.id;
   state.cashTransactions.splice(index, 1);
   save();
   renderTrades();
+  if (cashId) {
+    try {
+      await deleteCashFromSupabase(cashId);
+    } catch (err) {
+      console.warn("Could not delete cash transaction from Supabase:", err);
+      toast("Entry removed locally. Cloud delete failed — it will be removed on next sync.");
+    }
+  }
   toast(`${label.charAt(0).toUpperCase()}${label.slice(1)} deleted.`);
 }
 
@@ -1514,11 +1534,41 @@ function renderScreenshotUploader() {
 }
 
 function removeTradeScreenshot() {
+  const previousUrl = screenshotState.url || "";
   screenshotUploadToken += 1;
   resetScreenshotObjectUrl();
   setScreenshotState({ url: "", previewUrl: "", status: "idle", error: "" });
   const input = document.getElementById("modal-screenshot-input");
   if (input) input.value = "";
+  if (previousUrl) void deleteScreenshotFromStorage(previousUrl);
+}
+
+function screenshotStoragePathFromUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw || !currentUser) return "";
+  try {
+    const parsed = new URL(raw, window.location.origin);
+    const marker = "/screenshots/";
+    const idx = parsed.pathname.indexOf(marker);
+    if (idx === -1) return "";
+    const path = decodeURIComponent(parsed.pathname.slice(idx + marker.length));
+    if (!path.startsWith(`${currentUser.id}/`)) return "";
+    return path;
+  } catch (error) {
+    return "";
+  }
+}
+
+async function deleteScreenshotFromStorage(url) {
+  if (!supabaseClient || !currentUser) return;
+  const path = screenshotStoragePathFromUrl(url);
+  if (!path) return;
+  try {
+    const { error } = await supabaseClient.storage.from("screenshots").remove([path]);
+    if (error) throw error;
+  } catch (error) {
+    console.warn("Could not delete screenshot from storage", error);
+  }
 }
 
 async function handleScreenshotFile(file) {
@@ -1541,8 +1591,8 @@ async function handleScreenshotFile(file) {
   }
 
   resetScreenshotObjectUrl();
-  const uploadToken = screenshotUploadToken + 1;
-  screenshotUploadToken = uploadToken;
+  screenshotUploadToken += 1;
+  const uploadToken = screenshotUploadToken;
   const localUrl = URL.createObjectURL(file);
   setScreenshotState({ url: "", previewUrl: localUrl, objectUrl: localUrl, status: "uploading", error: "" });
 
@@ -1717,16 +1767,25 @@ function saveTradeFromModal() {
   toast(isEdit ? "Trade updated." : "Trade saved.");
 }
 
-function deleteTrade(index) {
+async function deleteTrade(index) {
   const trade = state.trades[index];
   if (!trade) return;
   if (!confirm(`Delete trade #${index + 1} (${trade.date || "no date"} · ${trade.result || "open"})? This cannot be undone.`)) return;
   const tradeId = trade.id;
+  const screenshotUrl = trade.screenshotUrl || "";
   state.trades.splice(index, 1);
   save();
   renderTrades();
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
-  if (tradeId) deleteTradeFromSupabase(tradeId);
+  if (tradeId) {
+    try {
+      await deleteTradeFromSupabase(tradeId);
+    } catch (err) {
+      console.warn("Could not delete trade from Supabase:", err);
+      toast("Trade removed locally. Cloud delete failed — it will be removed on next sync.");
+    }
+  }
+  if (screenshotUrl) void deleteScreenshotFromStorage(screenshotUrl);
   toast("Trade deleted.");
 }
 
@@ -1765,11 +1824,12 @@ function readonlyStars(score) {
   return `<span class="star-rating-readonly" aria-label="${current} out of 5">${"&#9733;".repeat(current)}${"&#9734;".repeat(5 - current)}</span>`;
 }
 
-function viewInfoItem(label, value, delay) {
+function viewInfoItem(label, value, delay, rawHtml = false) {
+  const display = rawHtml ? (value || "-") : escapeHtml(value || "-");
   return `
     <div class="view-info-item" style="animation-delay:${delay}ms">
       <span>${escapeHtml(label)}</span>
-      <b>${value || "-"}</b>
+      <b>${display}</b>
     </div>
   `;
 }
@@ -1796,7 +1856,7 @@ function renderViewTradeModal() {
     ["Hold Quality", escapeHtml(trade.hold || "-")],
     ["Risk ($)", escapeHtml(trade.risk || "-")],
     ["Reward ($)", escapeHtml(trade.reward || "-")],
-    ["Patience Score", readonlyStars(trade.patienceScore)]
+    ["Patience Score", readonlyStars(trade.patienceScore), true]
   ];
   const screenshotUrl = safeHttpUrl(trade.screenshotUrl);
   const imageHtml = screenshotUrl
@@ -1824,7 +1884,7 @@ function renderViewTradeModal() {
         </div>
       </header>
       <div class="view-info-grid">
-        ${info.map(([label, value], itemIndex) => viewInfoItem(label, value, itemIndex * 20)).join("")}
+        ${info.map((row, itemIndex) => viewInfoItem(row[0], row[1], itemIndex * 20, row[2])).join("")}
       </div>
       <section class="view-notes">
         <span>Notes / Reason</span>
@@ -1921,7 +1981,7 @@ function saveSkippedTradeFromModal() {
   toast(isEdit ? "Skipped trade updated." : "Skipped trade saved.");
 }
 
-function deleteSkippedTrade(index) {
+async function deleteSkippedTrade(index) {
   const trade = state.skippedTrades[index];
   if (!trade) return;
   if (!confirm(`Delete skipped trade (${trade.date || "no date"} · ${trade.level || "no level"})? This cannot be undone.`)) return;
@@ -1929,7 +1989,14 @@ function deleteSkippedTrade(index) {
   state.skippedTrades.splice(index, 1);
   save();
   renderSkippedTrades();
-  if (tradeId) deleteSkippedFromSupabase(tradeId);
+  if (tradeId) {
+    try {
+      await deleteSkippedFromSupabase(tradeId);
+    } catch (err) {
+      console.warn("Could not delete skipped trade from Supabase:", err);
+      toast("Skipped trade removed locally. Cloud delete failed — it will be removed on next sync.");
+    }
+  }
   toast("Skipped trade deleted.");
 }
 
@@ -3966,7 +4033,7 @@ function renderWeeklyReviews() {
   }
   list.innerHTML = reviews.map((review) => `
     <article class="weekly-card">
-      <button class="icon-btn" onclick="deleteWeeklyReview('${escapeHtml(review.id)}')" title="Delete review"><i data-lucide="trash-2"></i></button>
+      <button class="icon-btn" type="button" data-review-id="${escapeHtml(review.id)}" onclick="deleteWeeklyReview(this.dataset.reviewId)" title="Delete review"><i data-lucide="trash-2"></i></button>
       <h3>${escapeHtml(formatDateDisplay(review.weekOf) || review.weekOf)}</h3>
       <div><span>What did I learn this week?</span><p>${escapeHtml(review.learned || "-")}</p></div>
       <div><span>What pattern repeated (good or bad)?</span><p>${escapeHtml(review.pattern || "-")}</p></div>
@@ -4005,12 +4072,20 @@ function saveWeeklyReview() {
   toast("Weekly review saved.");
 }
 
-function deleteWeeklyReview(id) {
+async function deleteWeeklyReview(id) {
+  if (!id) return;
   if (!confirm("Delete this weekly review? This cannot be undone.")) return;
   state.weeklyReviews = state.weeklyReviews.filter((review) => review.id !== id);
   save();
   renderWeeklyReviews();
-  if (id && currentUser) deleteReviewFromSupabase(id);
+  if (currentUser) {
+    try {
+      await deleteReviewFromSupabase(id);
+    } catch (err) {
+      console.warn("Could not delete review from Supabase:", err);
+      toast("Review removed locally. Cloud delete failed — it will be removed on next sync.");
+    }
+  }
   toast("Weekly review deleted.");
 }
 
@@ -4094,6 +4169,7 @@ async function clearAllTrades() {
   }
   state.trades = [];
   syncMemoryState();
+  await save();
   renderTrades();
   if (document.getElementById("tab-analysis")?.classList.contains("active")) renderAnalysis();
   if (document.getElementById("tab-pnl")?.classList.contains("active")) renderPnl();
@@ -4192,8 +4268,8 @@ async function completeOAuthReturn() {
 async function migrateOldCaches() {
   if (!("serviceWorker" in navigator)) return;
   try {
-    const key = "gj_cache_migrated_v27";
-    if (localStorage.getItem(key)) return; // Already migrated, don't run again
+    const key = "gj_cache_migrated_v28";
+    if (safeStorageGet(localStorage, key)) return; // Already migrated, don't run again
 
     const registrations = await navigator.serviceWorker.getRegistrations();
     await Promise.all(registrations.map((registration) => registration.unregister()));
@@ -4201,7 +4277,7 @@ async function migrateOldCaches() {
       const keys = await caches.keys();
       await Promise.all(keys.map((key) => caches.delete(key)));
     }
-    localStorage.setItem(key, "true");
+    safeStorageSet(localStorage, key, "true");
     console.log("One-time Service Worker cache migration completed.");
   } catch (error) {
     console.warn("Could not migrate legacy service worker caches", error);
@@ -4326,6 +4402,7 @@ function exposeAuthApi() {
   window.signInWithEmail = signInWithEmail;
   window.signUpWithEmail = signUpWithEmail;
   window.signOutUser = signOutUser;
+  window.deleteWeeklyReview = deleteWeeklyReview;
   window.toggleDiagnosticsPanel = toggleDiagnosticsPanel;
 }
 
@@ -4491,6 +4568,7 @@ async function signOutUser() {
   }
   clearSessionAuthStorage();
   mentorSessionKey = "";
+  safeStorageRemove(sessionStorage, "gj_mentor_key");
   currentUser = null;
   resetJournalState();
   renderCurrentAccount();
@@ -4653,10 +4731,16 @@ async function loadFromSupabase(userId) {
     }
 
     accountData = {};
-    for (const account of accounts) {
-      accountData[account.id] = await loadAccountDataFromSupabase(userId, account.id);
-      if (loadToken !== authLoadToken) return false;
-    }
+    const accountResults = await Promise.all(
+      accounts.map((account) =>
+        loadAccountDataFromSupabase(userId, account.id)
+          .then((data) => ({ id: account.id, data }))
+      )
+    );
+    if (loadToken !== authLoadToken) return false;
+    accountResults.forEach(({ id, data }) => {
+      accountData[id] = data;
+    });
 
     state = normalizeJournalState(accountData[activeAccountId] || emptyJournalState(userId));
     syncMemoryState();
@@ -4815,17 +4899,20 @@ function tradeToDbRow(userId, accountId, trade) {
   };
 }
 
-async function syncSupabaseTable(table, userId, accountId, rows, toDbRow) {
-  const keep = new Set(rows.map((row) => row.id));
+async function syncSupabaseTable(table, userId, accountId, rows, toDbRow, deletedIds = new Set()) {
   if (rows.length > 0) {
-    const { error } = await supabaseClient.from(table).upsert(rows.map((row) => toDbRow(userId, accountId, row)), { onConflict: "id" });
+    const { error } = await supabaseClient.from(table).upsert(
+      rows.map((row) => toDbRow(userId, accountId, row)),
+      { onConflict: "id" }
+    );
     if (error) throw error;
   }
-  const { data: existing, error: fetchErr } = await supabaseClient.from(table).select("id").eq("user_id", userId).eq("account_id", accountId);
-  if (fetchErr) throw fetchErr;
-  const staleIds = (existing || []).map((row) => row.id).filter((id) => !keep.has(id));
-  if (staleIds.length > 0) {
-    const { error: delErr } = await supabaseClient.from(table).delete().in("id", staleIds).eq("user_id", userId);
+  if (deletedIds.size > 0) {
+    const { error: delErr } = await supabaseClient
+      .from(table)
+      .delete()
+      .in("id", Array.from(deletedIds))
+      .eq("user_id", userId);
     if (delErr) throw delErr;
   }
 }
@@ -4849,24 +4936,24 @@ async function saveToSupabase(options = {}) {
       const data = normalizeJournalState(accountData[accountId]);
 
       await Promise.all([
-        syncSupabaseTable("trades", userId, accountId, data.trades, tradeToDbRow),
+        syncSupabaseTable("trades", userId, accountId, data.trades, tradeToDbRow, new Set()),
         syncSupabaseTable("cash_transactions", userId, accountId, data.cashTransactions, (uid, accId, c) => ({
           id: c.id, user_id: uid, account_id: accId,
           date: c.date, type: c.type, amount: c.amount || null, note: c.note, created_at: c.createdAt
-        })),
+        }), new Set()),
         syncSupabaseTable("skipped_trades", userId, accountId, data.skippedTrades, (uid, accId, s) => ({
           id: s.id, user_id: uid, account_id: accId,
           date: s.date, session: s.session, level: s.level, tf: s.tf,
           direction: s.direction, skip_reason: s.skipReason, confidence: s.confidence,
           notes: s.notes, outcome: s.outcome, pips_missed: s.pipsMissed
-        })),
+        }), new Set()),
         syncSupabaseTable("weekly_reviews", userId, accountId, data.weeklyReviews, (uid, accId, r) => ({
           id: r.id, user_id: uid, account_id: accId,
           week_of: r.weekOf, learned: r.learned, pattern: r.pattern, improve: r.improve, created_at: r.createdAt
-        })),
+        }), new Set()),
         (async () => {
           const { error } = await supabaseClient.from("journal_meta").upsert({
-            id: accountId,
+            id: `${userId}_${accountId}`,
             user_id: userId,
             account_id: accountId,
             options: data.options,
@@ -4893,7 +4980,7 @@ async function deleteTradeFromSupabase(tradeId) {
     .delete()
     .eq("id", tradeId)
     .eq("user_id", currentUser.id);
-  if (error) console.warn("Could not delete trade from Supabase:", error);
+  if (error) throw error;
 }
 
 async function deleteSkippedFromSupabase(tradeId) {
@@ -4903,7 +4990,7 @@ async function deleteSkippedFromSupabase(tradeId) {
     .delete()
     .eq("id", tradeId)
     .eq("user_id", currentUser.id);
-  if (error) console.warn("Could not delete skipped trade from Supabase:", error);
+  if (error) throw error;
 }
 
 async function deleteCashFromSupabase(cashId) {
@@ -4913,7 +5000,7 @@ async function deleteCashFromSupabase(cashId) {
     .delete()
     .eq("id", cashId)
     .eq("user_id", currentUser.id);
-  if (error) console.warn("Could not delete cash transaction from Supabase:", error);
+  if (error) throw error;
 }
 
 async function deleteReviewFromSupabase(reviewId) {
@@ -4923,7 +5010,7 @@ async function deleteReviewFromSupabase(reviewId) {
     .delete()
     .eq("id", reviewId)
     .eq("user_id", currentUser.id);
-  if (error) console.warn("Could not delete review from Supabase:", error);
+  if (error) throw error;
 }
 
 async function upsertAccountToSupabase(userId, account) {
@@ -4934,7 +5021,7 @@ async function upsertAccountToSupabase(userId, account) {
     name: account.name,
     created_at: account.createdAt,
     updated_at: new Date().toISOString()
-  }, { onConflict: "id" });
+  }, { onConflict: "user_id,id" });
   if (error) throw error;
 }
 
@@ -4956,30 +5043,62 @@ async function clearAccountFromSupabase(userId, accountId) {
 }
 
 async function handleAuthStateChange(event, session) {
-  if (authStateBusy) return;
+  if (authStateBusy) {
+    setTimeout(() => handleAuthStateChange(event, session), 400);
+    return;
+  }
   authStateBusy = true;
   try {
     const user = session?.user || null;
     currentUser = user;
     updateUserRow(user);
 
-    if (event === "INITIAL_SESSION" || event === "SIGNED_IN") {
+    if (event === "INITIAL_SESSION") {
       if (!user) {
-        authLoadToken += 1;
-        setAuthBusy(false);
-        resetJournalState();
-        renderCurrentAccount();
-        showLoginScreen();
-        updateSyncStatus("offline");
-        recordDiagnostic("auth", "No active session restored", { event });
-      } else {
-        hideLoginScreen();
-        setAuthBusy(false);
-        resetJournalState(user.id);
-        updateSyncStatus("syncing");
-        recordDiagnostic("auth", "Restoring journal for signed-in user", { userId: user.id, event });
+        setTimeout(() => {
+          if (!currentUser) {
+            authLoadToken += 1;
+            setAuthBusy(false);
+            resetJournalState();
+            renderCurrentAccount();
+            showLoginScreen();
+            hideSplashScreen();
+            updateSyncStatus("offline");
+            recordDiagnostic("auth", "No session after INITIAL_SESSION timeout", { event });
+          }
+        }, 2000);
+        authStateBusy = false;
+        return;
+      }
+      hideLoginScreen();
+      setAuthBusy(false);
+      resetJournalState(user.id);
+      updateSyncStatus("syncing");
+      recordDiagnostic("auth", "Session restored via INITIAL_SESSION", { userId: user.id });
+      try {
         await loadFromSupabase(user.id);
         updateSyncStatus("synced");
+      } catch (err) {
+        console.warn("Loading journal failed", err);
+        recordDiagnostic("error", "Failed to load journal after INITIAL_SESSION", { error: String(err?.message || err) });
+      }
+      hideSplashScreen();
+      return;
+    }
+
+    if (event === "SIGNED_IN") {
+      if (!user) return;
+      hideLoginScreen();
+      setAuthBusy(false);
+      resetJournalState(user.id);
+      updateSyncStatus("syncing");
+      recordDiagnostic("auth", "User signed in", { userId: user.id, event });
+      try {
+        await loadFromSupabase(user.id);
+        updateSyncStatus("synced");
+      } catch (err) {
+        console.warn("Loading journal failed", err);
+        recordDiagnostic("error", "Failed to load journal after sign-in", { error: String(err?.message || err) });
       }
       hideSplashScreen();
       return;
@@ -4991,19 +5110,58 @@ async function handleAuthStateChange(event, session) {
       resetJournalState();
       renderCurrentAccount();
       showLoginScreen();
+      hideSplashScreen();
       updateSyncStatus("offline");
       recordDiagnostic("auth", "User signed out", { event });
       return;
     }
 
     if (event === "TOKEN_REFRESHED") {
+      if (session?.user) {
+        currentUser = session.user;
+        updateUserRow(session.user);
+        const loginScreen = document.getElementById("login-screen");
+        const loginVisible = loginScreen && !loginScreen.hasAttribute("hidden");
+        if (loginVisible) {
+          hideLoginScreen();
+          setAuthBusy(false);
+          resetJournalState(session.user.id);
+          updateSyncStatus("syncing");
+          recordDiagnostic("auth", "Session restored via TOKEN_REFRESHED", { userId: session.user.id });
+          try {
+            await loadFromSupabase(session.user.id);
+            updateSyncStatus("synced");
+          } catch (err) {
+            console.warn("Loading journal failed after token refresh", err);
+            recordDiagnostic("error", "Failed to load journal after token refresh", { error: String(err?.message || err) });
+          }
+          hideSplashScreen();
+        }
+      }
       updateSyncStatus("synced");
       recordDiagnostic("auth", "Session refreshed", { event });
+      return;
+    }
+
+    if (event === "USER_UPDATED") {
+      if (session?.user) {
+        currentUser = session.user;
+        updateUserRow(session.user);
+        recordDiagnostic("auth", "User profile updated", { userId: session.user.id });
+      }
+      return;
+    }
+
+    if (event === "PASSWORD_RECOVERY") {
+      setAuthStatus("Password recovery link verified. Set a new password in Options.", "success");
+      recordDiagnostic("auth", "Password recovery session", { event });
+      return;
     }
   } catch (error) {
     console.warn("Auth state change failed", error);
     recordDiagnostic("error", "Auth state change failed", { error: String(error?.message || error), event });
     setAuthStatus("Authentication recovery failed. Please sign in again.", "error");
+    try { hideSplashScreen(); } catch (e) {}
   } finally {
     authStateBusy = false;
   }
@@ -5029,29 +5187,15 @@ async function initSupabaseAuth() {
     void handleAuthStateChange(event, session);
   });
 
-  const { data: initialSessionData, error: initialSessionError } = await supabaseClient.auth.getSession();
-  if (initialSessionError) {
-    recordDiagnostic("auth", "Initial session read failed", { error: String(initialSessionError.message || initialSessionError) });
-  }
-
   const callbackHandled = await completeOAuthReturn().catch((error) => {
     console.warn("OAuth return handling failed", error);
     setAuthStatus("Sign-in failed. Please try again.", "error");
     return false;
   });
 
-  if (initialSessionData?.session) {
-    recordDiagnostic("auth", "Initial session restored on startup", { userId: initialSessionData.session.user?.id });
-    return;
-  }
-
   if (callbackHandled) {
     return;
   }
-
-  showLoginScreen();
-  hideSplashScreen();
-  recordDiagnostic("auth", "No active session available on startup");
 }
 
 function switchTab(name, button) {
@@ -5071,12 +5215,20 @@ function switchTab(name, button) {
   refreshIcons();
 }
 
+function saveMentorKey(key) {
+  mentorSessionKey = key;
+  safeStorageSet(sessionStorage, "gj_mentor_key", key);
+}
+
 function renderAiMentor() {
+  if (!mentorSessionKey) {
+    mentorSessionKey = safeStorageGet(sessionStorage, "gj_mentor_key", "");
+  }
   const keyInput = document.getElementById("mentor-api-key");
   const modelInput = document.getElementById("mentor-model");
   const keyStatus = document.getElementById("mentor-key-status");
   const scope = document.getElementById("mentor-scope");
-  const savedKey = mentorSessionKey || "";
+  const savedKey = mentorSessionKey || safeStorageGet(sessionStorage, "gj_mentor_key", "");
   if (keyInput && !keyInput.value) keyInput.value = savedKey;
   if (modelInput) modelInput.value = DEFAULT_MENTOR_MODEL;
   if (keyStatus) keyStatus.textContent = savedKey ? "ready for this tab" : "not saved";
@@ -5086,13 +5238,14 @@ function renderAiMentor() {
 
 function saveMentorSettings() {
   const key = document.getElementById("mentor-api-key")?.value.trim() || "";
-  mentorSessionKey = key;
+  saveMentorKey(key);
   renderAiMentor();
   toast(key ? "AI Mentor key ready for this tab only." : "Add API key to analyze.");
 }
 
 function clearMentorSettings() {
   mentorSessionKey = "";
+  safeStorageRemove(sessionStorage, "gj_mentor_key");
   const keyInput = document.getElementById("mentor-api-key");
   const modelInput = document.getElementById("mentor-model");
   if (keyInput) keyInput.value = "";
@@ -5314,6 +5467,18 @@ function renderMentorMarkdown(text) {
   }).join("");
 }
 
+function safeSanitize(html) {
+  if (typeof DOMPurify !== "undefined") {
+    return DOMPurify.sanitize(html, {
+      ALLOWED_TAGS: ["article", "section", "header", "h3", "div", "p", "ul", "ol", "li", "strong", "em", "b", "span", "br"],
+      ALLOWED_ATTR: ["class", "aria-label", "aria-hidden"]
+    });
+  }
+  const div = document.createElement("div");
+  div.textContent = html;
+  return `<pre style="white-space:pre-wrap">${div.innerHTML}</pre>`;
+}
+
 function buildLocalMentorFallback(snapshot) {
   const summary = snapshot?.summary || {};
   const recentTrades = snapshot?.recentTrades || [];
@@ -5370,9 +5535,7 @@ function buildLocalMentorFallback(snapshot) {
     "3. Write one rule for managing your next session before trading."
   ].join("\n");
   const rawHtml = `<article class="mentor-review">${renderMentorMarkdown(body)}</article>`;
-  return typeof DOMPurify !== "undefined"
-    ? DOMPurify.sanitize(rawHtml, { ALLOWED_TAGS: ["article", "section", "header", "h3", "div", "p", "ul", "ol", "li", "strong", "em", "b", "span", "br"], ALLOWED_ATTR: ["class", "aria-label", "aria-hidden"] })
-    : rawHtml;
+  return safeSanitize(rawHtml);
 }
 
 async function runAiMentorReview() {
@@ -5409,7 +5572,7 @@ async function runAiMentorReview() {
     mentorRequestInProgress = false;
     return;
   }
-  mentorSessionKey = key;
+  saveMentorKey(key);
   renderAiMentor();
   output.innerHTML = `<div class="mentor-loading"><span class="upload-spinner"></span><b>Analyzing journal...</b></div>`;
   diagnosticsState.ai = { status: "requesting" };
@@ -5441,13 +5604,11 @@ async function runAiMentorReview() {
     const scope = document.getElementById("mentor-scope");
     if (scope) scope.textContent = `model: ${data?.model || model}`;
     const rawHtml = `<article class="mentor-review">${renderMentorMarkdown(content)}</article>`;
-    output.innerHTML = typeof DOMPurify !== "undefined"
-      ? DOMPurify.sanitize(rawHtml, { ALLOWED_TAGS: ["article", "section", "header", "h3", "div", "p", "ul", "ol", "li", "strong", "em", "b", "span", "br"], ALLOWED_ATTR: ["class", "aria-label", "aria-hidden"] })
-      : rawHtml;
+    output.innerHTML = safeSanitize(rawHtml);
     diagnosticsState.ai = { status: "ready", lastModel: data?.model || model };
   } catch (error) {
     console.warn("AI Mentor request failed", error);
-    const fallbackHtml = buildLocalMentorFallback(mentorTradeSnapshot());
+    const fallbackHtml = safeSanitize(buildLocalMentorFallback(mentorTradeSnapshot()));
     output.innerHTML = fallbackHtml;
     diagnosticsState.ai = { status: "fallback", error: error.message || "network error" };
     toast("AI Mentor request failed. Showing local fallback analysis.");
@@ -5694,8 +5855,12 @@ function seedDemoTrades() {
 }
 
 if (typeof document !== "undefined") {
+  installGlobalErrorHandlers();
   exposeAuthApi();
   purgeLegacyJournalStorage();
+  if (!mentorSessionKey) {
+    mentorSessionKey = safeStorageGet(sessionStorage, "gj_mentor_key", "");
+  }
   migrateOldCaches();
   resetJournalState();
   applyReportPreset();
@@ -5705,7 +5870,7 @@ if (typeof document !== "undefined") {
   refreshIcons();
 
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./sw.js?v=20260628-supabase-only-v27")
+    navigator.serviceWorker.register("./sw.js?v=20260629-supabase-v28")
       .catch((err) => console.warn("Service worker registration failed:", err));
   }
   document.addEventListener("keydown", (event) => {

@@ -1,14 +1,19 @@
-const CACHE_NAME = "gold-journal-v27";
+const CACHE_NAME = "gold-journal-v28";
+const APP_VERSION = "20260629-supabase-v28";
 const APP_FILES = [
   "./",
-  "./styles.css?v=20260628-supabase-only-v27",
-  "./app.js?v=20260628-supabase-only-v27",
-  "./manifest.json",
-  "./icon.svg",
+  `./index.html`,
+  `./styles.css?v=${APP_VERSION}`,
+  `./app.js?v=${APP_VERSION}`,
+  `./env-config.js`,
+  `./manifest.json`,
+  `./icon.svg`,
   "./auth/callback/index.html"
 ];
 
 const STATIC_EXTENSIONS = [".js", ".css", ".html", ".json", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".ico", ".woff", ".woff2"];
+
+const NETWORK_ONLY_HOSTS = ["supabase.co", "openrouter.ai"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -29,9 +34,12 @@ self.addEventListener("activate", (event) => {
 });
 
 function isSameOriginStatic(url) {
-  // Ignore external Supabase, Google, or other API calls
   if (url.origin !== self.location.origin) return false;
   return STATIC_EXTENSIONS.some((ext) => url.pathname.endsWith(ext)) || url.pathname === "/";
+}
+
+function isNetworkOnly(url) {
+  return NETWORK_ONLY_HOSTS.some((host) => url.hostname.includes(host));
 }
 
 self.addEventListener("fetch", (event) => {
@@ -39,15 +47,13 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(event.request.url);
 
-  // Supabase requests should go straight to network, do not cache
-  if (url.hostname.includes("supabase.co")) {
+  if (isNetworkOnly(url)) {
     return;
   }
 
   if (event.request.mode === "navigate") {
-    // Network-first for navigation, fallback to shell
     event.respondWith(
-      fetch(event.request).catch(() => caches.match("./"))
+      fetch(event.request).catch(() => caches.match("./index.html").then((cached) => cached || caches.match("./")))
     );
     return;
   }
@@ -66,7 +72,7 @@ self.addEventListener("fetch", (event) => {
         const copy = response.clone();
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
-      }).catch(() => caches.match("./"))
+      }).catch(() => caches.match("./index.html").then((cached) => cached || caches.match("./")))
     )
   );
 });

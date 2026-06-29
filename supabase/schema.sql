@@ -1,19 +1,22 @@
 -- XAUUSD Journal — run in Supabase SQL Editor
 
--- Accounts table
+-- Accounts table (composite PK: logical account id is per-user, e.g. "main")
+-- Migration from id-only PK: ALTER TABLE accounts DROP CONSTRAINT accounts_pkey;
+--   ALTER TABLE accounts ADD PRIMARY KEY (user_id, id);
 CREATE TABLE IF NOT EXISTS accounts (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL,
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   name TEXT NOT NULL DEFAULT 'Main Account',
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (user_id, id)
 );
 
 -- Trades table
 CREATE TABLE IF NOT EXISTS trades (
   id TEXT PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL,
   date TEXT,
   session TEXT,
   entry TEXT,
@@ -43,7 +46,7 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE TABLE IF NOT EXISTS cash_transactions (
   id TEXT PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL,
   date TEXT,
   type TEXT,
   amount NUMERIC,
@@ -55,7 +58,7 @@ CREATE TABLE IF NOT EXISTS cash_transactions (
 CREATE TABLE IF NOT EXISTS skipped_trades (
   id TEXT PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL,
   date TEXT,
   session TEXT,
   level TEXT,
@@ -73,7 +76,7 @@ CREATE TABLE IF NOT EXISTS skipped_trades (
 CREATE TABLE IF NOT EXISTS weekly_reviews (
   id TEXT PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL,
   week_of TEXT,
   learned TEXT,
   pattern TEXT,
@@ -82,10 +85,12 @@ CREATE TABLE IF NOT EXISTS weekly_reviews (
 );
 
 -- Journal options and settings (one row per user per account)
+-- Note: id format is '{user_id}_{account_id}' to ensure global uniqueness
+-- If migrating existing data: UPDATE journal_meta SET id = user_id || '_' || account_id;
 CREATE TABLE IF NOT EXISTS journal_meta (
   id TEXT PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL,
   options JSONB DEFAULT '{}',
   settings JSONB DEFAULT '{}',
   updated_at TIMESTAMPTZ DEFAULT NOW()
