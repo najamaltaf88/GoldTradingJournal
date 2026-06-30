@@ -258,6 +258,10 @@ let lastMentorRequestTime = 0;
 const MENTOR_COOLDOWN_MS = 30000; // 30 seconds between requests
 let accountSwitchInProgress = false;
 
+let lastModifiedTradeIndex = null;
+let lastModifiedTradeKind = null;
+let lastModifiedSkippedIndex = null;
+
 const screenshotState = {
   url: "",
   previewUrl: "",
@@ -1222,14 +1226,18 @@ function openCashModal(type = "deposit", index = null) {
   document.getElementById("cash-date").value = entry?.date || todayISO();
   document.getElementById("cash-amount").value = entry?.amount || "";
   document.getElementById("cash-note").value = entry?.note || "";
-  modal?.removeAttribute("hidden");
+  if (modal) {
+    modal.hidden = false;
+    modal.classList.remove("closing");
+    updateModalOpenClass();
+  }
   setTimeout(() => document.getElementById("cash-amount")?.focus(), 40);
   refreshIcons();
 }
 
 function closeCashModal() {
-  document.getElementById("cash-modal")?.setAttribute("hidden", "");
   cashEditingIndex = null;
+  dismissModal("cash-modal");
 }
 
 function saveCashFromModal() {
@@ -1690,6 +1698,7 @@ function openTradeModal(index = null, draft = null) {
   const modal = document.getElementById("trade-modal");
   if (modal) {
     modal.hidden = false;
+    modal.classList.remove("closing");
     document.body.classList.add("modal-open");
     setTimeout(() => document.getElementById("modal-date")?.focus(), 40);
   }
@@ -1718,9 +1727,6 @@ function handleModalCustomOption(select) {
 }
 
 function closeTradeModal() {
-  const modal = document.getElementById("trade-modal");
-  if (modal) modal.hidden = true;
-  document.body.classList.remove("modal-open");
   modalEditingIndex = null;
   screenshotUploadToken += 1;
   resetScreenshotObjectUrl();
@@ -1729,6 +1735,7 @@ function closeTradeModal() {
   screenshotState.previewUrl = "";
   screenshotState.status = "idle";
   screenshotState.error = "";
+  dismissModal("trade-modal");
 }
 
 function modalTradeData() {
@@ -1812,17 +1819,14 @@ function openViewTradeModal(index) {
   if (!modal || viewTradeIndex === null || !state.trades[viewTradeIndex]) return;
   renderViewTradeModal();
   modal.hidden = false;
+  modal.classList.remove("closing");
   document.body.classList.add("modal-open");
   refreshIcons();
 }
 
 function closeViewTradeModal() {
-  const modal = document.getElementById("view-trade-modal");
-  if (modal) modal.hidden = true;
   viewTradeIndex = null;
-  if (document.getElementById("trade-modal")?.hidden !== false && document.getElementById("skipped-modal")?.hidden !== false) {
-    document.body.classList.remove("modal-open");
-  }
+  dismissModal("view-trade-modal");
 }
 
 function editTradeFromView() {
@@ -1951,6 +1955,7 @@ function openSkippedModal(index = null) {
   const modal = document.getElementById("skipped-modal");
   if (modal) {
     modal.hidden = false;
+    modal.classList.remove("closing");
     document.body.classList.add("modal-open");
     setTimeout(() => document.getElementById("skipped-date")?.focus(), 40);
   }
@@ -1958,10 +1963,8 @@ function openSkippedModal(index = null) {
 }
 
 function closeSkippedModal() {
-  const modal = document.getElementById("skipped-modal");
-  if (modal) modal.hidden = true;
-  document.body.classList.remove("modal-open");
   skippedEditingIndex = null;
+  dismissModal("skipped-modal");
 }
 
 function modalSkippedTradeData() {
@@ -5161,9 +5164,33 @@ function switchTab(name, button) {
   destroyAllCharts();
   clearTimeout(analysisTimer);
   analysisTimer = null;
+
+  const currentActive = document.querySelector(".tab-panel.active");
+  const targetActive = document.getElementById(`tab-${name}`);
+
   document.querySelectorAll(".nav-btn, .bottom-nav-btn").forEach((btn) => btn.classList.toggle("active", btn.dataset.tab === name));
-  document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.remove("active"));
-  document.getElementById(`tab-${name}`)?.classList.add("active");
+
+  if (currentActive && currentActive !== targetActive) {
+    currentActive.classList.remove("active");
+    currentActive.classList.add("leaving");
+
+    const onTransitionEnd = (e) => {
+      if (e.propertyName === "opacity") {
+        currentActive.classList.remove("leaving");
+        currentActive.removeEventListener("transitionend", onTransitionEnd);
+      }
+    };
+    currentActive.addEventListener("transitionend", onTransitionEnd);
+
+    setTimeout(() => {
+      currentActive.classList.remove("leaving");
+    }, 250);
+  }
+
+  if (targetActive) {
+    targetActive.classList.add("active");
+  }
+
   if (name === "missed") renderSkippedTrades();
   if (name === "analysis") renderAnalysisWithDelay();
   if (name === "pnl") renderPnl();
@@ -5881,3 +5908,49 @@ function hideSplashScreen() {
   }, 450);
 }
 
+function updateModalOpenClass() {
+  const anyOpen = Array.from(document.querySelectorAll(".modal-backdrop")).some(
+    m => !m.hidden && !m.classList.contains("closing")
+  );
+  if (anyOpen) {
+    document.body.classList.add("modal-open");
+  } else {
+    document.body.classList.remove("modal-open");
+  }
+}
+
+function dismissModal(modalId, onClosed) {
+  const modal = document.getElementById(modalId);
+  if (!modal) return;
+  if (modal.hidden) {
+    modal.classList.remove("closing");
+    if (onClosed) onClosed();
+    updateModalOpenClass();
+    return;
+  }
+  if (modal.classList.contains("closing")) return;
+  modal.classList.add("closing");
+
+  updateModalOpenClass();
+
+  const onAnimationEnd = (e) => {
+    if (e.target === modal) {
+      modal.hidden = true;
+      modal.classList.remove("closing");
+      modal.removeEventListener("animationend", onAnimationEnd);
+      if (onClosed) onClosed();
+      updateModalOpenClass();
+    }
+  };
+  modal.addEventListener("animationend", onAnimationEnd);
+
+  setTimeout(() => {
+    if (modal.classList.contains("closing")) {
+      modal.hidden = true;
+      modal.classList.remove("closing");
+      modal.removeEventListener("animationend", onAnimationEnd);
+      if (onClosed) onClosed();
+      updateModalOpenClass();
+    }
+  }, 250);
+}

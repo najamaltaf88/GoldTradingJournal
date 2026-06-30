@@ -33,7 +33,7 @@
   --shadow-glow: 0 0 20px rgba(223, 171, 55, 0.15);
   --font: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --mono: "DM Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
-  --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+  --transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 /* Custom Premium Scrollbar */
@@ -63,26 +63,108 @@
   }
 }
 
-@keyframes modalFadeIn {
+@keyframes tabFadeOutUp {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+}
+
+@keyframes backdropFadeIn {
   from {
     background: rgba(0, 0, 0, 0);
     backdrop-filter: blur(0px);
     -webkit-backdrop-filter: blur(0px);
   }
   to {
-    background: rgba(4, 5, 7, 0.78);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
+    background: rgba(0, 0, 0, 0.72);
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
   }
 }
 
-@keyframes modalSlideIn {
+@keyframes backdropFadeOut {
   from {
-    transform: scale(0.96) translateY(12px);
+    background: rgba(0, 0, 0, 0.72);
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+  }
+  to {
+    background: rgba(0, 0, 0, 0);
+    backdrop-filter: blur(0px);
+    -webkit-backdrop-filter: blur(0px);
+  }
+}
+
+@keyframes modalScaleIn {
+  from {
+    transform: scale(0.96) translateY(8px);
     opacity: 0;
   }
   to {
     transform: scale(1) translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes modalScaleOut {
+  from {
+    transform: scale(1) translateY(0);
+    opacity: 1;
+  }
+  to {
+    transform: scale(0.96) translateY(8px);
+    opacity: 0;
+  }
+}
+
+@keyframes rowFadeIn {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+    background: rgba(240, 189, 85, 0.18);
+  }
+  40% {
+    opacity: 1;
+    background: rgba(240, 189, 85, 0.18);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes loginFadeOut {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.02);
+  }
+}
+
+@keyframes loginFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(1.02);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes appFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
     opacity: 1;
   }
 }
@@ -137,7 +219,10 @@ button {
 }
 
 .mobile-topbar,
-.bottom-nav,
+.bottom-nav {
+  display: none;
+}
+
 .sidebar-backdrop {
   display: none;
 }
@@ -1031,6 +1116,7 @@ th {
 .main {
   min-width: 0;
   overflow: hidden;
+  position: relative;
 }
 
 .tab-panel {
@@ -1038,11 +1124,28 @@ th {
   height: 100vh;
   overflow: hidden;
   flex-direction: column;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .tab-panel.active {
   display: flex;
-  animation: tabFadeInUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.tab-panel.leaving {
+  display: flex !important;
+  opacity: 0;
+  transform: translateY(-8px);
+  pointer-events: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 5;
 }
 
 .page-head {
@@ -1337,7 +1440,17 @@ td {
 }
 
 tbody tr {
-  transition: background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  transition: opacity 0.2s ease, transform 0.2s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+tbody tr.row-entering {
+  animation: rowFadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+tbody tr.row-leaving {
+  opacity: 0 !important;
+  transform: translateX(-16px) !important;
+  pointer-events: none;
 }
 
 tbody tr:hover {
@@ -3547,14 +3660,14 @@ body.show-optional-columns .optional-col {
   background: rgba(16, 20, 26, 0.96);
   box-shadow: var(--shadow);
   opacity: 0;
-  transform: translateX(24px);
+  transform: translateY(16px);
   pointer-events: none;
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1), transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .toast.show {
   opacity: 1;
-  transform: translateX(0);
+  transform: translateY(0);
 }
 
 body.modal-open {
@@ -3568,8 +3681,29 @@ body.modal-open {
   display: grid;
   place-items: center;
   padding: 18px;
+  background: rgba(0, 0, 0, 0);
+  backdrop-filter: blur(0px);
+  -webkit-backdrop-filter: blur(0px);
+  transition: background 0.25s cubic-bezier(0.16, 1, 0.3, 1), backdrop-filter 0.25s cubic-bezier(0.16, 1, 0.3, 1), -webkit-backdrop-filter 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.modal-backdrop:not([hidden]) {
   background: rgba(0, 0, 0, 0.72);
   backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+}
+
+.modal-backdrop:not([hidden]) .trade-modal {
+  animation: modalScaleIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.modal-backdrop.closing {
+  display: grid !important;
+  animation: backdropFadeOut 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.modal-backdrop.closing .trade-modal {
+  animation: modalScaleOut 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
 .modal-backdrop[hidden] {
@@ -3586,6 +3720,7 @@ body.modal-open {
   border-radius: var(--radius);
   background: #151515;
   box-shadow: 0 28px 90px rgba(0, 0, 0, 0.6);
+  opacity: 0;
 }
 
 .trade-modal h2 {
@@ -5033,13 +5168,22 @@ body.modal-open {
     transform: translateX(0);
   }
 
-  body.mobile-menu-open .sidebar-backdrop {
+  .sidebar-backdrop {
+    display: block;
     position: fixed;
     inset: 0;
     z-index: 44;
-    display: block;
     background: rgba(0, 0, 0, 0.62);
     backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.22s ease, backdrop-filter 0.22s ease, -webkit-backdrop-filter 0.22s ease;
+  }
+
+  body.mobile-menu-open .sidebar-backdrop {
+    opacity: 1;
+    pointer-events: auto;
   }
 
   .sidebar .brand {
@@ -5448,5 +5592,39 @@ body.modal-open {
 
   td {
     color: #111;
+  }
+}
+
+/* =============================================
+   ANIMATION TRANSITION UTILITIES
+   ============================================= */
+
+#login-screen.login-fade-out {
+  display: grid !important;
+  animation: loginFadeOut 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  pointer-events: none;
+}
+
+#login-screen.login-fade-in {
+  display: grid !important;
+  animation: loginFadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.app.app-fade-in,
+.mobile-topbar.app-fade-in,
+.bottom-nav.app-fade-in {
+  animation: appFadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-delay: -1ms !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    transition-delay: -1ms !important;
+    scroll-behavior: auto !important;
   }
 }
