@@ -8,7 +8,7 @@ let authMode = "signin";
 let authBusy = false;
 let authPasswordVisible = false;
 let authInitStarted = false;
-let authStateBusy = false;
+let sessionBootstrapUserId = "";
 let diagnosticsState = {
   auth: {},
   storage: {},
@@ -48,19 +48,34 @@ function safeStorageRemove(storage, key) {
   }
 }
 
-function getAuthStorage() {
-  return {
-    getItem(key) {
-      return safeStorageGet(localStorage, key, null);
-    },
-    setItem(key, value) {
-      return safeStorageSet(localStorage, key, value);
-    },
-    removeItem(key) {
-      return safeStorageRemove(localStorage, key);
+const SUPABASE_AUTH_OPTIONS = {
+  auth: {
+    detectSessionInUrl: false,
+    persistSession: true,
+    autoRefreshToken: true,
+    flowType: "pkce",
+    storage: {
+      getItem(key) {
+        try {
+          return localStorage.getItem(key);
+        } catch (error) {
+          console.warn("Auth storage read failed", error);
+          return null;
+        }
+      },
+      setItem(key, value) {
+        localStorage.setItem(key, value);
+      },
+      removeItem(key) {
+        try {
+          localStorage.removeItem(key);
+        } catch (error) {
+          console.warn("Auth storage remove failed", error);
+        }
+      }
     }
-  };
-}
+  }
+};
 
 function safeStorageClearMatching(storage, predicate) {
   try {
@@ -69,6 +84,31 @@ function safeStorageClearMatching(storage, predicate) {
     return true;
   } catch (error) {
     console.warn("Storage clear failed", error);
+    return false;
+  }
+}
+
+function initSupabase() {
+  if (supabaseClient) return true;
+
+  const config = window.SUPABASE_CONFIG;
+  if (!config || !config.url || !config.anonKey) {
+    console.warn("Supabase config missing. Copy .env.example to .env, then run: node scripts/generate-config.js");
+    setAuthStatus("Supabase config missing. Set SUPABASE_URL and SUPABASE_ANON_KEY in Netlify.", "error");
+    return false;
+  }
+  if (!window.supabase?.createClient) {
+    console.warn("Supabase JS library failed to load.");
+    setAuthStatus("Could not load Supabase. Check your connection or disable ad blockers.", "error");
+    return false;
+  }
+  try {
+    supabaseConfig = config;
+    supabaseClient = window.supabase.createClient(config.url, config.anonKey, SUPABASE_AUTH_OPTIONS);
+    return true;
+  } catch (error) {
+    console.error("Supabase init failed", error);
+    setAuthStatus("Could not connect to Supabase.", "error");
     return false;
   }
 }
@@ -132,41 +172,6 @@ function installGlobalErrorHandlers() {
     recordDiagnostic("error", reason, { stack: event.reason?.stack || "" });
     if (typeof toast === "function") toast("A background operation failed. Check diagnostics for details.");
   });
-}
-
-const SUPABASE_AUTH_OPTIONS = {
-  auth: {
-    detectSessionInUrl: true,
-    persistSession: true,
-    autoRefreshToken: true,
-    flowType: "pkce",
-    storage: getAuthStorage()
-  }
-};
-
-function initSupabase() {
-  if (supabaseClient) return true;
-
-  const config = window.SUPABASE_CONFIG;
-  if (!config || !config.url || !config.anonKey) {
-    console.warn("Supabase config missing. Copy .env.example to .env, then run: node scripts/generate-config.js");
-    setAuthStatus("Supabase config missing. Set SUPABASE_URL and SUPABASE_ANON_KEY in Netlify.", "error");
-    return false;
-  }
-  if (!window.supabase?.createClient) {
-    console.warn("Supabase JS library failed to load.");
-    setAuthStatus("Could not load Supabase. Check your connection or disable ad blockers.", "error");
-    return false;
-  }
-  try {
-    supabaseConfig = config;
-    supabaseClient = window.supabase.createClient(config.url, config.anonKey, SUPABASE_AUTH_OPTIONS);
-    return true;
-  } catch (error) {
-    console.error("Supabase init failed", error);
-    setAuthStatus("Could not connect to Supabase.", "error");
-    return false;
-  }
 }
 
 const MAX_SCREENSHOT_SIZE = 5 * 1024 * 1024;
@@ -4277,23 +4282,28 @@ async function completeOAuthReturn() {
   }
 }
 
-async function migrateOldCaches() {
-  if (!("serviceWorker" in navigator)) return;
-  try {
-    const key = "gj_cache_migrated_v28";
-    if (safeStorageGet(localStorage, key)) return; // Already migrated, don't run again
-
-    const registrations = await navigator.serviceWorker.getRegistrations();
-    await Promise.all(registrations.map((registration) => registration.unregister()));
-    if ("caches" in window) {
-      const keys = await caches.keys();
-      await Promise.all(keys.map((key) => caches.delete(key)));
-    }
-    safeStorageSet(localStorage, key, "true");
-    console.log("One-time Service Worker cache migration completed.");
-  } catch (error) {
-    console.warn("Could not migrate legacy service worker caches", error);
+async function establishUserSession(user, source = "auth") {
+  if (!user?.id) return;
+  if (sessionBootstrapUserId === user.id && currentUser?.id === user.id) {
+    hideSplashScreen();
+    return;
   }
+  sessionBootstrapUserId = user.id;
+  currentUser = user;
+  updateUserRow(user);
+  hideLoginScreen();
+  setAuthBusy(false);
+  resetJournalState(user.id);
+  updateSyncStatus("syncing");
+  recordDiagnostic("auth", "Session established", { userId: user.id, source });
+  try {
+    await loadFromSupabase(user.id);
+    updateSyncStatus("synced");
+  } catch (err) {
+    console.warn("Loading journal failed", err);
+    recordDiagnostic("error", "Failed to load journal", { source, error: String(err?.message || err) });
+  }
+  hideSplashScreen();
 }
 
 function setAuthStatus(message = "", type = "") {
@@ -5055,126 +5065,14 @@ async function clearAccountFromSupabase(userId, accountId) {
 }
 
 async function handleAuthStateChange(event, session) {
-  if (authStateBusy) {
-    setTimeout(() => handleAuthStateChange(event, session), 400);
-    return;
-  }
-  authStateBusy = true;
   try {
     const user = session?.user || null;
-    currentUser = user;
-    updateUserRow(user);
-
-    if (event === "INITIAL_SESSION") {
-      if (!user) {
-        const hasPersistedAuth = [localStorage, sessionStorage].some((storage) => {
-          try {
-            return Object.keys(storage || {}).some((key) => key.startsWith("sb-") || key === "supabase.auth.token");
-          } catch (error) {
-            return false;
-          }
-        });
-        if (hasPersistedAuth && supabaseClient) {
-          try {
-            const tryRecoverSession = async (attempt = 1) => {
-              const { data: sessionData, error: sessionError } = await supabaseClient.auth.getSession();
-              if (!sessionError && sessionData?.session?.user) {
-                currentUser = sessionData.session.user;
-                updateUserRow(currentUser);
-                hideLoginScreen();
-                setAuthBusy(false);
-                resetJournalState(currentUser.id);
-                updateSyncStatus("syncing");
-                recordDiagnostic("auth", "Session recovered from persisted storage", { userId: currentUser.id });
-                try {
-                  await loadFromSupabase(currentUser.id);
-                  updateSyncStatus("synced");
-                } catch (err) {
-                  console.warn("Loading journal failed", err);
-                  recordDiagnostic("error", "Failed to load journal after persisted session recovery", { error: String(err?.message || err) });
-                }
-                hideSplashScreen();
-                authStateBusy = false;
-                return true;
-              }
-              if (!sessionError && !sessionData?.session && attempt === 1) {
-                recordDiagnostic("auth", "Persisted auth keys found but no active session; retrying once after transient delay", { hasPersistedAuth, sessionError: sessionError?.message || null });
-                await new Promise((resolve) => setTimeout(resolve, 1500));
-                return tryRecoverSession(2);
-              }
-              if (!sessionError && !sessionData?.session) {
-                recordDiagnostic("auth", "Persisted auth keys found but no active session after recovery retry", { hasPersistedAuth, sessionError: sessionError?.message || null });
-              } else if (sessionError) {
-                recordDiagnostic("auth", "Persisted session recovery check returned an error", { hasPersistedAuth, sessionError: sessionError?.message || null });
-              }
-              return false;
-            };
-            const recoveredSession = await tryRecoverSession();
-            if (recoveredSession) {
-              return;
-            }
-          } catch (error) {
-            console.warn("Persisted session recovery check failed", error);
-          }
-        }
-        const initStart = Date.now();
-        setTimeout(() => {
-          const elapsed = Date.now() - initStart;
-          if (!currentUser) {
-            authLoadToken += 1;
-            setAuthBusy(false);
-            resetJournalState();
-            renderCurrentAccount();
-            showLoginScreen();
-            hideSplashScreen();
-            updateSyncStatus("offline");
-            recordDiagnostic("auth", `No session after ${elapsed}ms timeout (threshold 5s)`, { event, elapsed });
-            console.warn(`[AUTH] Session restore timeout after ${elapsed}ms. User stayed logged out.`);
-          } else {
-            recordDiagnostic("auth", `Session restored after ${elapsed}ms (async arrival)`, { elapsed });
-            console.log(`[AUTH] Session restored during grace period after ${elapsed}ms`);
-          }
-        }, 5000);
-        authStateBusy = false;
-        console.log(`[AUTH] INITIAL_SESSION: no user found, waiting up to 5s for session restoration...`);
-        return;
-      }
-      hideLoginScreen();
-      setAuthBusy(false);
-      resetJournalState(user.id);
-      updateSyncStatus("syncing");
-      recordDiagnostic("auth", "Session restored via INITIAL_SESSION", { userId: user.id });
-      try {
-        await loadFromSupabase(user.id);
-        updateSyncStatus("synced");
-      } catch (err) {
-        console.warn("Loading journal failed", err);
-        recordDiagnostic("error", "Failed to load journal after INITIAL_SESSION", { error: String(err?.message || err) });
-      }
-      hideSplashScreen();
-      return;
-    }
-
-    if (event === "SIGNED_IN") {
-      if (!user) return;
-      hideLoginScreen();
-      setAuthBusy(false);
-      resetJournalState(user.id);
-      updateSyncStatus("syncing");
-      recordDiagnostic("auth", "User signed in", { userId: user.id, event });
-      try {
-        await loadFromSupabase(user.id);
-        updateSyncStatus("synced");
-      } catch (err) {
-        console.warn("Loading journal failed", err);
-        recordDiagnostic("error", "Failed to load journal after sign-in", { error: String(err?.message || err) });
-      }
-      hideSplashScreen();
-      return;
-    }
 
     if (event === "SIGNED_OUT") {
       authLoadToken += 1;
+      sessionBootstrapUserId = "";
+      currentUser = null;
+      updateUserRow(null);
       setAuthBusy(false);
       resetJournalState();
       renderCurrentAccount();
@@ -5189,26 +5087,9 @@ async function handleAuthStateChange(event, session) {
       if (session?.user) {
         currentUser = session.user;
         updateUserRow(session.user);
-        const loginScreen = document.getElementById("login-screen");
-        const loginVisible = loginScreen && !loginScreen.hasAttribute("hidden");
-        if (loginVisible) {
-          hideLoginScreen();
-          setAuthBusy(false);
-          resetJournalState(session.user.id);
-          updateSyncStatus("syncing");
-          recordDiagnostic("auth", "Session restored via TOKEN_REFRESHED", { userId: session.user.id });
-          try {
-            await loadFromSupabase(session.user.id);
-            updateSyncStatus("synced");
-          } catch (err) {
-            console.warn("Loading journal failed after token refresh", err);
-            recordDiagnostic("error", "Failed to load journal after token refresh", { error: String(err?.message || err) });
-          }
-          hideSplashScreen();
-        }
+        updateSyncStatus("synced");
+        recordDiagnostic("auth", "Session refreshed", { userId: session.user.id });
       }
-      updateSyncStatus("synced");
-      recordDiagnostic("auth", "Session refreshed", { event });
       return;
     }
 
@@ -5226,13 +5107,27 @@ async function handleAuthStateChange(event, session) {
       recordDiagnostic("auth", "Password recovery session", { event });
       return;
     }
+
+    if ((event === "INITIAL_SESSION" || event === "SIGNED_IN") && user) {
+      await establishUserSession(user, event);
+      return;
+    }
+
+    if (event === "INITIAL_SESSION" && !user) {
+      sessionBootstrapUserId = "";
+      currentUser = null;
+      updateUserRow(null);
+      setAuthBusy(false);
+      showLoginScreen();
+      hideSplashScreen();
+      updateSyncStatus("offline");
+      recordDiagnostic("auth", "No persisted session", { event });
+    }
   } catch (error) {
     console.warn("Auth state change failed", error);
     recordDiagnostic("error", "Auth state change failed", { error: String(error?.message || error), event });
     setAuthStatus("Authentication recovery failed. Please sign in again.", "error");
-    try { hideSplashScreen(); } catch (e) {}
-  } finally {
-    authStateBusy = false;
+    hideSplashScreen();
   }
 }
 
@@ -5252,19 +5147,14 @@ async function initSupabaseAuth() {
     console.warn("Could not sync auth provider availability", error);
   });
 
+  await completeOAuthReturn().catch((error) => {
+    console.warn("OAuth return handling failed", error);
+    setAuthStatus("Sign-in failed. Please try again.", "error");
+  });
+
   supabaseClient.auth.onAuthStateChange((event, session) => {
     void handleAuthStateChange(event, session);
   });
-
-  const callbackHandled = await completeOAuthReturn().catch((error) => {
-    console.warn("OAuth return handling failed", error);
-    setAuthStatus("Sign-in failed. Please try again.", "error");
-    return false;
-  });
-
-  if (callbackHandled) {
-    return;
-  }
 }
 
 function switchTab(name, button) {
@@ -5930,8 +5820,6 @@ if (typeof document !== "undefined") {
   if (!mentorSessionKey) {
     mentorSessionKey = safeStorageGet(sessionStorage, "gj_mentor_key", "");
   }
-  migrateOldCaches();
-  resetJournalState();
   applyReportPreset();
   renderCurrentAccount();
   setAuthMode("signin");
@@ -5939,7 +5827,7 @@ if (typeof document !== "undefined") {
   refreshIcons();
 
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./sw.js?v=20260629-supabase-v28")
+    navigator.serviceWorker.register("./sw.js?v=20260630-supabase-v30")
       .catch((err) => console.warn("Service worker registration failed:", err));
   }
   document.addEventListener("keydown", (event) => {

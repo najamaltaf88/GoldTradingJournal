@@ -15,7 +15,12 @@
 [[headers]]
   for = "/env-config.js"
   [headers.values]
-    Cache-Control = "public, max-age=300, stale-while-revalidate=60"
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+[[headers]]
+  for = "/app.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
 
 [[headers]]
   for = "/*"
