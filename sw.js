@@ -1,45 +1,41 @@
-const CACHE_NAME = "gold-journal-v29";
-const APP_VERSION = "20260630-supabase-v29";
-const APP_FILES = [
-  "./",
-  `./index.html`,
-  `./styles.css?v=${APP_VERSION}`,
-  `./app.js?v=${APP_VERSION}`,
-  `./env-config.js?v=${APP_VERSION}`,
-  `./manifest.json`,
-  `./icon.svg`,
-  "./auth/callback/index.html"
+const CACHE_NAME = "gold-journal-v30";
+const APP_VERSION = "20260630-supabase-v30";
+
+// Never cache runtime config or app code — always fetch fresh from network.
+const NETWORK_ONLY_PATHS = [
+  "/env-config.js",
+  "/app.js",
+  "/sw.js"
 ];
 
-const STATIC_EXTENSIONS = [".js", ".css", ".html", ".json", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".ico", ".woff", ".woff2"];
-
-const NETWORK_ONLY_HOSTS = ["supabase.co", "openrouter.ai"];
+const SHELL_FILES = [
+  "./",
+  "./index.html",
+  `./styles.css?v=${APP_VERSION}`,
+  "./manifest.json",
+  "./icon.svg"
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME)
-      .then((cache) => cache.addAll(APP_FILES))
+      .then((cache) => cache.addAll(SHELL_FILES))
       .then(() => self.skipWaiting())
   );
 });
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
-        keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))
-      )
-    ).then(() => self.clients.claim())
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
+      .then(() => self.clients.claim())
   );
 });
 
-function isSameOriginStatic(url) {
+function isNetworkOnlyRequest(url) {
   if (url.origin !== self.location.origin) return false;
-  return STATIC_EXTENSIONS.some((ext) => url.pathname.endsWith(ext)) || url.pathname === "/";
-}
-
-function isNetworkOnly(url) {
-  return NETWORK_ONLY_HOSTS.some((host) => url.hostname.includes(host));
+  const path = url.pathname;
+  return NETWORK_ONLY_PATHS.some((entry) => path.endsWith(entry.replace(/^\//, "")) || path === entry);
 }
 
 self.addEventListener("fetch", (event) => {
@@ -47,32 +43,35 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(event.request.url);
 
-  if (isNetworkOnly(url)) {
+  // Supabase API, auth, storage, and third-party scripts: browser handles directly.
+  if (url.origin !== self.location.origin) return;
+
+  if (isNetworkOnlyRequest(url)) {
+    event.respondWith(fetch(event.request));
     return;
   }
 
   if (event.request.mode === "navigate") {
     event.respondWith(
-      fetch(event.request).catch(() => caches.match("./index.html").then((cached) => cached || caches.match("./")))
+      fetch(event.request)
+        .then((response) => {
+          if (response && response.ok) return response;
+          return caches.match("./index.html");
+        })
+        .catch(() => caches.match("./index.html"))
     );
     return;
   }
 
-  if (!isSameOriginStatic(url)) {
-    event.respondWith(fetch(event.request));
-    return;
-  }
-
   event.respondWith(
-    caches.match(event.request).then((cached) =>
-      cached || fetch(event.request).then((response) => {
-        if (!response || response.status !== 200 || response.type !== "basic") {
-          return response;
+    fetch(event.request)
+      .then((response) => {
+        if (response && response.ok && response.type === "basic") {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         }
-        const copy = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
-      }).catch(() => caches.match("./index.html").then((cached) => cached || caches.match("./")))
-    )
+      })
+      .catch(() => caches.match(event.request).then((cached) => cached || caches.match("./index.html")))
   );
 });
