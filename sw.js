@@ -1,11 +1,11 @@
-const CACHE_NAME = "gold-journal-v28";
-const APP_VERSION = "20260629-supabase-v28";
+const CACHE_NAME = "gold-journal-v29";
+const APP_VERSION = "20260630-supabase-v29";
 const APP_FILES = [
   "./",
   `./index.html`,
   `./styles.css?v=${APP_VERSION}`,
   `./app.js?v=${APP_VERSION}`,
-  `./env-config.js`,
+  `./env-config.js?v=${APP_VERSION}`,
   `./manifest.json`,
   `./icon.svg`,
   "./auth/callback/index.html"

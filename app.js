@@ -48,6 +48,20 @@ function safeStorageRemove(storage, key) {
   }
 }
 
+function getAuthStorage() {
+  return {
+    getItem(key) {
+      return safeStorageGet(localStorage, key, null);
+    },
+    setItem(key, value) {
+      return safeStorageSet(localStorage, key, value);
+    },
+    removeItem(key) {
+      return safeStorageRemove(localStorage, key);
+    }
+  };
+}
+
 function safeStorageClearMatching(storage, predicate) {
   try {
     const keys = Object.keys(storage || {});
@@ -126,15 +140,13 @@ const SUPABASE_AUTH_OPTIONS = {
     persistSession: true,
     autoRefreshToken: true,
     flowType: "pkce",
-    storage: {
-      getItem: (key) => safeStorageGet(localStorage, key, null),
-      setItem: (key, value) => safeStorageSet(localStorage, key, value),
-      removeItem: (key) => safeStorageRemove(localStorage, key)
-    }
+    storage: getAuthStorage()
   }
 };
 
 function initSupabase() {
+  if (supabaseClient) return true;
+
   const config = window.SUPABASE_CONFIG;
   if (!config || !config.url || !config.anonKey) {
     console.warn("Supabase config missing. Copy .env.example to .env, then run: node scripts/generate-config.js");
@@ -5055,32 +5067,51 @@ async function handleAuthStateChange(event, session) {
 
     if (event === "INITIAL_SESSION") {
       if (!user) {
-        const hasPersistedAuth = Object.keys(localStorage || {}).some((key) => key.startsWith("sb-") || key === "supabase.auth.token");
+        const hasPersistedAuth = [localStorage, sessionStorage].some((storage) => {
+          try {
+            return Object.keys(storage || {}).some((key) => key.startsWith("sb-") || key === "supabase.auth.token");
+          } catch (error) {
+            return false;
+          }
+        });
         if (hasPersistedAuth && supabaseClient) {
           try {
-            const { data: sessionData, error: sessionError } = await supabaseClient.auth.getSession();
-            if (!sessionError && sessionData?.session?.user) {
-              currentUser = sessionData.session.user;
-              updateUserRow(currentUser);
-              hideLoginScreen();
-              setAuthBusy(false);
-              resetJournalState(currentUser.id);
-              updateSyncStatus("syncing");
-              recordDiagnostic("auth", "Session recovered from persisted storage", { userId: currentUser.id });
-              try {
-                await loadFromSupabase(currentUser.id);
-                updateSyncStatus("synced");
-              } catch (err) {
-                console.warn("Loading journal failed", err);
-                recordDiagnostic("error", "Failed to load journal after persisted session recovery", { error: String(err?.message || err) });
+            const tryRecoverSession = async (attempt = 1) => {
+              const { data: sessionData, error: sessionError } = await supabaseClient.auth.getSession();
+              if (!sessionError && sessionData?.session?.user) {
+                currentUser = sessionData.session.user;
+                updateUserRow(currentUser);
+                hideLoginScreen();
+                setAuthBusy(false);
+                resetJournalState(currentUser.id);
+                updateSyncStatus("syncing");
+                recordDiagnostic("auth", "Session recovered from persisted storage", { userId: currentUser.id });
+                try {
+                  await loadFromSupabase(currentUser.id);
+                  updateSyncStatus("synced");
+                } catch (err) {
+                  console.warn("Loading journal failed", err);
+                  recordDiagnostic("error", "Failed to load journal after persisted session recovery", { error: String(err?.message || err) });
+                }
+                hideSplashScreen();
+                authStateBusy = false;
+                return true;
               }
-              hideSplashScreen();
-              authStateBusy = false;
+              if (!sessionError && !sessionData?.session && attempt === 1) {
+                recordDiagnostic("auth", "Persisted auth keys found but no active session; retrying once after transient delay", { hasPersistedAuth, sessionError: sessionError?.message || null });
+                await new Promise((resolve) => setTimeout(resolve, 1500));
+                return tryRecoverSession(2);
+              }
+              if (!sessionError && !sessionData?.session) {
+                recordDiagnostic("auth", "Persisted auth keys found but no active session after recovery retry", { hasPersistedAuth, sessionError: sessionError?.message || null });
+              } else if (sessionError) {
+                recordDiagnostic("auth", "Persisted session recovery check returned an error", { hasPersistedAuth, sessionError: sessionError?.message || null });
+              }
+              return false;
+            };
+            const recoveredSession = await tryRecoverSession();
+            if (recoveredSession) {
               return;
-            }
-            if (!sessionError && !sessionData?.session) {
-              recordDiagnostic("auth", "Persisted auth keys found but no active session", { hasPersistedAuth });
-              clearSessionAuthStorage();
             }
           } catch (error) {
             console.warn("Persisted session recovery check failed", error);
